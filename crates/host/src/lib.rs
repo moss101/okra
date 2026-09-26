@@ -25,6 +25,7 @@ pub mod storage;
 pub mod subagent;
 pub mod usage;
 pub mod skill_sync;
+pub mod surfaces;
 pub mod terminal;
 
 pub use notifications::{
@@ -46,6 +47,7 @@ pub use subagent::{
     ProjectedContext, RoleScope, SubagentGrant, SubagentLaunchError, SubagentLauncher,
 };
 pub use settings::{SettingsError as SettingsStoreError, SettingsScope, SettingsStore};
+pub use surfaces::{AttachDecision, SurfaceError, SurfaceInfo, SurfaceKind, SurfaceRegistry};
 pub use usage::{GroupedUsage, UsageError, UsageLedger, UsageRecord, UsageSnapshot, UsageTotals};
 pub use storage::{CatalogEntry, StorageError as StorageDomainError, StorageService};
 pub use credential::{CredentialError, CredentialStore};
