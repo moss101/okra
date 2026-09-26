@@ -21,6 +21,7 @@ pub mod onboarding;
 pub mod notifications;
 pub mod plugin_sync;
 pub mod plugins;
+pub mod remote_access;
 pub mod safe_fs;
 pub mod settings;
 pub mod settings_sync;
@@ -88,6 +89,9 @@ pub use files::{
 pub use mcp_sync::{
     ExportedServer, ImportOutcome, ImportStatus, McpServerRecord, McpSyncCandidate,
     McpSyncDescriptor, McpSyncError, McpSyncService, McpSyncSource, PathRewrite,
+};
+pub use remote_access::{
+    check_directory_write_access, check_directories_write_access, WriteAccessResult,
 };
 pub use skill_sync::{
     SkillCandidate, SkillRoot, SkillSyncError, SkillSyncService, DEFAULT_MAX_ARCHIVE_BYTES,
