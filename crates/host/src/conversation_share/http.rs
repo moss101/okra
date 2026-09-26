@@ -644,9 +644,11 @@ mod tests {
     use super::super::build_integrity;
     use std::sync::{Arc, Mutex};
 
+    type Responder = Box<dyn Fn(&HttpRequest) -> Result<HttpResponse, String> + Send + Sync>;
+
     /// Canned transport; `seen` is shared with the test for assertions.
     struct FakeTransport {
-        respond: Box<dyn Fn(&HttpRequest) -> Result<HttpResponse, String> + Send + Sync>,
+        respond: Responder,
         seen: Arc<Mutex<Vec<HttpRequest>>>,
     }
 

@@ -18,6 +18,7 @@ pub mod notifications;
 pub mod plugin_sync;
 pub mod plugins;
 pub mod safe_fs;
+pub mod settings;
 pub mod settings_sync;
 pub mod storage;
 pub mod subagent;
@@ -43,6 +44,7 @@ pub use plugin_sync::{
 pub use subagent::{
     ProjectedContext, RoleScope, SubagentGrant, SubagentLaunchError, SubagentLauncher,
 };
+pub use settings::{SettingsError as SettingsStoreError, SettingsScope, SettingsStore};
 pub use usage::{GroupedUsage, UsageError, UsageLedger, UsageRecord, UsageSnapshot, UsageTotals};
 pub use storage::{CatalogEntry, StorageError as StorageDomainError, StorageService};
 pub use checkpoints::{
