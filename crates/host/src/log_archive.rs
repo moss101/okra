@@ -21,8 +21,6 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::skill_sync::{append_tar_entry, gzip_tar, SkillSyncError};
-use crate::plugins::store::sha256_hex;
 
 pub const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
@@ -284,7 +282,4 @@ mod tests {
         assert_ne!(archive_checksum(b"abc"), archive_checksum(b"abd"), "sensitive");
     }
 
-    fn sha256_hex(bytes: &[u8]) -> String {
-        crate::plugins::store::sha256_hex(bytes)
-    }
 }
