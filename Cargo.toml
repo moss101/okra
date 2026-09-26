@@ -61,6 +61,8 @@ portable-pty = "0.9"
 # key-generation seeds only. Content addressing stays on sha2.
 ed25519-dalek = { version = "2", default-features = false, features = ["fast", "std", "rand_core"] }
 getrandom = "0.2"
+# Skill-sync archives (#48): ustar+gzip, matching the donor's archive format.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tempfile = "3"
 
 [workspace.lints.rust]

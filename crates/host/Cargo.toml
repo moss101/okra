@@ -18,6 +18,7 @@ sha2 = { workspace = true }
 regex = { workspace = true }
 ed25519-dalek = { workspace = true }
 getrandom = { workspace = true }
+flate2 = { workspace = true }
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 
 [dev-dependencies]
