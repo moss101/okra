@@ -24,6 +24,7 @@ pub mod notifications;
 pub mod plugin_sync;
 pub mod plugins;
 pub mod remote_access;
+pub mod log_archive;
 pub mod safe_fs;
 pub mod settings;
 pub mod settings_sync;
@@ -87,6 +88,10 @@ pub use checkpoints::{
 pub use conversation_share::{
     build_integrity, build_public_projection, canonical_json, verify_integrity, PublicProjection,
     ProjectionErrorKind, ShareError, ShareIntegrity,
+};
+pub use log_archive::{
+    create_diagnostic_archive, archive_checksum, ArchiveReport, MAX_FILE_BYTES as ARCHIVE_MAX_FILE_BYTES,
+    MAX_TOTAL_BYTES as ARCHIVE_MAX_TOTAL_BYTES,
 };
 pub use feedback::{
     FeedbackAttachment, FeedbackComment, FeedbackError, FeedbackTicket, FeedbackTicketStore,
