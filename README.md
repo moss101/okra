@@ -20,11 +20,24 @@ map (block → source → crate) and `.agents/notes/` for binding decisions.
 M0  skeleton                    ✔ workspace, policy files, protocol port with
                                   TS-ground-truth convergence tests, kernel
                                   event log, read_file end-to-end, headless CLI
+M0  gate G0                     ✔ ZCode's existing Electron UI displays a
+                                  real turn produced by the okra daemon
+                                  (okra serve + host-side bridge, N0005)
 M1  agent + CLI parity          ◐ tool plane, policy stack, session log,
                                   governors, fault injection (in progress)
 M2  context / memory / skills   ◐ compaction summary schema, origin tags
 M3  host services + alpha       ☐      M4 surfaces ☐      M5 differentiators ☐
 ```
+
+## G0 demo (2026-09-26)
+
+The ZCode Dev Electron app, launched with `ZCODE_OKRA_DAEMON=<okra binary>
+pnpm dev:runtime` (ZCode working tree carries the marked G0 bridge patch —
+see `.agents/notes/0005-g0-electron-bridge.md`), rendered a full turn from
+the okra daemon: user message bubble, streaming assistant text, a read_file
+tool card, and the file content okra's Rust toolchain read from the
+workspace — over the standard `zcode-agent` v4 channel with no renderer
+changes.
 
 ## Layout
 

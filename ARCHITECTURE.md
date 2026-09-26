@@ -32,7 +32,7 @@ name decision N0002).
 | `gateway` | #8 NDJSON event bus: ring replay, Last-Event-ID reconnect, slow-client eviction (protocol caps) | qwen `packages/acp-bridge/eventBus`, zcode-v4 caps | **M0 done**; ACP edge at M4 |
 | `computer` | #60 contracts: split consent, batch stop-on-first-error, `user_actively_typing`, pixel guard honest failure, no-raise | Claude2 `docs/02-03` | **M0 contracts**; MCP servers at M5 |
 | `tui` | #55 `--minimal` scrollback writer (O(N) streaming) | grok pager (ratatui at M4) | **M0 partial** |
-| `okra` (bin) | #56 headless CLI: `--json` NDJSON, `--cwd`, `--max-turns`, `--kill-at-phase`, `--fork-session`, `--worktree` | grok headless flag set | **M0 done** with offline demo sampler; real providers at M1 |
+| `okra` (bin) | #56 headless CLI: `--json` NDJSON, `--cwd`, `--max-turns`, `--kill-at-phase`, `--fork-session`, `--worktree` · **G0 daemon**: `serve --stdio` streams zcode-v4 row projections (N0005) | grok headless flag set | **M0 done + G0 gate PASSED** — ZCode Dev Electron UI displayed a real okra turn (2026-09-26) |
 
 ## Dependency direction (enforced by `scripts/check-boundaries.sh`)
 
