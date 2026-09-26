@@ -202,6 +202,15 @@ fn run_gate(addr: &str) {
     let steered = second.read_reply(3);
     assert_eq!(steered["result"]["steered"], true);
 
+    // the surface registry tracks both NDJSON surfaces
+    tui_surface.send(30, r#"{"method":"surfaces/list"}"#);
+    let registry = tui_surface.read_reply(30);
+    let surfaces = registry["result"]["surfaces"].as_array().unwrap();
+    assert_eq!(surfaces.len(), 2, "both NDJSON surfaces registered");
+    assert!(surfaces
+        .iter()
+        .all(|s| s["kind"] == "cli" && s["detached"] == serde_json::Value::Bool(false)));
+
     // surface A drives the turn
     tui_surface.send(
         4,

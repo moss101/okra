@@ -45,6 +45,9 @@ pub struct TcpServeState {
     pub sessions: Mutex<BTreeMap<String, Arc<Mutex<SessionProjection>>>>,
     pub steering: Mutex<BTreeMap<String, SteeringChannel>>,
     pub writers: Mutex<Vec<SurfaceWriter>>,
+    /// G4 bookkeeping: every attached surface is registered here with a
+    /// kind + capabilities, heartbeated per frame, and detached on exit.
+    pub surfaces: Mutex<okra_host::surfaces::SurfaceRegistry>,
     next_static: std::sync::atomic::AtomicU64,
 }
 
@@ -56,6 +59,7 @@ impl TcpServeState {
             sessions: Mutex::new(BTreeMap::new()),
             steering: Mutex::new(BTreeMap::new()),
             writers: Mutex::new(Vec::new()),
+            surfaces: Mutex::new(okra_host::surfaces::SurfaceRegistry::new()),
             next_static: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -142,6 +146,14 @@ fn handle_client(state: &Arc<TcpServeState>, stream: TcpStream) {
         inner: Arc::clone(&own_writer),
         sse: false,
     });
+    // register in the surface registry (kind Cli: NDJSON line protocol)
+    let surface_id = state
+        .surfaces
+        .lock()
+        .unwrap()
+        .attach(okra_host::surfaces::SurfaceKind::Cli, vec!["steer".into()])
+        .map(|(id, _)| id)
+        .unwrap_or_default();
     let respond = move |id: u64, result: serde_json::Value| {
         let mut w = own_writer.lock().unwrap();
         let _ = w.write_all(
@@ -153,6 +165,7 @@ fn handle_client(state: &Arc<TcpServeState>, stream: TcpStream) {
     let reader = std::io::BufReader::new(read_half);
     for line in reader.lines().map_while(Result::ok) {
         if line.trim().is_empty() { continue; }
+        state.surfaces.lock().unwrap().heartbeat(&surface_id);
         let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else { continue; };
         let id_field = msg["id"].as_u64().unwrap_or(0);
         let method = msg["method"].as_str().unwrap_or_default().to_string();
@@ -160,6 +173,17 @@ fn handle_client(state: &Arc<TcpServeState>, stream: TcpStream) {
         match method.as_str() {
             "hello" => respond(id_field, serde_json::json!({"daemon":"okra","protocolVersion":3})),
             "ping" => respond(id_field, serde_json::json!({"pong":true})),
+            "surfaces/list" => {
+                let list: Vec<serde_json::Value> = state
+                    .surfaces
+                    .lock()
+                    .unwrap()
+                    .list()
+                    .iter()
+                    .map(|s| serde_json::to_value(s).unwrap_or_default())
+                    .collect();
+                respond(id_field, serde_json::json!({ "surfaces": list }));
+            }
             "v4/conversation/subscribe" => {
                 let session_id = params["sessionId"].as_str().unwrap_or_default().to_string();
                 state.steering.lock().unwrap().entry(session_id)
@@ -183,6 +207,7 @@ fn handle_client(state: &Arc<TcpServeState>, stream: TcpStream) {
             _ => {}
         }
     }
+    state.surfaces.lock().unwrap().detach(&surface_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -280,18 +305,38 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
             inner: Arc::new(Mutex::new(writer)),
             sse: true,
         });
+        // register as a Browser surface; heartbeats tick on client bytes
+        let sse_surface_id = state
+            .surfaces
+            .lock()
+            .unwrap()
+            .attach(
+                okra_host::surfaces::SurfaceKind::Browser,
+                vec!["sse".into(), "steer".into()],
+            )
+            .map(|(id, _)| id)
+            .unwrap_or_default();
         // hold the connection open reading (and discarding) client bytes;
         // broadcasts flow through the registered SSE writer. When the
         // browser disconnects, read fails and we return: the broadcaster
-        // prunes the dead writer.
+        // prunes the dead writer and the registry detaches the surface.
         let mut reader = BufReader::new(stream);
         let mut scratch = [0u8; 256];
         loop {
             match reader.read(&mut scratch) {
-                Ok(0) => return Ok(()),
-                Ok(_) => {}
+                Ok(0) => {
+                    state.surfaces.lock().unwrap().detach(&sse_surface_id);
+                    return Ok(());
+                }
+                Ok(n) => {
+                    state.surfaces.lock().unwrap().heartbeat(&sse_surface_id);
+                    let _ = n;
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => return Ok(()),
+                Err(_) => {
+                    state.surfaces.lock().unwrap().detach(&sse_surface_id);
+                    return Ok(());
+                }
             }
         }
     }

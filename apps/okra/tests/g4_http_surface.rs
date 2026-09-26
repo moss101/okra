@@ -198,6 +198,27 @@ fn run_http_gate(addr: &str) {
         // give the SSE handshake a moment to register the surface
         std::thread::sleep(Duration::from_millis(300));
 
+        // the browser surface is registered with kind browser + sse capability
+        let mut ndjson = TcpStream::connect(addr).unwrap();
+        ndjson.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        ndjson
+            .write_all(b"{\"id\":40,\"method\":\"surfaces/list\"}\n")
+            .unwrap();
+        let mut nd_reader = BufReader::new(ndjson.try_clone().unwrap());
+        let mut reg = String::new();
+        let reg_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < reg_deadline, "no surfaces/list reply");
+            reg.clear();
+            nd_reader.read_line(&mut reg).unwrap();
+            if reg.contains("\"surfaces\"") {
+                break;
+            }
+        }
+        assert!(reg.contains("\"kind\":\"browser\""), "{reg}");
+        assert!(reg.contains("\"sse\""), "{reg}");
+        let _ = ndjson;
+
         // 3. POST /command drives a turn from the "browser"
         let (status, reply) = http_post_command(addr, &serde_json::json!({
             "commandId": "browser-1",
