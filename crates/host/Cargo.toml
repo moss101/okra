@@ -14,6 +14,10 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 libc = { workspace = true }
 portable-pty = { workspace = true }
+sha2 = { workspace = true }
+regex = { workspace = true }
+ed25519-dalek = { workspace = true }
+getrandom = { workspace = true }
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 
 [dev-dependencies]

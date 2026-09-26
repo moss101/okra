@@ -57,6 +57,10 @@ nono = "=0.53.0"
 libc = "0.2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 portable-pty = "0.9"
+# Plugin signing (#46, clean-room): ed25519-dalek for Ed25519, getrandom for
+# key-generation seeds only. Content addressing stays on sha2.
+ed25519-dalek = { version = "2", default-features = false, features = ["fast", "std", "rand_core"] }
+getrandom = "0.2"
 tempfile = "3"
 
 [workspace.lints.rust]

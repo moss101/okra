@@ -11,6 +11,7 @@ pub mod fsutil;
 pub mod git;
 pub mod oauth;
 pub mod notifications;
+pub mod plugins;
 pub mod safe_fs;
 pub mod terminal;
 
@@ -19,4 +20,5 @@ pub use notifications::{
 };
 pub use git::{GitError, GitHead, GitRepository, GitStatusEntry};
 pub use oauth::{DeviceAuthorization, OAuthClient, OAuthDomain, OAuthError, TokenSet};
+pub use plugins::{PluginStore, SignedPluginEnvelope, SignatureVerdict, TrustStore};
 pub use terminal::{TerminalHost, TerminalSession, TerminalSize};
