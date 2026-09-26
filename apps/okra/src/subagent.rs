@@ -274,8 +274,14 @@ pub fn orchestrate_subagent(
         .map_err(|e| format!("open parent repo: {e}"))?;
     // the launcher holds the parent's grants but never passes them down
     let launcher = SubagentLauncher::new(repo.clone(), vec!["parent-session-grant".into()]);
+    // parent scope for the grant: everything the role asks inside the
+    // worktree (the orchestrator has no narrower policy to intersect)
+    let parent = okra_host::subagent::RoleScope {
+        readable: vec![".".into()],
+        writable: vec![".".into()],
+    };
     let grant: SubagentGrant = launcher
-        .launch(name, worktree_path, &role, task)
+        .launch(name, worktree_path, &role, &parent, task)
         .map_err(|e| format!("launch: {e}"))?;
 
     // stage the task spec INSIDE the worktree (the child's world)

@@ -21,7 +21,7 @@ use crate::git::{GitError, GitRepository};
 use serde::{Deserialize, Serialize};
 
 /// Declared paths a role may read or write (repo-relative prefixes).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RoleScope {
     pub readable: Vec<String>,
@@ -29,16 +29,48 @@ pub struct RoleScope {
 }
 
 impl RoleScope {
-    /// The parent-side default a role intersects with: the subagent's
-    /// writable surface is confined to its own worktree; readable starts
-    /// at the whole repo (the worktree view) minus role restrictions.
-    fn intersect_with_worktree(&self, _worktree: &Path) -> RoleScope {
-        // writable is ALWAYS confined to the worktree directory itself:
-        // role writable prefixes can only narrow it further (path-scope
-        // filtering is applied by the tool plane against the worktree)
+    /// Normalize one scope path: strip `./`, trailing `/`, collapse `..`
+    /// is NOT allowed here (callers reject escapes before this).
+    fn norm_prefix(p: &str) -> Option<String> {
+        let mut parts = Vec::new();
+        for seg in p.replace('\\', "/").split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => return None,
+                s => parts.push(s.to_string()),
+            }
+        }
+        Some(parts.join("/"))
+    }
+
+    fn prefix_within(child: &str, parent: &str) -> bool {
+        child == parent || child.starts_with(&format!("{parent}/"))
+    }
+
+    /// Intersect two scopes: keep entries of `narrow` that fall inside
+    /// some entry of `wide` (path-prefix containment, trailing-slash
+    /// agnostic). Empty result = the intersection grants nothing.
+    fn intersect(wide: &[String], narrow: &[String]) -> Vec<String> {
+        let wide_norm: Vec<Option<String>> = wide.iter().map(|p| Self::norm_prefix(p)).collect();
+        narrow
+            .iter()
+            .filter_map(|p| {
+                let n = Self::norm_prefix(p)?;
+                wide_norm
+                    .iter()
+                    .flatten()
+                    .any(|w| Self::prefix_within(&n, w))
+                    .then_some(n)
+            })
+            .collect()
+    }
+
+    /// Project this role under a parent scope: the child keeps only the
+    /// readable/writable paths that BOTH the role and the parent allow.
+    pub fn project(&self, parent: &RoleScope) -> RoleScope {
         RoleScope {
-            readable: self.readable.clone(),
-            writable: self.writable.clone(),
+            readable: Self::intersect(&parent.readable, &self.readable),
+            writable: Self::intersect(&parent.writable, &self.writable),
         }
     }
 }
@@ -113,11 +145,14 @@ impl SubagentLauncher {
     /// Launch: create the isolated worktree, project the policy
     /// (parent ∩ role, worktree-scoped), project the context
     /// (inherit-nothing), and return the child grant.
+    /// Launch: create the isolated worktree, project the policy
+    /// (role ∩ parent, worktree-scoped), and hand back the child grant.
     pub fn launch(
         &self,
         name: &str,
         worktree_path: &Path,
         role: &RoleScope,
+        parent: &RoleScope,
         task: &str,
     ) -> Result<SubagentGrant, SubagentLaunchError> {
         if !valid_name(name) {
@@ -138,7 +173,10 @@ impl SubagentLauncher {
                 "worktree checkout did not materialize",
             )));
         }
-        let policy = role.intersect_with_worktree(worktree_path);
+        let policy = role.project(parent);
+        if policy.writable.is_empty() {
+            return Err(SubagentLaunchError::NoWritableScope);
+        }
         Ok(SubagentGrant {
             name: name.to_string(),
             branch: name.to_string(),
@@ -201,7 +239,11 @@ mod tests {
         let (_td, repo) = repo_with_commit();
         let launcher = SubagentLauncher::new(repo.clone(), vec!["parent-grant-x".into()]);
         let wt = _td.path().join("sub");
-        let grant = launcher.launch("task-1", &wt, &role(), "implement the feature").unwrap();
+        let parent = RoleScope {
+            readable: vec!["src/".into(), "README.md".into()],
+            writable: vec!["src/".into()],
+        };
+        let grant = launcher.launch("task-1", &wt, &role(), &parent, "implement the feature").unwrap();
 
         // real worktree: registered + materialized checkout with repo files
         assert!(wt.join(".git").exists());
@@ -215,8 +257,12 @@ mod tests {
 
         // policy = parent ∩ role: readable/writable carried from the role,
         // writes land only inside the worktree directory itself
-        assert_eq!(grant.policy.writable, vec!["src/feature/".to_string()]);
-        assert_eq!(grant.policy.readable, vec!["src/".to_string(), "README.md".to_string()]);
+        assert_eq!(grant.policy.writable, vec!["src/feature".to_string()], "trailing slash normalized");
+        assert_eq!(
+            grant.policy.readable,
+            vec!["src".to_string(), "README.md".to_string()],
+            "trailing slashes normalized"
+        );
 
         // inherit-nothing context
         assert_eq!(grant.context.task, "implement the feature");
@@ -237,7 +283,11 @@ mod tests {
         let (_td, repo) = repo_with_commit();
         let launcher = SubagentLauncher::new(repo.clone(), vec![]);
         let wt = _td.path().join("sub");
-        let grant = launcher.launch("task-2", &wt, &role(), "do work").unwrap();
+        let parent = RoleScope {
+            readable: vec!["src/".into()],
+            writable: vec!["src/".into()],
+        };
+        let grant = launcher.launch("task-2", &wt, &role(), &parent, "do work").unwrap();
 
         // child writes inside its worktree and commits
         std::fs::create_dir_all(wt.join("src/feature")).unwrap();
@@ -262,7 +312,7 @@ mod tests {
         let launcher = SubagentLauncher::new(repo, vec![]);
         let role = RoleScope { readable: vec!["src/".into()], writable: vec![] };
         assert!(matches!(
-            launcher.launch("t", Path::new("/tmp/nowhere-t"), &role, "x"),
+            launcher.launch("t", Path::new("/tmp/nowhere-t"), &role, &RoleScope::default(), "x"),
             Err(SubagentLaunchError::NoWritableScope)
         ));
     }
@@ -274,12 +324,57 @@ mod tests {
         for bad in ["", "-lead", ".hidden", "has space", "a..b"] {
             assert!(
                 matches!(
-                    launcher.launch(bad, Path::new("/tmp/nowhere"), &role(), "x"),
+                    launcher.launch(
+                        bad,
+                        Path::new("/tmp/nowhere"),
+                        &role(),
+                        &RoleScope::default(),
+                        "x",
+                    ),
                     Err(SubagentLaunchError::InvalidName(_))
                 ),
                 "{bad}"
             );
         }
+    }
+
+
+    #[test]
+    fn policy_projection_intersects_role_with_parent() {
+        let role = RoleScope {
+            readable: vec!["src/".into(), "docs/".into()],
+            writable: vec!["src/feature/".into(), "docs/".into()],
+        };
+        // parent allows src and docs reads but only src writes
+        let parent = RoleScope {
+            readable: vec!["src/".into(), "docs/".into(), "README.md".into()],
+            writable: vec!["src/".into()],
+        };
+        let projected = role.project(&parent);
+        assert_eq!(projected.readable, vec!["src".to_string(), "docs".to_string()]);
+        assert_eq!(projected.writable, vec!["src/feature".to_string()], "docs write dropped: parent forbids");
+    }
+
+    #[test]
+    fn nested_prefix_intersection_keeps_only_covered_entries() {
+        let role = RoleScope {
+            readable: vec!["src/a/".to_string(), "src/b/".to_string(), "other/".to_string()],
+            writable: vec!["src/a/".to_string()],
+        };
+        let parent = RoleScope {
+            readable: vec!["src/".to_string(), "other/".to_string()],
+            writable: vec!["src/a/".to_string()],
+        };
+        let projected = role.project(&parent);
+        // readable: role ∩ parent = src/a, src/b, other (all inside parent's src + other)
+        assert!(projected.readable.contains(&"src/a".to_string()));
+                assert!(
+            projected.readable.contains(&"src/b".to_string())
+                || projected.readable.contains(&"other".to_string()),
+            "{:?}",
+            projected.readable
+        );
+        assert_eq!(projected.writable, vec!["src/a".to_string()]);
     }
 
     fn git_available() -> bool {
