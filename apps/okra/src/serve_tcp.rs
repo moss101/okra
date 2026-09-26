@@ -42,6 +42,8 @@ pub type SteeringChannel = Arc<Mutex<VecDeque<String>>>;
 pub struct TcpServeState {
     pub cwd: std::path::PathBuf,
     pub sessions_dir: std::path::PathBuf,
+    /// The hello payload facts (device identity + capability list).
+    pub config: okra_host::client_info::ClientConfig,
     pub sessions: Mutex<BTreeMap<String, Arc<Mutex<SessionProjection>>>>,
     pub steering: Mutex<BTreeMap<String, SteeringChannel>>,
     pub writers: Mutex<Vec<SurfaceWriter>>,
@@ -53,9 +55,30 @@ pub struct TcpServeState {
 
 impl TcpServeState {
     pub fn new(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) -> Self {
+        let home = okra_host::fsutil::home_dir().unwrap_or_else(|| cwd.clone());
+        let config = okra_host::client_info::client_config(
+            &home,
+            &sessions_dir,
+            env!("CARGO_PKG_VERSION"),
+            vec![
+                "ndjson".into(),
+                "http+sse".into(),
+                "steer".into(),
+                "surfaces".into(),
+            ],
+        )
+        .unwrap_or_else(|_| okra_host::client_info::ClientConfig {
+            daemon: "okra".into(),
+            protocol_version: 3,
+            device_id: "unknown".into(),
+            okra_version: env!("CARGO_PKG_VERSION").into(),
+            sessions_dir: sessions_dir.clone(),
+            capabilities: vec![],
+        });
         TcpServeState {
             cwd,
             sessions_dir,
+            config,
             sessions: Mutex::new(BTreeMap::new()),
             steering: Mutex::new(BTreeMap::new()),
             writers: Mutex::new(Vec::new()),
@@ -171,7 +194,10 @@ fn handle_client(state: &Arc<TcpServeState>, stream: TcpStream) {
         let method = msg["method"].as_str().unwrap_or_default().to_string();
         let params = msg["params"].clone();
         match method.as_str() {
-            "hello" => respond(id_field, serde_json::json!({"daemon":"okra","protocolVersion":3})),
+            "hello" => respond(
+                id_field,
+                serde_json::to_value(&state.config).unwrap_or_default(),
+            ),
             "ping" => respond(id_field, serde_json::json!({"pong":true})),
             "surfaces/list" => {
                 let list: Vec<serde_json::Value> = state

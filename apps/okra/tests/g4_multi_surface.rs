@@ -31,6 +31,9 @@ impl Surface {
         surface.send(1, r#"{"method":"hello"}"#);
         let reply = surface.read_reply(1);
         assert_eq!(reply["result"]["daemon"], "okra", "handshake");
+        assert_eq!(reply["result"]["protocolVersion"], 3);
+        assert_eq!(reply["result"]["deviceId"].as_str().map(|d| d.len()), Some(32));
+        assert!(reply["result"]["capabilities"].is_array());
         surface
     }
 

@@ -8,6 +8,7 @@
 //! - fsutil: the single sanctioned canonicalize/home_dir call sites
 
 pub mod checkpoints;
+pub mod client_info;
 pub mod conversation_share;
 pub mod credential;
 pub mod files;
@@ -57,6 +58,10 @@ pub use surfaces::{AttachDecision, SurfaceError, SurfaceInfo, SurfaceKind, Surfa
 pub use usage::{GroupedUsage, UsageError, UsageLedger, UsageRecord, UsageSnapshot, UsageTotals};
 pub use storage::{CatalogEntry, StorageError as StorageDomainError, StorageService};
 pub use credential::{CredentialError, CredentialStore};
+pub use client_info::{
+    client_config, load_or_create_device_identity, ClientConfig, DeviceIdentity, DAEMON_NAME,
+    PROTOCOL_VERSION,
+};
 pub use checkpoints::{
     CheckpointError, CheckpointManager, FileSnapshot, GitState, RestoreReport, RewindCheckpoint,
     RewindPoint,
