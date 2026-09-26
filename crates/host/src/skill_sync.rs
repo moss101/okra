@@ -172,7 +172,7 @@ fn resolve_within(root: &Path, path: &str) -> Result<PathBuf, SkillSyncError> {
 /// Tolerant frontmatter metadata (`parseSkillMetadata`): no frontmatter or
 /// an unparseable one falls back to the directory basename; a blank or
 /// missing `name` falls back too; `description` defaults to empty.
-fn parse_skill_metadata(content: &str, fallback_name: &str) -> (String, String) {
+pub(crate) fn parse_skill_metadata(content: &str, fallback_name: &str) -> (String, String) {
     let trimmed = content.trim_start_matches('\u{feff}');
     if !trimmed.starts_with("---") {
         return (fallback_name.to_string(), String::new());
@@ -201,6 +201,32 @@ fn parse_skill_metadata(content: &str, fallback_name: &str) -> (String, String) 
         name = fallback_name.to_string();
     }
     (name, description)
+}
+
+/// Loose single-line frontmatter field read (donor `readLooseSkill*`
+/// regex semantics over the frontmatter block only).
+pub(crate) fn loose_frontmatter_field(content: &str, key: &str) -> Option<String> {
+    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+    let frontmatter = normalized
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.find("\n---").map(|pos| &rest[..pos]))?;
+    for line in frontmatter.lines() {
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        if k.trim() == key {
+            let value = v.trim().trim_matches('"').trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// `readLooseSkillVersion`: optional version from skill frontmatter.
+pub(crate) fn read_loose_frontmatter_version(content: &str) -> Option<String> {
+    loose_frontmatter_field(content, "version")
 }
 
 /// One bounded DFS producing every directory (root excluded) as

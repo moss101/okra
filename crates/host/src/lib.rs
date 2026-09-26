@@ -16,6 +16,7 @@ pub mod oauth;
 pub mod notifications;
 pub mod plugins;
 pub mod safe_fs;
+pub mod settings_sync;
 pub mod skill_sync;
 pub mod terminal;
 
@@ -41,5 +42,9 @@ pub use mcp_sync::{
 pub use skill_sync::{
     SkillCandidate, SkillRoot, SkillSyncError, SkillSyncService, DEFAULT_MAX_ARCHIVE_BYTES,
     MAX_SKILL_SCAN_DEPTH, SKILL_FILE_NAME, SKILL_SCAN_EXCLUDED_DIRECTORY_NAMES,
+};
+pub use settings_sync::{
+    AgentDiscovery, DiscoveryResult, ImportMode, ImportResult, SettingsSyncService, SkipReason,
+    SourceScope, SyncAgent, SyncCandidate, SyncImportStatus,
 };
 pub use terminal::{TerminalHost, TerminalSession, TerminalSize};
