@@ -52,6 +52,6 @@ check compaction providers protocol
 check gateway protocol
 check session kernel protocol
 check host policy protocol kernel
-check agent-core tools policy providers kernel protocol compaction
+check agent-core tools policy providers kernel protocol compaction memory
 
 if [ "$viol" = 0 ]; then echo "boundaries: ok"; else exit 1; fi

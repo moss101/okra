@@ -12,6 +12,7 @@ okra-tools = { workspace = true }
 okra-policy = { workspace = true }
 okra-providers = { workspace = true }
 okra-compaction = { workspace = true }
+okra-memory = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

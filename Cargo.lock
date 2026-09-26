@@ -1004,6 +1004,7 @@ dependencies = [
  "okra-compaction",
  "okra-gateway",
  "okra-kernel",
+ "okra-memory",
  "okra-policy",
  "okra-protocol",
  "okra-providers",
@@ -1019,6 +1020,7 @@ version = "0.1.0"
 dependencies = [
  "okra-compaction",
  "okra-kernel",
+ "okra-memory",
  "okra-policy",
  "okra-protocol",
  "okra-providers",
@@ -1038,6 +1040,7 @@ dependencies = [
  "okra-providers",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 

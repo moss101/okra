@@ -185,6 +185,7 @@ fn main() {
         let mut reads_per_turn = 8usize;
         let mut content_bytes = 2048usize;
         let mut limit_tokens = 20_000u64;
+        let mut microcompact_at: Option<u64> = Some(limit_tokens / 3);
         let mut i = 1;
         while i < argv.len() {
             let next = |i: &mut usize| -> String {
@@ -197,6 +198,10 @@ fn main() {
                 "--reads-per-turn" => reads_per_turn = next(&mut i).parse().unwrap_or(reads_per_turn),
                 "--content-bytes" => content_bytes = next(&mut i).parse().unwrap_or(content_bytes),
                 "--limit-tokens" => limit_tokens = next(&mut i).parse().unwrap_or(limit_tokens),
+                "--microcompact-at" => {
+                    let v = next(&mut i);
+                    microcompact_at = if v == "off" { None } else { v.parse().ok() };
+                }
                 other => {
                     eprintln!("error: unknown bench flag {other}");
                     std::process::exit(2);
@@ -204,7 +209,14 @@ fn main() {
             }
             i += 1;
         }
-        match bench::run_benchmark(turns, files, reads_per_turn, content_bytes, limit_tokens) {
+        match bench::run_benchmark(
+            turns,
+            files,
+            reads_per_turn,
+            content_bytes,
+            limit_tokens,
+            microcompact_at,
+        ) {
             Ok(v) => {
                 let passed = v.passed;
                 println!("BENCH {}", serde_json::to_string(&v).unwrap_or_default());

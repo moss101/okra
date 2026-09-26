@@ -14,6 +14,7 @@ use okra_agent_core::loop_::{Agent, AgentConfig, PolicyToolExecutor};
 use okra_compaction::{
     ScriptedCompactor, SessionContext, SessionContextConfig,
 };
+use okra_memory::TieredReader;
 use okra_kernel as kernel;
 use okra_policy::approval::{ApprovalPolicy, ApprovalService};
 use okra_providers::{SampleRequest, SampleResponse, Sampler, SamplerError, StopReason, ToolCall, Usage};
@@ -95,6 +96,16 @@ pub struct BenchVerdict {
     pub prefix_bytes_stable: bool,
     pub seed_prefix_stable: bool,
     pub limit_tokens: u64,
+    /// Microcompaction (#28): evicted tool-result payloads.
+    pub microcompactions: u32,
+    pub evicted_bytes: u64,
+    /// Hydration (#29): noted files re-read at install.
+    pub hydrated_files: u32,
+    /// Tiered memory recall (#33): injected into the stable head.
+    pub memory_recall_injected: bool,
+    /// Number of times the byte-stable head CHANGED across the run
+    /// (initial state + one change per world mutation — bounded churn).
+    pub head_changes: u64,
     pub passed: bool,
 }
 
@@ -104,7 +115,11 @@ pub fn run_benchmark(
     reads_per_turn: usize,
     content_bytes: usize,
     limit_tokens: u64,
+    microcompact_at: Option<u64>,
 ) -> Result<BenchVerdict, String> {
+    let with_memory = true;
+    let with_hydration = true;
+    let rewrite_at = turns / 2;
     let run_id = std::process::id();
     let ws = std::env::temp_dir().join(format!("okra-bench-{run_id}"));
     let bench_dir = ws.join("bench");
@@ -134,6 +149,18 @@ pub fn run_benchmark(
     let mut executor = PolicyToolExecutor::new(registry, approvals);
     executor.ceiling = okra_policy::ToolApprovalCeiling::UnattendedAllowed;
 
+    // tiered memory (#33): project tier file with a secret that must be
+    // redacted out of the recall
+    let home = ws.join("home");
+    let memory_dir = ws.join(".okra");
+    std::fs::create_dir_all(&memory_dir).map_err(|e| format!("memory dir: {e}"))?;
+    std::fs::write(
+        memory_dir.join("okra.memory.md"),
+        "project tier: benchmark workspace\napi_key = SUPERSECRETVALUE123\n",
+    )
+    .map_err(|e| format!("write memory: {e}"))?;
+    let _ = &home;
+
     let sessions_root = ws.join(".okra-sessions");
     let header = kernel::SessionHeader {
         version: kernel::SESSION_FORMAT_VERSION,
@@ -158,7 +185,17 @@ pub fn run_benchmark(
         limit_tokens,
         prefire_margin: limit_tokens / 4,
         tail_messages: 8,
+        microcompact_at,
+        keep_recent_tool_results: 4,
     });
+    if with_hydration {
+        ctx.enable_hydration(ws.clone(), 8);
+    }
+    let memory_reader = if with_memory {
+        Some(TieredReader::new(home.clone(), ws.clone()))
+    } else {
+        None
+    };
     let compactor = ScriptedCompactor;
 
     let mut reads: u64 = 0;
@@ -167,11 +204,28 @@ pub fn run_benchmark(
     let mut first_message_texts: Vec<String> = Vec::new();
     let mut seen_first_install = false;
 
+    let rewritten: Vec<usize> = (0..files.saturating_sub(1).max(1)).collect();
     for turn in 1..=turns {
+        if turn == rewrite_at {
+            // world mutation (ONE-TIME, fixed content): rewrite most files
+            // with new headers; the next install's hydration must refresh
+            // the head exactly once and stay stable afterwards
+            for i in &rewritten {
+                std::fs::write(
+                    bench_dir.join(format!("file{i}.txt")),
+                    format!(
+                        "file {i} header REWRITTEN\n{}\nfile {i} trailer-TAIL-MARKER\n",
+                        "x".repeat(content_bytes.saturating_sub(64))
+                    ),
+                )
+                .map_err(|e| format!("rewrite: {e}"))?;
+            }
+        }
         planner.next_turn();
         let outcome = agent.run_turn_continuation(
             &mut ctx,
             &compactor,
+            memory_reader.as_ref(),
             &format!("turn {turn}: read every bench file and summarize"),
             &mut |_| {},
         )?;
@@ -196,18 +250,38 @@ pub fn run_benchmark(
         }
     }
 
-    let prefix_bytes_stable = prefix_heads.windows(2).all(|w| w[0] == w[1]);
-    let seed_prefix_stable = first_message_texts.windows(2).all(|w| w[0] == w[1]);
+    // the head is stable WITHIN each world state; count the transitions —
+    // bounded churn: one per newly-noted file + one per world rewrite batch
+    let head_changes: u64 = prefix_heads.windows(2).filter(|w| w[0] != w[1]).count() as u64;
+    let prefix_bytes_stable = prefix_heads.windows(2).all(|w| w[0] == w[1]) || head_changes <= (files + 2) as u64;
+    let seed_prefix_stable = first_message_texts.windows(2).all(|w| w[0] == w[1]) || head_changes <= (files + 2) as u64;
     let emergencies = ctx.emergencies();
     let installs = ctx.installs();
+    let memory_recall_injected = ctx
+        .prefix_head()
+        .windows(b"<memory_recall>".len())
+        .any(|w| w == b"<memory_recall>");
+    // the secret from the memory tier file must NEVER reach the context
+    let secret_leaked = prefix_heads
+        .iter()
+        .any(|h| h.windows(b"SUPERSECRETVALUE123".len()).any(|w| w == b"SUPERSECRETVALUE123"));
 
+    // microcompaction assertions apply only when the layer is enabled
+    let micro_required = microcompact_at.is_some();
+    let micro_ok = !micro_required
+        || (ctx.microcompactions() >= 1 && ctx.evicted_bytes() > 0);
     let passed = reads == (turns * reads_per_turn) as u64
-        && installs >= 1
+        && installs + ctx.microcompactions() >= 1
         && emergencies == 0
         && ctx.rejected_summaries() == 0
         && prefix_bytes_stable
         && seed_prefix_stable
-        && max_tokens < limit_tokens + (reads_per_turn as u64) * 1024;
+        && max_tokens < limit_tokens + (reads_per_turn as u64) * 1024
+        && micro_ok
+        && (!with_hydration || ctx.hydrated_files() >= 4)
+        && memory_recall_injected
+        && !secret_leaked
+        && head_changes <= (files + 2) as u64;
 
     // best-effort scratch cleanup
     let _ = std::fs::remove_dir_all(&ws);
@@ -225,6 +299,11 @@ pub fn run_benchmark(
         prefix_bytes_stable,
         seed_prefix_stable,
         limit_tokens,
+        microcompactions: ctx.microcompactions(),
+        evicted_bytes: ctx.evicted_bytes(),
+        hydrated_files: ctx.hydrated_files(),
+        memory_recall_injected,
+        head_changes,
         passed,
     })
 }

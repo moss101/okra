@@ -123,11 +123,24 @@ pub struct SessionContextConfig {
     pub prefire_margin: u64,
     /// Newest messages kept verbatim after an install.
     pub tail_messages: usize,
+    /// Microcompaction (#28, qwen): evict old tool-result payloads in place
+    /// (outcome preserved, content replaced by a stub) once usage crosses
+    /// `microcompact_at`. Runs BEFORE summary compaction — it is cheap and
+    /// often enough on its own.
+    pub microcompact_at: Option<u64>,
+    /// Newest tool results exempt from microcompaction.
+    pub keep_recent_tool_results: usize,
 }
 
 impl Default for SessionContextConfig {
     fn default() -> Self {
-        SessionContextConfig { limit_tokens: 8_000, prefire_margin: 2_000, tail_messages: 8 }
+        SessionContextConfig {
+            limit_tokens: 8_000,
+            prefire_margin: 2_000,
+            tail_messages: 8,
+            microcompact_at: Some(5_000),
+            keep_recent_tool_results: 4,
+        }
     }
 }
 
@@ -136,6 +149,9 @@ struct CompactionStats {
     installs: u32,
     emergencies: u32,
     rejected_summaries: u32,
+    microcompactions: u32,
+    evicted_bytes: u64,
+    hydrated_files: u32,
 }
 
 /// The cross-turn context: owns messages, world state, and the compaction
@@ -145,6 +161,14 @@ pub struct SessionContext {
     world: WorldState,
     config: SessionContextConfig,
     staged: Option<CompactionSummary>,
+    /// File-state hydration (#29, ZCode): workspace root to re-read noted
+    /// files from at install time. None = hydration off.
+    hydration_root: Option<std::path::PathBuf>,
+    /// Max files hydrated per install (most recently noted first).
+    hydration_max_files: usize,
+    /// Tiered memory recall (#33): rendered recall text folded into the
+    /// byte-stable head (memory files change rarely).
+    memory_recall: Option<String>,
     stats: CompactionStats,
     /// The byte-stable head: rendered once per install and reused verbatim.
     prefix_head: Vec<u8>,
@@ -164,11 +188,17 @@ impl SessionContext {
             world: WorldState::default(),
             config,
             staged: None,
+            hydration_root: None,
+            hydration_max_files: 4,
+            memory_recall: None,
             stats: CompactionStats {
                 prefires: 0,
                 installs: 0,
                 emergencies: 0,
                 rejected_summaries: 0,
+                microcompactions: 0,
+                evicted_bytes: 0,
+                hydrated_files: 0,
             },
             prefix_head: Vec::new(),
             events: Vec::new(),
@@ -214,6 +244,55 @@ impl SessionContext {
     pub fn rejected_summaries(&self) -> u32 {
         self.stats.rejected_summaries
     }
+    pub fn microcompactions(&self) -> u32 {
+        self.stats.microcompactions
+    }
+    pub fn evicted_bytes(&self) -> u64 {
+        self.stats.evicted_bytes
+    }
+    pub fn hydrated_files(&self) -> u32 {
+        self.stats.hydrated_files
+    }
+
+    /// Enable file-state hydration: `root` is re-read at install time for
+    /// every noted file path (most recent first, capped).
+    pub fn enable_hydration(&mut self, root: std::path::PathBuf, max_files: usize) {
+        self.hydration_root = Some(root);
+        self.hydration_max_files = max_files;
+    }
+
+    /// Tiered memory recall (#33): folded into the byte-stable head.
+    /// While the memory files are unchanged, the head stays byte-identical.
+    pub fn set_memory_recall(&mut self, recall: &str) {
+        let recall = recall.trim();
+        if recall.is_empty() {
+            return;
+        }
+        self.memory_recall = Some(recall.to_string());
+        self.refresh_world_head();
+    }
+
+    /// Note a file path the agent touched (drives hydration at install).
+    /// Insert-only: never overwrites a hydration note (the fresh file
+    /// excerpt is the authoritative state; re-noting must not oscillate
+    /// the byte-stable head).
+    pub fn note_file(&mut self, path: &str) {
+        let already_noted = self
+            .world
+            .sections
+            .iter()
+            .any(|(sec, entries)| {
+                *sec == Section::FileStates
+                    && entries.iter().any(|e| e.key == path)
+            });
+        if !already_noted {
+            self.world.set(
+                Section::FileStates,
+                path,
+                "touched (state refreshed at compaction)",
+            );
+        }
+    }
 
     /// Push a message and run the two-pass state machine.
     pub fn push(&mut self, message: Message, compactor: &dyn Compactor) {
@@ -228,6 +307,15 @@ impl SessionContext {
     }
 
     fn run_compaction_cycle(&mut self, compactor: &dyn Compactor) {
+        // Pass 0 — microcompaction (#28): cheapest first. Evict old tool
+        // result payloads in place; outcomes (error flags) are preserved so
+        // the model keeps the facts it needs at a fraction of the size.
+        if let Some(micro_at) = self.config.microcompact_at
+            && self.tokens() >= micro_at
+        {
+            self.microcompact();
+        }
+
         let tokens = self.tokens();
         let prefire_at = self.config.limit_tokens.saturating_sub(self.config.prefire_margin);
 
@@ -279,6 +367,85 @@ impl SessionContext {
         }
     }
 
+    /// Microcompaction (#28): replace all but the newest
+    /// `keep_recent_tool_results` tool-result payloads with a stub that
+    /// preserves the call id and the error flag. In-place eviction — the
+    /// surrounding messages stay untouched.
+    fn microcompact(&mut self) {
+        let keep = self.config.keep_recent_tool_results;
+        // indices (newest first) of tool-result blocks
+        let mut result_positions: Vec<(usize, usize)> = Vec::new();
+        for (mi, m) in self.messages.iter().enumerate() {
+            for (bi, b) in m.content.iter().enumerate() {
+                if matches!(b, ContentBlock::ToolResponse { .. }) {
+                    result_positions.push((mi, bi));
+                }
+            }
+        }
+        if result_positions.len() <= keep {
+            return;
+        }
+        let evict_count = result_positions.len() - keep;
+        let evict: Vec<(usize, usize)> = result_positions[..evict_count].to_vec();
+        let mut evicted: u64 = 0;
+        for (mi, bi) in evict {
+            if let ContentBlock::ToolResponse { result } = &mut self.messages[mi].content[bi] {
+                let original = result.content.len();
+                if original <= 64 {
+                    continue; // already small: eviction saves nothing
+                }
+                evicted += original as u64;
+                let is_error = result.is_error;
+                result.content = format!(
+                    "[microcompacted: {original} bytes of tool output evicted; outcome {}]",
+                    if is_error { "error" } else { "success" }
+                );
+                result.is_error = is_error;
+                self.stats.microcompactions += 1;
+            }
+        }
+        self.stats.evicted_bytes += evicted;
+    }
+
+    /// Hydration (#29): after compaction the summarized view of a touched
+    /// file can be stale — re-read the noted files (most recent first,
+    /// capped) and fold a fresh excerpt into the world FileStates so the
+    /// NEXT head render carries current reality. Reads happen before the
+    /// head render inside `install`.
+    fn hydrate_file_states(&mut self) {
+        let Some(root) = &self.hydration_root else {
+            return;
+        };
+        let paths: Vec<String> = self
+            .world
+            .sections
+            .iter()
+            .find(|(sec, _)| *sec == Section::FileStates)
+            .map(|(_, entries)| entries.iter().map(|e| e.key.clone()).collect())
+            .unwrap_or_default();
+        let mut hydrated = 0u32;
+        for path in paths.iter().rev() {
+            if hydrated >= self.hydration_max_files as u32 {
+                break;
+            }
+            let abs = root.join(path);
+            let Ok(bytes) = std::fs::read(&abs) else {
+                continue;
+            };
+            let excerpt: String = {
+                let text = String::from_utf8_lossy(&bytes);
+                text.chars().take(160).collect()
+            };
+            self.world.set(
+                Section::FileStates,
+                path,
+                format!("hydrated {} bytes: {:?}", bytes.len(), excerpt),
+            );
+            hydrated += 1;
+            self.stats.hydrated_files += 1;
+        }
+    }
+
     /// Produce + VALIDATE a summary. Invalid output is counted and rejected
     /// — never installed (§3 #30).
     fn produce_summary(&mut self, compactor: &dyn Compactor) -> Option<CompactionSummary> {
@@ -302,6 +469,7 @@ impl SessionContext {
     /// what makes the head byte-identical across turns with an unchanged
     /// world — the provider prefix-cache property (§3 #32).
     fn install(&mut self, summary: CompactionSummary) {
+        self.hydrate_file_states();
         self.refresh_world_head();
 
         let summary_json =
@@ -331,10 +499,18 @@ impl SessionContext {
     }
 
     /// Render the world_state head. Byte-stable: identical world →
-    /// identical bytes (WorldState::render contract). The summary is NOT
-    /// part of this render — it lives in its own message.
+    /// identical bytes (WorldState::render contract). The tiered memory
+    /// recall (#33) is folded in AFTER the world section — it belongs to
+    /// the stable head because memory files change rarely; the summary is
+    /// NOT part of this render — it lives in its own message.
     fn refresh_world_head(&mut self) {
-        self.prefix_head = self.world.render().into_bytes();
+        let mut text = self.world.render();
+        if let Some(memory) = &self.memory_recall {
+            text.push_str("<memory_recall>\n");
+            text.push_str(memory);
+            text.push_str("\n</memory_recall>\n");
+        }
+        self.prefix_head = text.into_bytes();
     }
 
     /// The current prefix head bytes (for byte-stability assertions).
@@ -364,6 +540,8 @@ mod tests {
             limit_tokens: 4_000,
             prefire_margin: 1_000,
             tail_messages: 4,
+            microcompact_at: Some(2_500),
+            keep_recent_tool_results: 2,
         });
         let compactor = ScriptedCompactor;
         for i in 0..40 {
@@ -395,6 +573,8 @@ mod tests {
             limit_tokens: 2_000,
             prefire_margin: 500,
             tail_messages: 2,
+            microcompact_at: None,
+            keep_recent_tool_results: 2,
         });
         for i in 0..20 {
             ctx.extend(vec![big_msg(&format!("bad{i}"), 2)], &BadCompactor);
@@ -411,6 +591,8 @@ mod tests {
             limit_tokens: 3_000,
             prefire_margin: 500,
             tail_messages: 2,
+            microcompact_at: Some(2_500),
+            keep_recent_tool_results: 2,
         });
         ctx.world_mut()
             .set(Section::FileStates, "src/app.js", "edited; verified");
@@ -437,11 +619,106 @@ mod tests {
     }
 
     #[test]
+    fn microcompact_evicts_old_tool_results_preserving_outcomes() {
+        let mut ctx = SessionContext::new(SessionContextConfig {
+            limit_tokens: 50_000, // no summary compaction should trigger
+            prefire_margin: 5_000,
+            tail_messages: 2,
+            microcompact_at: Some(800),
+            keep_recent_tool_results: 2,
+        });
+        for i in 0..6 {
+            ctx.push(
+                Message {
+                    role: Role::Tool,
+                    content: vec![ContentBlock::ToolResponse {
+                        result: okra_providers::ToolResult {
+                            call_id: format!("c{i}"),
+                            content: format!("result {i} {}", "y".repeat(600)),
+                            is_error: i == 1,
+                        },
+                    }],
+                },
+                &ScriptedCompactor,
+            );
+        }
+        assert!(ctx.microcompactions() >= 2, "old results evicted");
+        assert!(ctx.evicted_bytes() > 0);
+        let result_content = |messages: &[Message], call_id: &str| -> Option<(String, bool)> {
+            messages.iter().find_map(|m| {
+                m.content.iter().find_map(|b| match b {
+                    ContentBlock::ToolResponse { result } if result.call_id == call_id => {
+                        Some((result.content.clone(), result.is_error))
+                    }
+                    _ => None,
+                })
+            })
+        };
+        // newest two kept verbatim
+        let (content5, _) = result_content(ctx.messages(), "c5").unwrap();
+        assert!(content5.contains("result 5") && content5.len() > 300);
+        // old ones stubbed with the outcome preserved
+        let (content0, err0) = result_content(ctx.messages(), "c0").unwrap();
+        assert!(content0.contains("microcompacted") && content0.contains("bytes of tool output evicted"));
+        assert!(err0 == false);
+        let (content1, err1) = result_content(ctx.messages(), "c1").unwrap();
+        assert!(content1.contains("microcompacted"));
+        assert!(err1, "error outcome preserved through stubbing");
+        // flat: microcompaction alone kept us far below the summary limit
+        assert!(ctx.tokens() < 50_000);
+        assert_eq!(ctx.installs(), 0, "summary compaction never needed here");
+    }
+
+    #[test]
+    fn hydration_refreshes_file_state_at_install() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::write(td.path().join("tracked.rs"), "pub fn v1() {}").unwrap();
+
+        let mut ctx = SessionContext::new(SessionContextConfig {
+            limit_tokens: 2_500,
+            prefire_margin: 500,
+            tail_messages: 2,
+            microcompact_at: None,
+            keep_recent_tool_results: 2,
+        });
+        ctx.enable_hydration(td.path().to_path_buf(), 4);
+        ctx.note_file("tracked.rs");
+        for i in 0..10 {
+            ctx.extend(vec![big_msg(&format!("h{i}"), 2)], &ScriptedCompactor);
+        }
+        assert!(ctx.installs() >= 1);
+        assert!(ctx.hydrated_files() >= 1, "noted file hydrated at install");
+        let head = String::from_utf8(ctx.prefix_head().to_vec()).unwrap();
+        assert!(head.contains("hydrated"), "fresh file state in head: {head}");
+        assert!(head.contains("pub fn v1"), "actual file content excerpt present");
+    }
+
+    #[test]
+    fn memory_recall_is_folded_into_the_stable_head() {
+        let mut ctx = SessionContext::new(SessionContextConfig {
+            limit_tokens: 3_000,
+            prefire_margin: 500,
+            tail_messages: 2,
+            microcompact_at: None,
+            keep_recent_tool_results: 2,
+        });
+        ctx.set_memory_recall("user prefers rust; project uses okra crates");
+        for i in 0..12 {
+            ctx.extend(vec![big_msg(&format!("m{i}"), 2)], &ScriptedCompactor);
+        }
+        let head = String::from_utf8(ctx.prefix_head().to_vec()).unwrap();
+        assert!(head.contains("<memory_recall>"));
+        assert!(head.contains("project uses okra crates"));
+    }
+
+    #[test]
     fn changed_world_changes_the_head_bytes() {
         let mut ctx = SessionContext::new(SessionContextConfig {
             limit_tokens: 3_000,
             prefire_margin: 500,
             tail_messages: 2,
+            microcompact_at: Some(2_500),
+            keep_recent_tool_results: 2,
         });
         let compactor = ScriptedCompactor;
         let mut heads: Vec<Vec<u8>> = Vec::new();

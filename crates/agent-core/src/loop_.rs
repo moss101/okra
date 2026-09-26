@@ -343,18 +343,40 @@ impl<S: Sampler + ?Sized> Agent<S> {
     /// Agent-continuation turn (G2): seeds the model context from the
     /// session context (compacted prefix + tail), runs the turn, then folds
     /// the resulting messages back through the two-pass compaction cycle.
+    /// `memory` (tiered memory recall, §3 #33) is optional: when present its
+    /// redacted recall is folded into the byte-stable head.
     pub fn run_turn_continuation(
         &mut self,
         context: &mut okra_compaction::SessionContext,
         compactor: &dyn okra_compaction::Compactor,
+        memory: Option<&okra_memory::TieredReader>,
         input: &str,
         events: &mut dyn FnMut(LoopEvent),
     ) -> Result<TurnOutcome, String> {
+        // tiered memory recall (#33): redacted, folded into the stable head
+        if let Some(reader) = memory {
+            let recall = reader.recall();
+            let recall = okra_memory::redact_secrets(&recall);
+            if !recall.trim().is_empty() {
+                context.set_memory_recall(&recall);
+            }
+        }
         let seed = context.messages().to_vec();
         let seed_len = seed.len();
         let events_before_compactions = context.events().len();
         let (outcome, history) = self.run_turn_core(seed, input, events)?;
         let new_messages: Vec<Message> = history[seed_len..].to_vec();
+        // note filesystem paths touched by fs tools → hydration at install
+        for msg in &new_messages {
+            for call in msg.tool_calls() {
+                if matches!(call.name.as_str(), "read_file" | "write_file" | "edit_file")
+                    && let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.args_json)
+                    && let Some(path) = args.get("path").and_then(|v| v.as_str())
+                {
+                    context.note_file(path);
+                }
+            }
+        }
         context.extend(new_messages, compactor);
         for ev in &context.events()[events_before_compactions..] {
             if matches!(
