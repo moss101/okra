@@ -14,6 +14,7 @@ pub mod conversation_share;
 pub mod credential;
 pub mod files;
 pub mod feedback;
+pub mod feedback_logs;
 pub mod fsutil;
 pub mod git;
 pub mod mcp_sync;
@@ -81,6 +82,7 @@ pub use client_info::{
     PROTOCOL_VERSION,
 };
 pub use broadcast::{Broadcast, BroadcastBus, BroadcastError};
+pub use feedback_logs::{attach_logs_to_ticket, DiagnosticAttachment, FeedbackArchiveError};
 pub use checkpoints::{
     CheckpointError, CheckpointManager, FileSnapshot, GitState, RestoreReport, RewindCheckpoint,
     RewindPoint,
