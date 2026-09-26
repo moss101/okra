@@ -45,6 +45,8 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("sqlite projection error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
     #[error("session already owned by another writer")]
     AlreadyOwned,
 }

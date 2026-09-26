@@ -38,7 +38,13 @@ M2  context / memory / skills   ◐ #28 microcompaction, #29 hydration,
                                   — benchmark green in BOTH compaction
                                   profiles (layered + summary-only);
                                   remaining: skills, agent-quality bench
-M3  host services + alpha       ☐      M4 surfaces ☐      M5 differentiators ☐
+M3  host services + alpha       ◐ strangler started: SQLite session/task
+                                  index behind the kernel SessionHandle
+                                  (rebuildable projection; `okra sessions`)
+                                  + OpenAI provider wired into the G2
+                                  benchmark profile (`--provider openai`)
+
+M4 surfaces ☐      M5 differentiators ◐ (subagent kernel isolation)
 ```
 
 ## G0 demo (2026-09-26)

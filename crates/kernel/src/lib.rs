@@ -18,6 +18,7 @@ mod invariant;
 mod repair;
 mod lease;
 mod storage;
+mod sqlite;
 mod surface;
 
 pub use invariant::{check_log, InvariantError};
@@ -34,6 +35,7 @@ pub use repair::{
 pub use storage::{
     claim_write_lease, scan_log, AppendDurability, AppendOutcome, JsonlLog, ScanResult, StorageError, LOG_FILENAME,
 };
+pub use sqlite::{ProjectionDb, SessionRow, TaskRow, TaskRowInput};
 pub use surface::{fold_surface, SurfaceError, SurfaceFoldResult, SurfaceNode};
 
 use okra_protocol::Timestamp;

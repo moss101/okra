@@ -92,6 +92,11 @@ pub trait ToolExecutor: Send {
     fn hook_stats(&self) -> (u64, u64) {
         (0, 0)
     }
+
+    /// Per-tool execution counts (read counters for benchmarks).
+    fn execution_counts(&self) -> Vec<(String, u64)> {
+        Vec::new()
+    }
 }
 
 /// Tool-plane wiring: registry dispatch + approval service + grants +
@@ -104,6 +109,7 @@ pub struct PolicyToolExecutor {
     pub grants: GrantStore,
     pub lattice: PermissionLattice,
     pub ceiling: ToolApprovalCeiling,
+    executions: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl PolicyToolExecutor {
@@ -114,6 +120,7 @@ impl PolicyToolExecutor {
             grants: GrantStore::new(1),
             lattice: PermissionLattice::new(),
             ceiling: ToolApprovalCeiling::GrantsAllowed,
+            executions: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -126,11 +133,26 @@ impl ToolExecutor for PolicyToolExecutor {
         )
     }
 
+    fn execution_counts(&self) -> Vec<(String, u64)> {
+        self.executions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
+    }
+
     fn execute(
         &mut self,
         call: &ToolCall,
         events: &mut dyn FnMut(LoopEvent),
     ) -> Result<(String, bool, bool), String> {
+        *self
+            .executions
+            .lock()
+            .unwrap()
+            .entry(call.name.clone())
+            .or_insert(0) += 1;
         let entry = self
             .registry
             .get(&call.name)
@@ -342,6 +364,11 @@ impl<S: Sampler + ?Sized> Agent<S> {
     /// Hook (#45) telemetry from the executor: (events fired, failures).
     pub fn hook_stats(&self) -> (u64, u64) {
         self.executor.hook_stats()
+    }
+
+    /// Per-tool execution counts from the executor.
+    pub fn execution_counts(&self) -> Vec<(String, u64)> {
+        self.executor.execution_counts()
     }
 
     pub fn session(&self) -> &kernel::SessionHandle {

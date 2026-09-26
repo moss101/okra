@@ -188,6 +188,8 @@ fn main() {
         let mut content_bytes = 2048usize;
         let mut limit_tokens = 20_000u64;
         let mut microcompact_at: Option<u64> = Some(limit_tokens / 3);
+        let mut provider: Option<String> = None;
+        let mut model: Option<String> = None;
         let mut i = 1;
         while i < argv.len() {
             let next = |i: &mut usize| -> String {
@@ -204,6 +206,8 @@ fn main() {
                     let v = next(&mut i);
                     microcompact_at = if v == "off" { None } else { v.parse().ok() };
                 }
+                "--provider" => provider = Some(next(&mut i)),
+                "--model" => model = Some(next(&mut i)),
                 other => {
                     eprintln!("error: unknown bench flag {other}");
                     std::process::exit(2);
@@ -211,14 +215,16 @@ fn main() {
             }
             i += 1;
         }
-        match bench::run_benchmark(
+        match bench::run_benchmark(&bench::BenchParams {
             turns,
             files,
             reads_per_turn,
             content_bytes,
             limit_tokens,
             microcompact_at,
-        ) {
+            provider,
+            model,
+        }) {
             Ok(v) => {
                 let passed = v.passed;
                 println!("BENCH {}", serde_json::to_string(&v).unwrap_or_default());
@@ -269,6 +275,40 @@ fn main() {
                 let ok = v["passed"] == serde_json::Value::Bool(true);
                 println!("SUBAGENT {}", serde_json::to_string(&v).unwrap_or_default());
                 std::process::exit(if ok { 0 } else { 1 });
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // `okra sessions [--cwd DIR]`: M3 strangler — task/session index query
+    // (SQLite projection behind the kernel SessionHandle)
+    if argv.first().map(String::as_str) == Some("sessions") {
+        let mut cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut i = 1;
+        while i < argv.len() {
+            if argv[i] == "--cwd" {
+                i += 1;
+                cwd = PathBuf::from(argv.get(i).cloned().unwrap_or_default());
+            }
+            i += 1;
+        }
+        let db_path = cwd.join(".okra-sessions").join("index.db");
+        let db = kernel::ProjectionDb::open(&db_path).unwrap_or_else(|e| {
+            eprintln!("error: cannot open index: {e}");
+            std::process::exit(1);
+        });
+        match db.list_sessions() {
+            Ok(rows) => {
+                if rows.is_empty() {
+                    println!("no sessions indexed");
+                }
+                for r in rows {
+                    println!("{:<40} {:<8} events={} {}", r.id, r.status, r.event_count, r.workspace);
+                }
+                std::process::exit(0);
             }
             Err(e) => {
                 eprintln!("error: {e}");
@@ -503,6 +543,23 @@ fn main() {
 
     let result = agent.run_turn(&args.prompt, &mut |ev| write_event(&ev, &mut sink, args.json));
     let _ = sink.flush();
+
+    // M3 strangler: fold the session into the SQLite task/session index
+    // (derived, rebuildable from the kernel log — the durable truth).
+    drop(agent); // release the write handle before reopening
+    {
+        let db_path = sessions_root.join("index.db");
+        if let Ok(db) = kernel::ProjectionDb::open(&db_path)
+            && let Ok(reader) = kernel::SessionHandle::open(
+                &sessions_root,
+                &session_id,
+                kernel::SessionAccess::Read,
+            )
+            && let Ok(events) = reader.read_all()
+        {
+            let _ = db.rebuild_from_log(&events, &session_id, &args.cwd.to_string_lossy());
+        }
+    }
 
     match result {
         Ok(outcome) => {

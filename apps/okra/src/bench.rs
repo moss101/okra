@@ -130,6 +130,8 @@ pub struct BenchVerdict {
     pub evicted_bytes: u64,
     /// Hydration (#29): noted files re-read at install.
     pub hydrated_files: u32,
+    /// Provider used for the run (scripted | openai).
+    pub provider: String,
     /// Tiered memory recall (#33): injected into the stable head.
     pub memory_recall_injected: bool,
     /// Skills (M2): catalog size + path-conditional activations.
@@ -148,14 +150,27 @@ pub struct BenchVerdict {
     pub passed: bool,
 }
 
-pub fn run_benchmark(
-    turns: usize,
-    files: usize,
-    reads_per_turn: usize,
-    content_bytes: usize,
-    limit_tokens: u64,
-    microcompact_at: Option<u64>,
-) -> Result<BenchVerdict, String> {
+pub struct BenchParams {
+    pub turns: usize,
+    pub files: usize,
+    pub reads_per_turn: usize,
+    pub content_bytes: usize,
+    pub limit_tokens: u64,
+    pub microcompact_at: Option<u64>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+}
+
+pub fn run_benchmark(p: &BenchParams) -> Result<BenchVerdict, String> {
+    let turns = p.turns;
+    let files = p.files;
+    let reads_per_turn = p.reads_per_turn;
+    let content_bytes = p.content_bytes;
+    let limit_tokens = p.limit_tokens;
+    let microcompact_at = p.microcompact_at;
+    let provider = p.provider.as_deref();
+    let model = p.model.clone();
+    let network = provider == Some("openai");
     let with_memory = true;
     let with_hydration = true;
     let rewrite_at = turns / 2;
@@ -277,12 +292,21 @@ pub fn run_benchmark(
         .map_err(|e| format!("create session: {e}"))?;
 
     let planner = Arc::new(BenchmarkPlanner::new(files, reads_per_turn));
+    let sampler: Arc<dyn Sampler> = if network {
+        let model_name = model.clone().unwrap_or_else(|| "gpt-4o-mini".into());
+        Arc::new(
+            okra_providers::OpenAiProvider::from_env(model_name)
+                .ok_or("set OKRA_API_KEY (or OPENAI_API_KEY) for --provider openai")?,
+        )
+    } else {
+        planner.clone()
+    };
     let config = AgentConfig {
         max_steps: reads_per_turn + 4,
         unattended: true,
         ..Default::default()
     };
-    let mut agent = Agent::new(config, planner.clone(), Box::new(executor), session);
+    let mut agent = Agent::new(config, sampler, Box::new(executor), session);
 
     let mut ctx = SessionContext::new(SessionContextConfig {
         limit_tokens,
@@ -342,16 +366,34 @@ pub fn run_benchmark(
                 .map_err(|e| format!("rewrite: {e}"))?;
             }
         }
-        planner.next_turn();
+        if !network {
+            planner.next_turn();
+        }
+        let prompt = if network {
+            format!(
+                "turn {turn}: read every bench/*.txt file one by one with the read_file tool, \
+                 then summarize what they contain."
+            )
+        } else {
+            format!("turn {turn}: read every bench file and summarize")
+        };
         let outcome = agent.run_turn_continuation(
             &mut ctx,
             &compactor,
             memory_reader.as_ref(),
             Some(&skill_catalog),
-            &format!("turn {turn}: read every bench file and summarize"),
+            prompt.as_str(),
             &mut |_| {},
         )?;
         executor_hook_stats = agent.hook_stats();
+        if network {
+            reads = agent
+                .execution_counts()
+                .iter()
+                .find(|(n, _)| n == "read_file")
+                .map(|(_, c)| *c)
+                .unwrap_or(0);
+        }
         match outcome {
             okra_agent_core::turn::TurnOutcome::Completed { .. } => {}
             other => return Err(format!("turn {turn} did not complete: {other:?}")),
@@ -395,7 +437,12 @@ pub fn run_benchmark(
         || (ctx.microcompactions() >= 1 && ctx.evicted_bytes() > 0);
     let mcp_calls = planner.mcp_calls();
     let (hook_events, registry_hook_failures) = executor_hook_stats;
-    let passed = reads == (turns * reads_per_turn) as u64
+    let reads_ok = if network {
+        reads >= turns as u64 // real model: at least one read per turn on average
+    } else {
+        reads == (turns * reads_per_turn) as u64
+    };
+    let passed = reads_ok
         && installs + ctx.microcompactions() >= 1
         && emergencies == 0
         && ctx.rejected_summaries() == 0
@@ -425,6 +472,7 @@ pub fn run_benchmark(
     let _ = std::fs::remove_dir_all(&ws);
 
     Ok(BenchVerdict {
+        provider: provider.unwrap_or("scripted").to_string(),
         turns: turns as u64,
         reads,
         compaction_installs: installs,

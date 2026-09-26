@@ -128,3 +128,50 @@ fn g2_m2_blocks_microcompaction_hydration_memory() {
         "head churn must be bounded by world mutations, got {head_changes}"
     );
 }
+
+/// Live network-model variant of the G2 gate: same benchmark, driven by the
+/// OpenAI-compatible provider instead of the scripted stub. Requires
+/// OKRA_API_KEY (or OPENAI_API_KEY) + network; run explicitly with
+/// `cargo test -- --ignored` (returns immediately otherwise).
+#[test]
+#[ignore = "requires OKRA_API_KEY and network access"]
+fn g2_network_provider_live_benchmark() {
+    if std::env::var("OKRA_API_KEY").is_err() && std::env::var("OPENAI_API_KEY").is_err() {
+        eprintln!("skipping: no OKRA_API_KEY/OPENAI_API_KEY set");
+        return;
+    }
+    let bin = env!("CARGO_BIN_EXE_okra");
+    let out = Command::new(bin)
+        .args([
+            "bench-continuation",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-4o-mini",
+            "--turns",
+            "3",
+            "--files",
+            "3",
+            "--reads-per-turn",
+            "2",
+            "--content-bytes",
+            "512",
+            "--limit-tokens",
+            "6000",
+        ])
+        .output()
+        .expect("spawn okra bench-continuation");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "live benchmark failed: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let bench_line = stdout.lines().find(|l| l.starts_with("BENCH ")).expect("verdict");
+    let verdict: serde_json::Value =
+        serde_json::from_str(bench_line.trim_start_matches("BENCH ")).unwrap();
+    assert_eq!(verdict["provider"], "openai");
+    assert_eq!(verdict["prefix_bytes_stable"], true, "byte-identical prefixes");
+    assert_eq!(verdict["seed_prefix_stable"], true);
+    assert_eq!(verdict["passed"], true);
+}
