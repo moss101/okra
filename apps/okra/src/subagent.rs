@@ -99,26 +99,94 @@ pub fn run_subagent(grant: &std::path::Path, spec_path: &std::path::Path) -> Res
             move |args| rf.execute(args, None),
         ))
         .map_err(|e| format!("register read_file: {e}"))?;
+    // optional role-scope (OKRA_SUBAGENT_WRITABLE = comma-separated
+    // worktree-relative prefixes): when set, writes outside them are
+    // refused at the tool plane — the kernel confinement remains the
+    // backstop for anything that slips past this check
+    let writable_prefixes: std::sync::Arc<Vec<String>> =
+        match std::env::var("OKRA_SUBAGENT_WRITABLE") {
+            Ok(raw) => std::sync::Arc::new(
+                raw.split(',')
+                    .map(|p| p.trim().trim_start_matches("./").to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect(),
+            ),
+            Err(_) => std::sync::Arc::new(Vec::new()),
+        };
     let wf = okra_tools::builtins::ErasedWriteFile::new(grant.to_path_buf());
     let entry = wf.entry();
+    let write_prefixes = std::sync::Arc::clone(&writable_prefixes);
+
     registry
-        .register(okra_tools::ErasedTool::simple(
-            entry,
-            vec![okra_tools::ResourceAccess::write_file("*")],
-            move |args| wf.execute(args),
-        ))
+        .register(
+            okra_tools::ErasedTool::simple(
+                entry,
+                vec![okra_tools::ResourceAccess::write_file("*")],
+                move |args| {
+                    // empty prefix list = no tool-plane restriction (the
+                    // kernel confinement is the backstop); a set list is an
+                    // allowlist — anything outside it is refused
+                    let covered = write_prefixes.is_empty()
+                        || write_prefixes.iter().any(|p| {
+                            let target = args
+                                .get("path")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .trim_start_matches("./");
+                            target == p.as_str() || target.starts_with(&format!("{p}/"))
+                        });
+                    if !covered {
+                        return okra_tools::ToolStream::terminal_only(Err(
+                            okra_tools::ToolError::invalid_input(format!(
+                                "write refused by role scope: {} is outside {}",
+                                args
+                                    .get("path")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default(),
+                                write_prefixes.join(", ")
+                            )),
+                        ));
+                    }
+                    wf.execute(args)
+                },
+            ),
+        )
         .map_err(|e| format!("register write_file: {e}"))?;
     let ef = okra_tools::builtins::ErasedEditFile::new(grant.to_path_buf());
     let entry = ef.entry();
+    let edit_prefixes = writable_prefixes.clone();
     registry
-        .register(okra_tools::ErasedTool::simple(
-            entry,
-            vec![okra_tools::ResourceAccess::file(
-                okra_tools::FileAccessOperation::Readwrite,
-                "*",
-            )],
-            move |args| ef.execute(args),
-        ))
+        .register(
+            okra_tools::ErasedTool::simple(
+                entry,
+                vec![okra_tools::ResourceAccess::file(
+                    okra_tools::FileAccessOperation::Readwrite,
+                    "*",
+                )],
+                move |args| {
+                    if !edit_prefixes.is_empty() {
+                        let target = args
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .trim_start_matches("./")
+                            .to_string();
+                        let covered = edit_prefixes
+                            .iter()
+                            .any(|p| target == *p || target.starts_with(&format!("{p}/")));
+                        if !covered {
+                            return okra_tools::ToolStream::terminal_only(Err(
+                                okra_tools::ToolError::invalid_input(format!(
+                                    "edit refused by role scope: {target} is outside {}",
+                                    edit_prefixes.join(", ")
+                                )),
+                            ));
+                        }
+                    }
+                    ef.execute(args)
+                },
+            ),
+        )
         .map_err(|e| format!("register edit_file: {e}"))?;
 
     let approvals = ApprovalService::new(ApprovalPolicy::Ask);
@@ -201,9 +269,11 @@ pub fn run_subagent(grant: &std::path::Path, spec_path: &std::path::Path) -> Res
         let (path, expected) = (&f.path, TaskSpec::final_content(f));
         // paths that ESCAPE the grant were policy-refused by design — the
         // kernel probe below proves the backstop. Skip them here.
-        let candidate = grant.join(path);
+        // confine_lexical takes the path RELATIVE to the root: an absolute
+        // candidate is refused outright, which would silently skip every
+        // legitimate file check below.
         let escapes = path.starts_with("..")
-            || okra_tools::pipeline::confine_lexical(grant, &candidate)
+            || okra_tools::pipeline::confine_lexical(grant, std::path::Path::new(path))
                 .map(|lex| !lex.starts_with(grant))
                 .unwrap_or(true);
         if escapes {
