@@ -27,7 +27,7 @@ use okra_tools::Registry;
 use crate::demo_sampler::DemoPlanner;
 
 /// One live session projection.
-struct SessionProjection {
+pub struct SessionProjection {
     session_id: String,
     rows: Vec<serde_json::Value>,
     control: serde_json::Value,
@@ -37,7 +37,7 @@ struct SessionProjection {
 }
 
 impl SessionProjection {
-    fn new(session_id: String, _cwd: std::path::PathBuf) -> Self {
+    pub fn new(session_id: String, _cwd: std::path::PathBuf) -> Self {
         SessionProjection {
             session_id,
             rows: Vec::new(),
@@ -102,7 +102,7 @@ fn now_ms() -> f64 {
         .unwrap_or(0.0)
 }
 
-fn uuid_v4() -> String {
+pub fn uuid_v4() -> String {
     // random enough for a demo turn id; no uuid dependency needed
     let mut bytes = [0u8; 16];
     let nanos = std::time::SystemTime::now()
@@ -154,7 +154,7 @@ impl Outbound {
     }
 }
 
-fn projection_notification(
+pub fn projection_notification(
     topic: &str,
     p: &SessionProjection,
 ) -> serde_json::Value {
@@ -172,16 +172,22 @@ fn projection_notification(
 }
 
 /// Run one full turn against the demo planner, streaming row updates into
-/// the projection and notifying the bridge after each change.
-fn run_turn_streaming(
-    outbound: Arc<Outbound>,
+/// the projection and notifying the attached surface after each change.
+/// `steering` (G4): when present, drained at every projection update —
+/// a steered message becomes a user row on the SAME live session, from
+/// whichever surface submitted it.
+#[allow(clippy::too_many_arguments)]
+pub fn run_turn_streaming(
+    notify: &mut dyn FnMut(&str, serde_json::Value),
     topic: String,
     session_id: String,
     cwd: std::path::PathBuf,
     sessions_dir: std::path::PathBuf,
     input_text: String,
     turn_row_lock: Arc<Mutex<SessionProjection>>,
+    steering: Option<Arc<Mutex<std::collections::VecDeque<String>>>>,
 ) -> Result<TurnOutcome, String> {
+    let steering_rx = steering;
     // 1. turnHeader (running) + userInput rows
     let (assistant_row_slot, turn_id) = {
         let mut p = turn_row_lock.lock().unwrap();
@@ -209,7 +215,7 @@ fn run_turn_streaming(
         p.control["phase"] = serde_json::json!("running");
         p.control["canStop"] = serde_json::json!(true);
         p.control["activeWorks"] = serde_json::json!([{ "kind": "primaryTurn", "startedAt": now_ms() }]);
-        outbound.notification(
+        notify(
             "v4/projection",
             projection_notification(&topic, &p)["params"].clone(),
         );
@@ -262,13 +268,26 @@ fn run_turn_streaming(
     let mut agent = Agent::new(config, Arc::new(sampler), Box::new(executor), kernel_session);
 
     // 3. drive the turn, streaming LoopEvents into rows
-    let outbound_for_events = outbound.clone();
     let topic_for_events = topic.clone();
     let row_lock = turn_row_lock.clone();
     let assistant_slot = assistant_row_slot.clone();
     let mut tool_row_by_call: std::collections::HashMap<String, u64> = Default::default();
     let outcome = agent.run_turn(&input_text, &mut |ev: LoopEvent| {
         let mut p = row_lock.lock().unwrap();
+        // G4 steering drain: steered text becomes a user row on the live
+        // session (from whichever surface submitted it)
+        while let Some(steer_text) = steering_rx
+            .as_ref()
+            .and_then(|q| q.lock().ok().and_then(|mut q| q.pop_front()))
+        {
+            let (_row_id, base, _) = p.base_row(&turn_id);
+            let mut r = base;
+            r["kind"] = serde_json::json!("userInput");
+            r["text"] = serde_json::json!(format!("[steered] {steer_text}"));
+            r["origin"] = serde_json::json!("realUser");
+            p.upsert_row(r);
+            p.revision += 1;
+        }
         match ev {
             LoopEvent::TextDelta { text } => {
                 let mut slot = assistant_slot.lock().unwrap();
@@ -321,7 +340,7 @@ fn run_turn_streaming(
             }
             _ => {}
         }
-        outbound_for_events.notification(
+        notify(
             "v4/projection",
             projection_notification(&topic_for_events, &p)["params"].clone(),
         );
@@ -362,7 +381,7 @@ fn run_turn_streaming(
         p.control["canStop"] = serde_json::json!(false);
         p.control["activeWorks"] = serde_json::json!([]);
         p.revision += 1;
-        outbound.notification(
+        notify(
             "v4/projection",
             projection_notification(&topic, &p)["params"].clone(),
         );
@@ -491,24 +510,25 @@ pub fn serve_stdio(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) ->
                         drop(sessions_guard);
                         let cwd2 = cwd.clone();
                         let sessions_dir2 = sessions_dir.clone();
-                        let session_id2 = session_id.clone();
-                        std::thread::spawn(move || {
-                            let _ = session_id2;
-                            if let Err(e) = run_turn_streaming(
-                                outbound.clone(),
-                                topic.clone(),
-                                session_id.clone(),
-                                cwd2,
-                                sessions_dir2,
-                                text,
-                                projection,
-                            ) {
-                                outbound.notification(
-                                    "v4/error",
-                                    serde_json::json!({ "topic": topic, "message": e }),
-                                );
-                            }
-                        });
+                        let mut notify = |m: &str, p: serde_json::Value| {
+                            outbound.notification(m, p)
+                        };
+                        let err_topic = topic.clone();
+                        if let Err(e) = run_turn_streaming(
+                            &mut notify,
+                            topic,
+                            session_id,
+                            cwd2,
+                            sessions_dir2,
+                            text,
+                            projection,
+                            None,
+                        ) {
+                            outbound.notification(
+                                "v4/error",
+                                serde_json::json!({ "topic": err_topic, "message": e }),
+                            );
+                        }
                     }
                     "stop" => {
                         // G0: turns are short demo turns; stop is accepted as a no-op

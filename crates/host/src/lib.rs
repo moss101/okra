@@ -9,6 +9,7 @@
 
 pub mod fsutil;
 pub mod git;
+pub mod oauth;
 pub mod notifications;
 pub mod safe_fs;
 pub mod terminal;
@@ -17,4 +18,5 @@ pub use notifications::{
     classify, redact_body, Notification, NotificationClass, NotificationsPolicy,
 };
 pub use git::{GitError, GitHead, GitRepository, GitStatusEntry};
+pub use oauth::{DeviceAuthorization, OAuthClient, OAuthDomain, OAuthError, TokenSet};
 pub use terminal::{TerminalHost, TerminalSession, TerminalSize};
