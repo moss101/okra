@@ -55,6 +55,36 @@ const TASKS: &[QualityTask] = &[
         setup: None,
     },
     QualityTask {
+        name: "read-verify-edit",
+        spec: r#"{
+            "task": "Read the config, fix the typo, verify",
+            "files": [
+                { "path": "settings.toml",
+                  "content": "[server]\nport = 8080\nhost = \"localhos\"\n",
+                  "edit": { "old": "localhos", "new": "localhost" } }
+            ]
+        }"#,
+        verify: &[("settings.toml", "[server]\nport = 8080\nhost = \"localhost\"\n")],
+        setup: None,
+    },
+    QualityTask {
+        name: "multi-file-create",
+        spec: r##"{
+            "task": "Create a README and a Makefile",
+            "files": [
+                { "path": "README.md",
+                  "content": "# My Project\nA sample project.\n" },
+                { "path": "Makefile",
+                  "content": "all:\n\techo building\n" }
+            ]
+        }"##,
+        verify: &[
+            ("README.md", "# My Project\nA sample project.\n"),
+            ("Makefile", "all:\n\techo building\n"),
+        ],
+        setup: None,
+    },
+    QualityTask {
         name: "bugfix-off-by-one",
         spec: r#"{
             "task": "Fix the sum function: it must include the last element",

@@ -324,7 +324,7 @@ fn main() {
         && argv.iter().any(|a| a == "--tcp")
     {
         let mut tcp_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let mut addr = String::from("127.0.0.1:0");
+        let addr = String::from("127.0.0.1:0");
         let mut i = 1;
         while i < argv.len() {
             match argv[i].as_str() {

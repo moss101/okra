@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use crate::serve::{run_turn_streaming, uuid_v4, SessionProjection};
@@ -18,7 +18,7 @@ pub struct SurfaceWriter {
 
 impl SurfaceWriter {
     pub fn send_line(&self, line: &[u8]) -> bool {
-        let mut w = match self.inner.lock() { Ok(mut w) => w, Err(_) => return false };
+        let mut w = match self.inner.lock() { Ok(w) => w, Err(_) => return false };
         w.write_all(line).and_then(|_| w.flush()).is_ok()
     }
 }
@@ -48,6 +48,7 @@ impl TcpServeState {
     fn next_static(&self) -> u64 {
         self.next_static.fetch_add(1, Ordering::SeqCst)
     }
+    #[allow(dead_code)]
     pub fn broadcast(&self, value: &serde_json::Value) {
         let line = serde_json::to_vec(value).unwrap_or_default();
         let mut writers = self.writers.lock().unwrap();
@@ -59,6 +60,7 @@ impl TcpServeState {
         for i in dead.into_iter().rev() { writers.remove(i); }
     }
 
+    #[allow(dead_code)]
     pub fn broadcast_bytes(&self, line: &[u8]) {
         let mut writers = self.writers.lock().unwrap();
         let mut dead = Vec::new();
