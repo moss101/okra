@@ -31,6 +31,7 @@ pub mod subagent;
 pub mod usage;
 pub mod skill_sync;
 pub mod surfaces;
+pub mod telemetry;
 pub mod terminal;
 
 pub use notifications::{
@@ -60,6 +61,7 @@ pub use prompt_transfer::{
     validate_ref as validate_prompt_ref, LocalTransfer, StageParams, StageResult,
     StagingTransfer, TransferError, TransferPhase, TransferProgress,
 };
+pub use telemetry::{TelemetryEvent, TelemetryLog};
 pub use settings::{SettingsError as SettingsStoreError, SettingsScope, SettingsStore};
 pub use surfaces::{AttachDecision, SurfaceError, SurfaceInfo, SurfaceKind, SurfaceRegistry};
 pub use usage::{GroupedUsage, UsageError, UsageLedger, UsageRecord, UsageSnapshot, UsageTotals};
