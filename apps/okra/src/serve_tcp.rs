@@ -62,10 +62,15 @@ impl TcpServeState {
 
     #[allow(dead_code)]
     pub fn broadcast_bytes(&self, line: &[u8]) {
+        // NDJSON: every frame is newline-terminated
+        let mut framed = line.to_vec();
+        if framed.last() != Some(&b'\n') {
+            framed.push(b'\n');
+        }
         let mut writers = self.writers.lock().unwrap();
         let mut dead = Vec::new();
         for (i, w) in writers.iter().enumerate() {
-            let ok = w.send_line(line);
+            let ok = w.send_line(&framed);
             if !ok { dead.push(i); }
         }
         for i in dead.into_iter().rev() { writers.remove(i); }
@@ -84,11 +89,17 @@ pub fn serve_tcp(state: Arc<TcpServeState>, listener: std::net::TcpListener) -> 
 fn handle_client(state: &Arc<TcpServeState>, stream: TcpStream) {
     let read_half = match stream.try_clone() { Ok(s) => s, Err(_) => return };
     let own_writer = Arc::new(Mutex::new(stream));
+    // register this surface for broadcasts; the broadcaster prunes dead
+    // writers when a surface disconnects
+    state.writers.lock().unwrap().push(SurfaceWriter {
+        inner: Arc::clone(&own_writer),
+    });
     let respond = move |id: u64, result: serde_json::Value| {
         let mut w = own_writer.lock().unwrap();
         let _ = w.write_all(
             serde_json::to_vec(&serde_json::json!({ "id": id, "result": result })).unwrap_or_default().as_slice(),
         );
+        let _ = w.write_all(b"\n");
         let _ = w.flush();
     };
     let reader = std::io::BufReader::new(read_half);

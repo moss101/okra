@@ -24,6 +24,40 @@ pub fn minimal_line(event: &str, payload: &serde_json::Value) -> Option<String> 
     }
 }
 
+/// Render a v4 conversation projection row into a scrollback line
+/// (the TUI as a G4 surface: the daemon's projection notifications are
+/// the same rows every surface sees).
+pub fn projection_row_line(row: &serde_json::Value) -> Option<String> {
+    let kind = row.get("kind")?.as_str()?;
+    match kind {
+        "turnHeader" => Some("── turn ──".into()),
+        "userInput" => row
+            .get("text")
+            .and_then(|t| t.as_str())
+            .map(|t| format!("> {t}")),
+        "assistantText" => {
+            let text = row.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            let state = row.get("state").and_then(|s| s.as_str()).unwrap_or("");
+            if state == "streaming" {
+                Some(text.to_string())
+            } else {
+                text.lines().next().map(str::to_string)
+            }
+        }
+        "toolCall" => {
+            let name = row.get("toolName").and_then(|n| n.as_str()).unwrap_or("tool");
+            let status = row.get("status").and_then(|s| s.as_str()).unwrap_or("running");
+            let marker = match status {
+                "success" => "✓",
+                "error" => "✗",
+                _ => "▸",
+            };
+            Some(format!("{marker} {name}"))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

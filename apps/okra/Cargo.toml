@@ -25,4 +25,5 @@ tempfile = { workspace = true }
 
 [dev-dependencies]
 okra-kernel = { workspace = true }
+okra-tui = { workspace = true }
 tempfile = { workspace = true }

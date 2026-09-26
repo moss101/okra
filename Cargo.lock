@@ -1208,6 +1208,7 @@ dependencies = [
  "okra-protocol",
  "okra-providers",
  "okra-tools",
+ "okra-tui",
  "serde",
  "serde_json",
  "tempfile",
