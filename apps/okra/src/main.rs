@@ -10,6 +10,7 @@
 //! behind the same Sampler seam at M1.
 
 mod demo_sampler;
+mod serve;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -117,6 +118,34 @@ fn build_registry(cwd: &std::path::Path) -> Registry {
 }
 
 fn main() {
+    // `okra serve --stdio --cwd DIR [--sessions DIR]`: G0 daemon mode
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("serve") {
+        let mut cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut sessions_dir = None;
+        let mut i = 1;
+        while i < argv.len() {
+            match argv[i].as_str() {
+                "--stdio" => {}
+                "--cwd" => {
+                    i += 1;
+                    cwd = PathBuf::from(argv.get(i).cloned().unwrap_or_default());
+                }
+                "--sessions" => {
+                    i += 1;
+                    sessions_dir = Some(PathBuf::from(argv.get(i).cloned().unwrap_or_default()));
+                }
+                other => {
+                    eprintln!("error: unknown serve flag {other}");
+                    std::process::exit(2);
+                }
+            }
+            i += 1;
+        }
+        let sessions_dir = sessions_dir.unwrap_or_else(|| cwd.join(".okra-sessions"));
+        serve::serve_stdio(cwd, sessions_dir);
+    }
+
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
