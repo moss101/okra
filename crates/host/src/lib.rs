@@ -7,6 +7,7 @@
 //!   ownership checks (§3 #52, ChatGPT2 docs/03)
 //! - fsutil: the single sanctioned canonicalize/home_dir call sites
 
+pub mod files;
 pub mod fsutil;
 pub mod git;
 pub mod oauth;
@@ -21,4 +22,9 @@ pub use notifications::{
 pub use git::{GitError, GitHead, GitRepository, GitStatusEntry};
 pub use oauth::{DeviceAuthorization, OAuthClient, OAuthDomain, OAuthError, TokenSet};
 pub use plugins::{PluginStore, SignedPluginEnvelope, SignatureVerdict, TrustStore};
+pub use files::{
+    Attachment, AttachmentKind, AttachmentOrigin, AttachmentStore, ChangeKind, DownloadEntry,
+    DownloadError, DownloadState, DownloadStore, FileChange, FileWatchService, LifecycleEvent,
+    LifecycleKind,
+};
 pub use terminal::{TerminalHost, TerminalSession, TerminalSize};
