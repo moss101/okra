@@ -7,6 +7,7 @@
 //!   ownership checks (§3 #52, ChatGPT2 docs/03)
 //! - fsutil: the single sanctioned canonicalize/home_dir call sites
 
+pub mod checkpoints;
 pub mod conversation_share;
 pub mod files;
 pub mod fsutil;
@@ -29,6 +30,10 @@ pub use git::{
 };
 pub use oauth::{DeviceAuthorization, OAuthClient, OAuthDomain, OAuthError, TokenSet};
 pub use plugins::{PluginStore, SignedPluginEnvelope, SignatureVerdict, TrustStore};
+pub use checkpoints::{
+    CheckpointError, CheckpointManager, FileSnapshot, GitState, RestoreReport, RewindCheckpoint,
+    RewindPoint,
+};
 pub use conversation_share::{
     build_integrity, build_public_projection, canonical_json, verify_integrity, PublicProjection,
     ProjectionErrorKind, ShareError, ShareIntegrity,

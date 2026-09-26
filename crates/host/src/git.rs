@@ -147,6 +147,23 @@ impl GitRepository {
         Ok(())
     }
 
+    /// Move HEAD and the index to `hash` and force the working tree to
+    /// match — the checkpoint git-restore primitive (#38). The hash must
+    /// be a plain hex object id.
+    pub fn reset_hard(&self, hash: &str) -> Result<(), GitError> {
+        let valid = !hash.is_empty()
+            && (hash.len() == 40 || hash.len() == 64)
+            && hash.bytes().all(|b| b.is_ascii_hexdigit());
+        if !valid {
+            return Err(GitError::UnsafeRef(hash.to_string()));
+        }
+        run_git(
+            &self.root,
+            &["reset", "--hard", hash],
+        )?;
+        Ok(())
+    }
+
     pub fn worktree_list(&self) -> Result<Vec<PathBuf>, GitError> {
         let out = run_git(&self.root, &["worktree", "list", "--porcelain"])?;
         let mut paths = Vec::new();
