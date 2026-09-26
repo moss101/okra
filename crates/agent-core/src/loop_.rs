@@ -30,6 +30,7 @@ use crate::governors::{
     StationarityTracker,
 };
 use crate::steering::{format_as_user_message, SteeringInbox};
+use crate::tasks::{automation_mutation_allowed, AutomationGuardDecision, TurnDispatch};
 use okra_compaction::OriginTag;
 use crate::turn::{CancellationCategory, CompletedStop, TurnOutcome, TurnPhase, TurnMachine};
 
@@ -109,6 +110,9 @@ pub struct PolicyToolExecutor {
     pub grants: GrantStore,
     pub lattice: PermissionLattice,
     pub ceiling: ToolApprovalCeiling,
+    /// Automation self-mutation guard (#40): how THIS turn was dispatched.
+    /// Ordinary for interactive turns; set before running automation turns.
+    pub turn_dispatch: TurnDispatch,
     executions: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
@@ -120,6 +124,7 @@ impl PolicyToolExecutor {
             grants: GrantStore::new(1),
             lattice: PermissionLattice::new(),
             ceiling: ToolApprovalCeiling::GrantsAllowed,
+            turn_dispatch: TurnDispatch::Ordinary,
             executions: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -153,6 +158,21 @@ impl ToolExecutor for PolicyToolExecutor {
             .unwrap()
             .entry(call.name.clone())
             .or_insert(0) += 1;
+        // #40 automation self-mutation guard, first check of the turn:
+        // a scheduled turn must not reschedule itself; an idle turn must not
+        // spawn idle tasks. Pure deny on the name, before hooks/approval and
+        // independent of registry registration (the loop's ToolCallFinished
+        // fires from the returned tuple).
+        if automation_mutation_allowed(self.turn_dispatch, &call.name)
+            == AutomationGuardDecision::Denied
+        {
+            let reason = format!(
+                "denied by automation self-mutation guard ({:?} turn may not call {})",
+                self.turn_dispatch, call.name
+            );
+            return Ok((reason, true, false));
+        }
+
         let entry = self
             .registry
             .get(&call.name)

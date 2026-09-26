@@ -31,10 +31,26 @@ pub enum TaskStatus {
 }
 
 /// ZCode automation self-mutation guard (`automationToolPolicy.ts`):
-/// Cron*/OffPeak* mutation tools are DENIED on automation/off-peak turns —
-/// a scheduled task must not be able to reschedule itself.
-pub const AUTOMATION_MUTATION_TOOLS: [&str; 4] =
-    ["cron_create", "cron_update", "cron_delete", "offpeak_create"];
+/// on a cron-scheduled turn the turn must not be able to reschedule itself.
+pub const AUTOMATION_MUTATION_TOOLS: [&str; 3] =
+    ["cron_create", "cron_update", "cron_delete"];
+
+/// Separate constant, NEVER merged into `AUTOMATION_MUTATION_TOOLS` — a cron
+/// automation turn explicitly allows `offpeak_create` (scheduled work may
+/// spawn idle-time tasks); mixing the lists would make automation turns
+/// wrongly deny it. Only idle-dispatch turns deny `offpeak_create` (an idle
+/// task must not recursively spawn idle tasks); `offpeak_list` stays allowed.
+pub const OFF_PEAK_MUTATION_TOOLS: [&str; 1] = ["offpeak_create"];
+
+/// Where this turn was dispatched from — the guard's only input besides the
+/// tool name. `TaskKind::Scheduled` maps to `CronScheduled` when a run starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TurnDispatch {
+    #[default]
+    Ordinary,
+    CronScheduled,
+    IdleDispatch,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutomationGuardDecision {
@@ -42,15 +58,43 @@ pub enum AutomationGuardDecision {
     Denied,
 }
 
-/// The guard: is `tool` allowed on a turn driven by a `scheduled` task?
-pub fn automation_mutation_allowed(turn_task_kind: Option<TaskKind>, tool: &str) -> AutomationGuardDecision {
-    if turn_task_kind == Some(TaskKind::Scheduled)
-        && AUTOMATION_MUTATION_TOOLS.contains(&tool)
-    {
+/// The guard: is `tool` allowed on a turn dispatched the given way?
+pub fn automation_mutation_allowed(
+    turn: TurnDispatch,
+    tool: &str,
+) -> AutomationGuardDecision {
+    let denied = match turn {
+        TurnDispatch::Ordinary => false,
+        TurnDispatch::CronScheduled => AUTOMATION_MUTATION_TOOLS.contains(&tool),
+        TurnDispatch::IdleDispatch => OFF_PEAK_MUTATION_TOOLS.contains(&tool),
+    };
+    if denied {
         AutomationGuardDecision::Denied
     } else {
         AutomationGuardDecision::Allowed
     }
+}
+
+/// `mergeAutomationMutationToolDenylist`: union into the session denylist,
+/// order-stable, no duplicates.
+pub fn merge_automation_mutation_denylist(current: &[String]) -> Vec<String> {
+    merge_denylist(current, &AUTOMATION_MUTATION_TOOLS)
+}
+
+/// `mergeOffPeakMutationToolDenylist` — separate for the same reason as the
+/// constants above.
+pub fn merge_off_peak_mutation_denylist(current: &[String]) -> Vec<String> {
+    merge_denylist(current, &OFF_PEAK_MUTATION_TOOLS)
+}
+
+fn merge_denylist(current: &[String], add: &[&str]) -> Vec<String> {
+    let mut merged = current.to_vec();
+    for tool in add {
+        if !merged.iter().any(|t| t == tool) {
+            merged.push((*tool).to_string());
+        }
+    }
+    merged
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -138,22 +182,52 @@ mod tests {
 
     #[test]
     fn automation_guard_denies_self_mutation_on_scheduled_turns() {
+        // cron turn: Cron* denied, OffPeakCreate explicitly allowed
         assert_eq!(
-            automation_mutation_allowed(Some(TaskKind::Scheduled), "cron_create"),
+            automation_mutation_allowed(TurnDispatch::CronScheduled, "cron_create"),
             AutomationGuardDecision::Denied
         );
         assert_eq!(
-            automation_mutation_allowed(Some(TaskKind::Scheduled), "cron_list"),
-            AutomationGuardDecision::Allowed
-        );
-        // the same tools are fine on ordinary turns
-        assert_eq!(
-            automation_mutation_allowed(Some(TaskKind::Job), "cron_create"),
-            AutomationGuardDecision::Allowed
+            automation_mutation_allowed(TurnDispatch::CronScheduled, "cron_delete"),
+            AutomationGuardDecision::Denied
         );
         assert_eq!(
-            automation_mutation_allowed(None, "cron_delete"),
+            automation_mutation_allowed(TurnDispatch::CronScheduled, "offpeak_create"),
             AutomationGuardDecision::Allowed
         );
+        assert_eq!(
+            automation_mutation_allowed(TurnDispatch::CronScheduled, "cron_list"),
+            AutomationGuardDecision::Allowed
+        );
+        // idle turn: OffPeakCreate denied (no recursive idle spawns), Cron* fine
+        assert_eq!(
+            automation_mutation_allowed(TurnDispatch::IdleDispatch, "offpeak_create"),
+            AutomationGuardDecision::Denied
+        );
+        assert_eq!(
+            automation_mutation_allowed(TurnDispatch::IdleDispatch, "cron_create"),
+            AutomationGuardDecision::Allowed
+        );
+        // the same tools are all fine on ordinary turns
+        for tool in ["cron_create", "cron_delete", "offpeak_create"] {
+            assert_eq!(
+                automation_mutation_allowed(TurnDispatch::Ordinary, tool),
+                AutomationGuardDecision::Allowed
+            );
+        }
+    }
+
+    #[test]
+    fn denylist_merge_is_order_stable_and_dedup_free() {
+        let merged = merge_automation_mutation_denylist(&["bash".into()]);
+        assert_eq!(merged, ["bash", "cron_create", "cron_update", "cron_delete"]);
+        // re-merge adds nothing
+        assert_eq!(
+            merge_automation_mutation_denylist(&merged),
+            merged
+        );
+        // off-peak list stays separate from the cron list
+        let off = merge_off_peak_mutation_denylist(&[]);
+        assert_eq!(off, ["offpeak_create"]);
     }
 }
