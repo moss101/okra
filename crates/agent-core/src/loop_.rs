@@ -87,6 +87,11 @@ pub trait ToolExecutor: Send {
     fn tool_views(&self) -> Vec<ToolView>;
 
     fn set_sandbox_mode(&mut self, mode: SandboxMode);
+
+    /// Hook (#45) telemetry: (events fired, contained failures).
+    fn hook_stats(&self) -> (u64, u64) {
+        (0, 0)
+    }
 }
 
 /// Tool-plane wiring: registry dispatch + approval service + grants +
@@ -114,6 +119,13 @@ impl PolicyToolExecutor {
 }
 
 impl ToolExecutor for PolicyToolExecutor {
+    fn hook_stats(&self) -> (u64, u64) {
+        (
+            self.registry.hook_system.events_fired(),
+            self.registry.hook_system.failures(),
+        )
+    }
+
     fn execute(
         &mut self,
         call: &ToolCall,
@@ -211,11 +223,33 @@ impl ToolExecutor for PolicyToolExecutor {
         }
 
         // execute the approved bytes (registry re-validates hooks on the
-        // same canonical bytes — approved bytes = executed bytes)
-        let stream = self
-            .registry
-            .dispatch(&call.name, &approved.args(), &[])
-            .map_err(|e| format!("dispatch: {e}"))?;
+        // same canonical bytes — approved bytes = executed bytes).
+        // A hook `Ask` verdict routes through the approval service
+        // (prompt gate): denied -> blocked; granted -> re-dispatch with the
+        // ask satisfied (recorded in the audit trail).
+        let stream = match self.registry.dispatch(&call.name, &approved.args(), &[]) {
+            Ok(stream) => stream,
+            Err(okra_tools::RegistryError::HookAsk { .. }) => {
+                let (outcome, _audit) = self
+                    .approvals
+                    .decide(&call.name, &call.id, &args_json);
+                if !outcome.grants() {
+                    let reason = format!("hook asked; {}", outcome.denial_reason());
+                    events(LoopEvent::ToolCallFinished {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        is_error: true,
+                        output: reason.clone(),
+                    });
+                    return Ok((reason, true, false));
+                }
+                match self.registry.dispatch_allow_ask(&call.name, &approved.args(), &[]) {
+                    Ok(stream) => stream,
+                    Err(e) => return Err(format!("dispatch: {e}")),
+                }
+            }
+            Err(e) => return Err(format!("dispatch: {e}")),
+        };
         let mut text = String::new();
         let mut is_error = false;
         let mut true_noop = false;
@@ -303,6 +337,11 @@ impl<S: Sampler + ?Sized> Agent<S> {
 
     pub fn steering_sender(&self) -> std::sync::mpsc::Sender<crate::steering::Tagged> {
         self.steering.sender()
+    }
+
+    /// Hook (#45) telemetry from the executor: (events fired, failures).
+    pub fn hook_stats(&self) -> (u64, u64) {
+        self.executor.hook_stats()
     }
 
     pub fn session(&self) -> &kernel::SessionHandle {

@@ -30,12 +30,14 @@ M1  agent + CLI parity          ✔ multi-file coding tasks via `--task`
                                   OpenAI-compatible provider (`--provider
                                   openai`); kernel sandbox via nono
                                   (`--sandbox`, Seatbelt/Landlock)
-M2  context / memory / skills   ◐ compaction wired (prefire two-pass +
-                                  validated install + byte-stable head);
-                                  #28 microcompaction, #29 file-state
-                                  hydration, #33 tiered memory recall
-                                  (secret-redacted) — benchmark green in
-                                  BOTH profiles (layered + summary-only)
+M2  context / memory / skills   ◐ #28 microcompaction, #29 hydration,
+                                  #33 memory recall, compaction (prefire
+                                  two-pass + validated install + byte-stable
+                                  head), #45 hooks (20 events, deny>ask>
+                                  allow), #47 MCP client + use_tool funnel
+                                  — benchmark green in BOTH compaction
+                                  profiles (layered + summary-only);
+                                  remaining: skills, agent-quality bench
 M3  host services + alpha       ☐      M4 surfaces ☐      M5 differentiators ☐
 ```
 

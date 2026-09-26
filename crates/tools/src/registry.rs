@@ -45,6 +45,8 @@ impl ErasedTool {
 pub enum RegistryError {
     #[error("unknown tool `{0}`")]
     UnknownTool(String),
+    #[error("hook asks for approval on `{tool}`: {reason}")]
+    HookAsk { tool: String, reason: String },
     #[error("duplicate tool `{0}`")]
     Duplicate(String),
     #[error("pipeline: {0}")]
@@ -61,6 +63,12 @@ pub struct Registry {
     tools: HashMap<String, ErasedTool>,
     normalizers: Vec<Box<dyn ArgumentNormalizer>>,
     hooks: Vec<Box<dyn PreToolUseHook>>,
+    /// External hook system (#45): 20-event set, deny>ask>allow, contained
+    /// failures. Wired into the dispatch funnel below.
+    pub hook_system: crate::hooks::HookSystem,
+    /// When a hook verdict is Ask, dispatch returns this error and the
+    /// executor routes it through the approval service (prompt gate).
+    pub hook_ask_rejects: bool,
 }
 
 impl Default for Registry {
@@ -71,7 +79,13 @@ impl Default for Registry {
 
 impl Registry {
     pub fn new() -> Self {
-        Registry { tools: HashMap::new(), normalizers: Vec::new(), hooks: Vec::new() }
+        Registry {
+            tools: HashMap::new(),
+            normalizers: Vec::new(),
+            hooks: Vec::new(),
+            hook_system: crate::hooks::HookSystem::new(),
+            hook_ask_rejects: false,
+        }
     }
 
     pub fn register(&mut self, tool: ErasedTool) -> Result<(), RegistryError> {
@@ -116,6 +130,16 @@ impl Registry {
         raw_args: &Value,
         extra_hooks: &[&dyn PreToolUseHook],
     ) -> Result<ToolStream, RegistryError> {
+        self.dispatch_inner(tool_name, raw_args, extra_hooks, false)
+    }
+
+    fn dispatch_inner(
+        &self,
+        tool_name: &str,
+        raw_args: &Value,
+        extra_hooks: &[&dyn PreToolUseHook],
+        allow_ask: bool,
+    ) -> Result<ToolStream, RegistryError> {
         let tool = self.get(tool_name)?;
         let normalizers: Vec<&dyn ArgumentNormalizer> =
             self.normalizers.iter().map(|b| b.as_ref()).collect();
@@ -126,13 +150,62 @@ impl Registry {
         }
         let approved =
             normalize_before_hooks(&tool.entry, raw_args, &normalizers, &hooks)?;
+
+        // external hooks (#45): PreToolUse — deny > ask > allow. Deny is
+        // fatal; Ask surfaces as HookAsk for the executor's prompt gate.
+        let pre_verdict = self.hook_system.emit(
+            "PreToolUse",
+            Some(tool_name),
+            &serde_json::json!({ "tool": tool_name, "args": approved.args() }),
+        );
+        match pre_verdict {
+            crate::hooks::HookVerdict::Deny { reason } => {
+                return Err(RegistryError::Pipeline(PipelineError::HookDenied {
+                    hook: "hooks:PreToolUse".into(),
+                    tool: tool_name.into(),
+                    reason,
+                }));
+            }
+            crate::hooks::HookVerdict::Ask { reason }
+                if self.hook_ask_rejects && !allow_ask =>
+            {
+                return Err(RegistryError::HookAsk { tool: tool_name.into(), reason });
+            }
+            _ => {}
+        }
+
         let args = approved.args();
         let stream = (tool.execute)(&args);
         stream.validate().map_err(|e| RegistryError::StreamProtocol(match &e {
             crate::stream::ToolError::Custom { code, message } => format!("{code}: {message}"),
             other => format!("{other:?}"),
         }))?;
+
+        // PostToolUse: observe/deny-capable telemetry; never fatal here
+        let _ = self.hook_system.emit(
+            "PostToolUse",
+            Some(tool_name),
+            &serde_json::json!({ "tool": tool_name }),
+        );
         Ok(stream)
+    }
+
+    /// Like `dispatch`, but an Ask verdict from the external hook system is
+    /// treated as satisfied (the caller recorded the prompt outcome) instead
+    /// of surfacing `HookAsk` again.
+    pub fn dispatch_allow_ask(
+        &self,
+        tool_name: &str,
+        raw_args: &Value,
+        extra_hooks: &[&dyn PreToolUseHook],
+    ) -> Result<ToolStream, RegistryError> {
+        match self.dispatch_inner(tool_name, raw_args, extra_hooks, true) {
+            Err(RegistryError::HookAsk { .. }) => {
+                // a hook still asks even with the override: obey it
+                self.dispatch_inner(tool_name, raw_args, extra_hooks, false)
+            }
+            other => other,
+        }
     }
 
     /// Registry-scoped hook verdict without executing (policy probes).

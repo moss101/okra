@@ -9,6 +9,7 @@ description = "Tool runtime: streams, ToolSpec, policy metadata, ToolAccesses sc
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

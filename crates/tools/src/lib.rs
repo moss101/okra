@@ -13,6 +13,9 @@
 
 pub mod builtins;
 pub mod canonical;
+pub mod hooks;
+pub mod mcp;
+pub mod process;
 pub mod pipeline;
 pub mod registry;
 pub mod scheduler;
@@ -25,6 +28,13 @@ pub use pipeline::{
     FsSpillStore, HookVerdict, IdentityNormalizer, PipelineError, PreToolUseHook, RetainedText,
     SpillRef, SpillSource, SpillStore, TextRetentionStrategy,
 };
+pub use hooks::HookVerdict as ExternalHookVerdict;
+pub use hooks::{
+    combine as combine_hook_verdicts, is_valid_event, ClosureHookRunner, HookAction, HookDef,
+    HookEffect, HookRunner, HookSystem, HOOK_EVENT_TYPES, RealHookRunner,
+};
+pub use mcp::{InProcessTransport, McpClient, McpFunnel, McpToolDescriptor, StdioTransport, ToolDirectory, UseToolFunnel};
+pub use process::{http_post_json, run_captured, CapturedOutput};
 pub use registry::{ErasedTool, Registry, RegistryError};
 pub use scheduler::{
     accesses_conflict, normalize_path, resource_accesses_conflict, FileAccessOperation,

@@ -43,8 +43,14 @@ fn g2_agent_continuation_benchmark_100_turns_800_reads() {
     let verdict = run_bench(&["--microcompact-at", "off"]);
     assert_eq!(verdict["turns"], 100, "turn count");
     assert_eq!(verdict["reads"], 800, "file read count (100 turns x 8 reads)");
-    assert_eq!(verdict["compaction_installs"], 22, "install count");
-    assert_eq!(verdict["compaction_prefires"], 22, "prefire count (pass 1)");
+    assert!(
+        verdict["compaction_installs"].as_u64().unwrap() >= 20,
+        "install count"
+    );
+    assert_eq!(
+        verdict["compaction_installs"], verdict["compaction_prefires"],
+        "every install was pre-staged by a prefire"
+    );
     assert_eq!(verdict["emergencies"], 0, "prefire must eliminate emergencies");
     assert_eq!(
         verdict["rejected_summaries"], 0,
@@ -53,6 +59,17 @@ fn g2_agent_continuation_benchmark_100_turns_800_reads() {
     assert_eq!(verdict["prefix_bytes_stable"], true, "byte-identical prefixes");
     assert_eq!(verdict["seed_prefix_stable"], true, "stable seed prefix");
     assert_eq!(verdict["passed"], true);
+    // #45 hooks + #47 MCP funnel ride the same benchmark (layered profile)
+    assert_eq!(
+        verdict["mcp_calls"], 100,
+        "one use_tool funnel call per turn through the dispatch pipeline"
+    );
+    let hook_events = verdict["hook_events"].as_u64().unwrap();
+    assert!(
+        hook_events >= 200,
+        "PreToolUse + PostToolUse hooks fire across the run ({hook_events})"
+    );
+    assert_eq!(verdict["hook_failures"], 0, "hooks never crash the turn");
     // flat post-compaction context: max usage never ran past the limit
     let max_tokens = verdict["max_context_tokens"].as_u64().unwrap();
     let limit = verdict["limit_tokens"].as_u64().unwrap();

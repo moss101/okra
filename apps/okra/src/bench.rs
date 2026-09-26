@@ -20,7 +20,10 @@ use okra_policy::approval::{ApprovalPolicy, ApprovalService};
 use okra_providers::{SampleRequest, SampleResponse, Sampler, SamplerError, StopReason, ToolCall, Usage};
 use std::sync::{Arc, Mutex};
 
-use okra_tools::Registry;
+use okra_tools::{
+    ClosureHookRunner, HookAction, HookDef, HookEffect, HookSystem, McpClient, McpFunnel,
+    ToolDirectory, UseToolFunnel, Registry,
+};
 
 /// Reads `reads_per_turn` files per turn, cycling through the workspace
 /// files; then ends the turn.
@@ -34,6 +37,7 @@ pub struct BenchmarkPlanner {
 struct BenchState {
     sample_in_turn: usize,
     reads_issued: u64,
+    mcp_calls: u64,
 }
 
 impl BenchmarkPlanner {
@@ -48,6 +52,11 @@ impl BenchmarkPlanner {
     /// Mark the start of a new turn (resets the in-turn sample counter).
     pub fn next_turn(&self) {
         self.state.lock().unwrap().sample_in_turn = 0;
+    }
+
+    /// MCP funnel calls issued so far.
+    pub fn mcp_calls(&self) -> u64 {
+        self.state.lock().unwrap().mcp_calls
     }
 }
 
@@ -66,6 +75,26 @@ impl Sampler for BenchmarkPlanner {
                     name: "read_file".into(),
                     args_json: serde_json::json!({ "path": format!("bench/file{file_idx}.txt") })
                         .to_string(),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage { input_tokens: 30, output_tokens: 10 },
+            });
+        }
+        // one MCP funnel call per turn (use_tool -> mcp_echo)
+        if n == self.reads_per_turn {
+            st.mcp_calls += 1;
+            let turn = st.reads_issued;
+            return Ok(SampleResponse {
+                text: "Calling the MCP echo tool through the dispatch funnel.".into(),
+                tool_calls: vec![ToolCall {
+                    id: format!("bench-mcp-{turn}"),
+                    name: "use_tool".into(),
+                    args_json: serde_json::json!({
+                        "server": "bench-mcp",
+                        "tool": "mcp_echo",
+                        "arguments": { "text": format!("turn-{turn}") }
+                    })
+                    .to_string(),
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: Usage { input_tokens: 30, output_tokens: 10 },
@@ -106,6 +135,12 @@ pub struct BenchVerdict {
     /// Number of times the byte-stable head CHANGED across the run
     /// (initial state + one change per world mutation — bounded churn).
     pub head_changes: u64,
+    /// MCP (#47): use_tool funnel calls completed.
+    pub mcp_calls: u64,
+    /// Hooks (#45): events fired through the dispatch pipeline.
+    pub hook_events: u64,
+    /// Hooks contained failures (must be 0).
+    pub hook_failures: u64,
     pub passed: bool,
 }
 
@@ -144,6 +179,70 @@ pub fn run_benchmark(
             move |args| rf.execute(args, None),
         ))
         .map_err(|e| format!("register read_file: {e}"))?;
+
+    // MCP funnel (#47): in-process mock server with two deferred tools
+    let mut funnel = McpFunnel::new();
+    let client = McpClient::in_process("bench-mcp", Box::new(|method, params| match method {
+        "initialize" => Ok(serde_json::json!({
+            "protocolVersion": "2024-11-05",
+            "serverInfo": { "name": "bench-mcp" }
+        })),
+        "tools/list" => Ok(serde_json::json!({
+            "tools": [
+                { "name": "mcp_echo", "description": "echo text",
+                  "inputSchema": { "type": "object" } },
+                { "name": "mcp_len", "description": "text length",
+                  "inputSchema": { "type": "object" } }
+            ]
+        })),
+        "tools/call" => {
+            let name = params["name"].as_str().unwrap_or_default();
+            let text = params["arguments"]["text"].as_str().unwrap_or_default();
+            match name {
+                "mcp_echo" => Ok(serde_json::json!({
+                    "content": [{ "type": "text", "text": format!("mcp-echo: {text}") }]
+                })),
+                "mcp_len" => Ok(serde_json::json!({
+                    "content": [{ "type": "text", "text": text.chars().count().to_string() }]
+                })),
+                _ => Ok(serde_json::json!({ "content": [], "isError": true })),
+            }
+        }
+        _ => Err(format!("unknown method {method}")),
+    }));
+    funnel.attach(client).map_err(|e| format!("mcp attach: {e}"))?;
+    let funnel_arc = Arc::new(funnel);
+    let use_tool = UseToolFunnel { funnel: Arc::clone(&funnel_arc) };
+    let entry = use_tool.entry();
+    registry
+        .register(okra_tools::ErasedTool::simple(entry, vec![], move |args| {
+            use_tool.execute(args)
+        }))
+        .map_err(|e| format!("register use_tool: {e}"))?;
+    let directory = ToolDirectory { funnel: Arc::clone(&funnel_arc) };
+    let entry = directory.entry();
+    registry
+        .register(okra_tools::ErasedTool::simple(entry, vec![], move |args| {
+            directory.execute(args)
+        }))
+        .map_err(|e| format!("register tool_directory: {e}"))?;
+
+    // hooks (#45): observe counters on the tool lifecycle
+    let mut hook_system = HookSystem::with_runner(Arc::new(ClosureHookRunner {
+        handler: Box::new(|_def, _payload| Ok(okra_tools::ExternalHookVerdict::Observe)),
+    }));
+    for event in ["PreToolUse", "PostToolUse"] {
+        hook_system
+            .register(HookDef {
+                event: event.into(),
+                matcher: None,
+                action: HookAction::Command { program: "true".into(), args: vec![] },
+                effect: HookEffect::Observe,
+                timeout_ms: 5_000,
+            })
+            .map_err(|e| format!("register hook: {e}"))?;
+    }
+    registry.hook_system = hook_system;
 
     let approvals = ApprovalService::new(ApprovalPolicy::Never);
     let mut executor = PolicyToolExecutor::new(registry, approvals);
@@ -203,6 +302,7 @@ pub fn run_benchmark(
     let mut prefix_heads: Vec<Vec<u8>> = Vec::new();
     let mut first_message_texts: Vec<String> = Vec::new();
     let mut seen_first_install = false;
+    let mut executor_hook_stats = (0u64, 0u64);
 
     let rewritten: Vec<usize> = (0..files.saturating_sub(1).max(1)).collect();
     for turn in 1..=turns {
@@ -229,6 +329,7 @@ pub fn run_benchmark(
             &format!("turn {turn}: read every bench file and summarize"),
             &mut |_| {},
         )?;
+        executor_hook_stats = agent.hook_stats();
         match outcome {
             okra_agent_core::turn::TurnOutcome::Completed { .. } => {}
             other => return Err(format!("turn {turn} did not complete: {other:?}")),
@@ -270,6 +371,8 @@ pub fn run_benchmark(
     let micro_required = microcompact_at.is_some();
     let micro_ok = !micro_required
         || (ctx.microcompactions() >= 1 && ctx.evicted_bytes() > 0);
+    let mcp_calls = planner.mcp_calls();
+    let (hook_events, registry_hook_failures) = executor_hook_stats;
     let passed = reads == (turns * reads_per_turn) as u64
         && installs + ctx.microcompactions() >= 1
         && emergencies == 0
@@ -281,7 +384,10 @@ pub fn run_benchmark(
         && (!with_hydration || ctx.hydrated_files() >= 4)
         && memory_recall_injected
         && !secret_leaked
-        && head_changes <= (files + 2) as u64;
+        && head_changes <= (files + 2) as u64
+        && mcp_calls == turns as u64
+        && hook_events >= mcp_calls * 2
+        && registry_hook_failures == 0;
 
     // best-effort scratch cleanup
     let _ = std::fs::remove_dir_all(&ws);
@@ -304,6 +410,9 @@ pub fn run_benchmark(
         hydrated_files: ctx.hydrated_files(),
         memory_recall_injected,
         head_changes,
+        mcp_calls,
+        hook_events,
+        hook_failures: registry_hook_failures,
         passed,
     })
 }
