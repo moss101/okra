@@ -15,6 +15,7 @@
 mod event;
 mod handle;
 mod invariant;
+mod repair;
 mod lease;
 mod storage;
 mod surface;
@@ -26,6 +27,10 @@ pub use event::{
 };
 pub use handle::{HandleError, SessionAccess, SessionHandle};
 pub use lease::{LeaseError, SessionWriteLease, LEASE_FILENAME};
+pub use repair::{
+    interrupted_turn_closers, needs_repair, validate_closers, TOOL_OUTCOME_UNKNOWN_CODE,
+    TOOL_OUTCOME_UNKNOWN_TEXT,
+};
 pub use storage::{
     claim_write_lease, scan_log, AppendDurability, AppendOutcome, JsonlLog, ScanResult, StorageError, LOG_FILENAME,
 };

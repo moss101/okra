@@ -154,13 +154,17 @@ impl ToolExecutor for PolicyToolExecutor {
             }
 
             // grant check first: exact (tool, args hash, policy version)
+            let unattended_yolo = self.ceiling == ToolApprovalCeiling::UnattendedAllowed
+                && self.approvals.policy() == ApprovalPolicy::Ask;
             if self.ceiling != ToolApprovalCeiling::AlwaysPrompt
                 && self.grants.check(&call.name, &args_json, &behavior, GrantScope::Conversation)
                     == GrantDecision::Granted
             {
                 // granted for exactly these bytes
-            } else if self.ceiling == ToolApprovalCeiling::UnattendedAllowed && self.approvals.policy() == ApprovalPolicy::Ask {
-                // unattended hosts honour yolo; we still record the decision
+            } else if unattended_yolo {
+                // UnattendedAllowed ceiling: hosts with no session owner may
+                // honour yolo; the arg-hash grant still records the decision
+                // so the audit trail stays complete.
             } else {
                 let (outcome, _audit) = self
                     .approvals
@@ -269,7 +273,7 @@ impl ToolExecutor for PolicyToolExecutor {
 }
 
 /// The agent. One per session; not Clone (owns the log handle).
-pub struct Agent<S: Sampler> {
+pub struct Agent<S: Sampler + ?Sized> {
     pub config: AgentConfig,
     sampler: Arc<S>,
     executor: Box<dyn ToolExecutor>,
@@ -279,7 +283,7 @@ pub struct Agent<S: Sampler> {
     turn_counter: u64,
 }
 
-impl<S: Sampler> Agent<S> {
+impl<S: Sampler + ?Sized> Agent<S> {
     pub fn new(
         config: AgentConfig,
         sampler: Arc<S>,
@@ -341,10 +345,20 @@ impl<S: Sampler> Agent<S> {
         // ---- phase: enter ----
         self.phase_transition(TurnPhase::ProcessingInput, &mut out)?;
         Self::emit(&mut out, LoopEvent::TurnStarted { turn: turn_no });
-        self.log(vec![
-            kernel::make_log_only_event("turn/start", serde_json::json!({ "turn": turn_no }), clock),
-            kernel::make_event("user/message", serde_json::json!({ "text": input }), clock),
-        ])?;
+        // Durable boundary 1: turn/start
+        self.log(vec![kernel::make_log_only_event(
+            "turn/start",
+            serde_json::json!({ "turn": turn_no }),
+            clock,
+        )])?;
+        fault_inject_at_boundary("turn_start_logged");
+        // Durable boundary 2: the user message is on the surface
+        self.log(vec![kernel::make_event(
+            "user/message",
+            serde_json::json!({ "text": input }),
+            clock,
+        )])?;
+        fault_inject_at_boundary("user_message_logged");
 
         // pending tool calls awaiting results (assistant calls from last step)
         let mut history: Vec<Message> = vec![Message::user(input)];
@@ -478,6 +492,7 @@ impl<S: Sampler> Agent<S> {
                     serde_json::json!({ "text": response.text }),
                     clock,
                 )])?;
+                fault_inject_at_boundary("assistant_message_logged");
             }
 
             // ---- length salvage ----
@@ -550,6 +565,9 @@ impl<S: Sampler> Agent<S> {
                         serde_json::json!({ "callId": call.id, "tool": call.name }),
                         clock,
                     )])?;
+                    // Durable boundary: the call intent is on disk BEFORE any
+                    // side effect — recovery marks it outcome-unknown.
+                    fault_inject_at_boundary("tool_call_logged");
                     let result = self.executor.execute(call, &mut |ev| {
                         // nested borrow: route progress events out
                         events(ev);
@@ -590,7 +608,9 @@ impl<S: Sampler> Agent<S> {
                         }),
                         clock,
                     )
-                }).collect())?;
+                })
+                .collect())?;
+                fault_inject_at_boundary("tool_result_logged");
 
                 self.phase_transition(TurnPhase::AggregatingResults, &mut out)?;
                 history.extend(results);
@@ -659,6 +679,29 @@ impl<S: Sampler> Agent<S> {
         };
 
         self.steering.set_turn_running(false);
+        // Durable boundary: the turn is closed on disk on EVERY path.
+        {
+            let (kind, stop_label): (&str, Option<&str>) = match &outcome {
+                TurnOutcome::Completed { stop, .. } => (
+                    "completed",
+                    Some(match stop {
+                        CompletedStop::EndTurn => "end_turn",
+                        CompletedStop::MaxTokens => "max_tokens",
+                        CompletedStop::Refusal => "refusal",
+                    }),
+                ),
+                TurnOutcome::Cancelled { .. } => ("cancelled", None),
+                TurnOutcome::MaxTurnsReached { .. } => ("max_turns", None),
+                TurnOutcome::StationarityEnded => ("stationarity", None),
+            };
+            self.log(vec![kernel::make_log_only_event(
+                "turn/end",
+                serde_json::json!({ "turn": turn_no, "kind": kind, "stop": stop_label }),
+                clock,
+            )])
+            .ok();
+            fault_inject_at_boundary("turn_end_logged");
+        }
         let outcome = match outcome {
             TurnOutcome::Cancelled { category } => {
                 self.phase_transition(TurnPhase::Error, &mut out)?;
@@ -694,6 +737,32 @@ impl<S: Sampler> Agent<S> {
         .unwrap_or_default();
         events(LoopEvent::TurnFinished { outcome: outcome_json });
         Ok(outcome)
+    }
+}
+
+/// Fault injection: `OKRA_KILL_AT_BOUNDARY="<name>:<n>"` aborts the process
+/// right AFTER the named durable boundary is fsynced (G1 matrix):
+/// turn_start_logged | user_message_logged | assistant_message_logged |
+/// tool_call_logged | tool_result_logged | turn_end_logged.
+fn fault_inject_at_boundary(name: &str) {
+    let Ok(spec) = std::env::var("OKRA_KILL_AT_BOUNDARY") else {
+        return;
+    };
+    let Some((want, nth)) = spec.rsplit_once(':') else {
+        return;
+    };
+    let Ok(nth) = nth.parse::<u64>() else {
+        return;
+    };
+    if want != name {
+        return;
+    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
+    if n == nth {
+        eprintln!("[killAtBoundary] aborting after {name} (occurrence {n})");
+        std::process::abort();
     }
 }
 

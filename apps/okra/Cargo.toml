@@ -19,3 +19,7 @@ okra-providers = { workspace = true }
 okra-gateway = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+okra-kernel = { workspace = true }
+tempfile = { workspace = true }

@@ -19,6 +19,7 @@ pub mod scheduler;
 pub mod spec;
 pub mod stream;
 
+pub use builtins::{atomic_write as atomic_write_builtin, resolve_in_workspace};
 pub use pipeline::{
     apply_output_budget, normalize_before_hooks, retain_text, ApprovedInvocation, ArgumentNormalizer,
     FsSpillStore, HookVerdict, IdentityNormalizer, PipelineError, PreToolUseHook, RetainedText,

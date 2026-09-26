@@ -91,7 +91,9 @@ pub fn extract_content_blocks(v: &Value) -> Vec<ContentBlock> {
     match v {
         Value::String(s) => vec![ContentBlock::Text { text: s.clone() }],
         Value::Object(o) => {
-            if let Some(Value::String(text)) = o.get("text").or_else(|| o.get("output")) {
+            if let Some(Value::String(text)) =
+                o.get("text").or_else(|| o.get("output")).or_else(|| o.get("content"))
+            {
                 return vec![ContentBlock::Text { text: text.clone() }];
             }
             vec![ContentBlock::Text { text: v.to_string() }]

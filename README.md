@@ -23,8 +23,11 @@ M0  skeleton                    ✔ workspace, policy files, protocol port with
 M0  gate G0                     ✔ ZCode's existing Electron UI displays a
                                   real turn produced by the okra daemon
                                   (okra serve + host-side bridge, N0005)
-M1  agent + CLI parity          ◐ tool plane, policy stack, session log,
-                                  governors, fault injection (in progress)
+M1  agent + CLI parity          ◐ multi-file coding tasks via `--task`
+                                  (write/edit/verify + corrective writes);
+                                  kill matrix recovers from ALL 6 durable
+                                  boundaries — no double-exec, no torn state;
+                                  remaining: real model providers (N0004)
 M2  context / memory / skills   ◐ compaction summary schema, origin tags
 M3  host services + alpha       ☐      M4 surfaces ☐      M5 differentiators ☐
 ```

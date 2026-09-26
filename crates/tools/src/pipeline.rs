@@ -308,6 +308,22 @@ pub fn apply_output_budget(
     (retained.text, spill)
 }
 
+/// Lexically confine `candidate` under `root` without touching the
+/// filesystem (write paths that do not exist yet).
+pub fn confine_lexical(root: &Path, candidate: &Path) -> PathBuf {
+    let mut out = root.to_path_buf();
+    for component in candidate.components() {
+        match component {
+            std::path::Component::Normal(c) => out.push(c),
+            std::path::Component::CurDir => {}
+            // ParentDir was already collapsed against root by callers via
+            // canonicalize(root); a `..` here escapes — stop extending.
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Ensure a path is inside the workspace root — used by builtins (M0) and
 /// subagent FS isolation later (M5).
 pub fn confine_path_inside(root: &Path, candidate: &Path) -> Option<PathBuf> {

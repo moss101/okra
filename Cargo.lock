@@ -135,6 +135,7 @@ dependencies = [
  "okra-tools",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
