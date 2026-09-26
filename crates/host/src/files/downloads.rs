@@ -458,12 +458,12 @@ mod tests {
         let a = s.begin("c1", "u", td.path().join("a"), None);
         let b = s.begin("c2", "u", td.path().join("b"), None);
         assert_eq!(s.unacknowledged_ids().len(), 2);
-        s.acknowledge(&[a.id.clone()]);
+        s.acknowledge(std::slice::from_ref(&a.id));
         assert_eq!(s.unacknowledged_ids(), vec![b.id.clone()]);
         assert_eq!(s.acknowledge_all(), 1);
         assert!(s.unacknowledged_ids().is_empty());
         // idempotent re-ack
-        s.acknowledge(&[a.id.clone()]);
+        s.acknowledge(std::slice::from_ref(&a.id));
         assert!(s.unacknowledged_ids().is_empty());
     }
 

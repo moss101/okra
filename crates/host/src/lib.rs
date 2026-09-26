@@ -10,6 +10,7 @@
 pub mod files;
 pub mod fsutil;
 pub mod git;
+pub mod mcp_sync;
 pub mod oauth;
 pub mod notifications;
 pub mod plugins;
@@ -26,5 +27,9 @@ pub use files::{
     Attachment, AttachmentKind, AttachmentOrigin, AttachmentStore, ChangeKind, DownloadEntry,
     DownloadError, DownloadState, DownloadStore, FileChange, FileWatchService, LifecycleEvent,
     LifecycleKind,
+};
+pub use mcp_sync::{
+    ExportedServer, ImportOutcome, ImportStatus, McpServerRecord, McpSyncCandidate,
+    McpSyncDescriptor, McpSyncError, McpSyncService, McpSyncSource, PathRewrite,
 };
 pub use terminal::{TerminalHost, TerminalSession, TerminalSize};
