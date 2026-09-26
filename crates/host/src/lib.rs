@@ -23,7 +23,10 @@ pub mod terminal;
 pub use notifications::{
     classify, redact_body, Notification, NotificationClass, NotificationsPolicy,
 };
-pub use git::{GitError, GitHead, GitRepository, GitStatusEntry};
+pub use git::{
+    FileSource, GhRunner, GitError, GitHead, GitRepository, GitStatusEntry, RealGh,
+    MAX_GIT_FILE_BYTES,
+};
 pub use oauth::{DeviceAuthorization, OAuthClient, OAuthDomain, OAuthError, TokenSet};
 pub use plugins::{PluginStore, SignedPluginEnvelope, SignatureVerdict, TrustStore};
 pub use conversation_share::{
