@@ -19,6 +19,7 @@ okra-compaction = { workspace = true }
 okra-memory = { workspace = true }
 okra-providers = { workspace = true }
 okra-gateway = { workspace = true }
+okra-host = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

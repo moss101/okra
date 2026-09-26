@@ -284,6 +284,47 @@ fn main() {
         }
     }
 
+    // `okra subagent-launch`: G5 full loop — launcher (git worktree grant)
+    // → confined run-subagent child → collect_work on the branch
+    if argv.first().map(String::as_str) == Some("subagent-launch") {
+        let mut repo = None;
+        let mut name = String::from("subagent-task");
+        let mut worktree = None;
+        let mut task = String::from("execute the task");
+        let mut spec = None;
+        let mut i = 1;
+        while i < argv.len() {
+            match argv[i].as_str() {
+                "--repo" => { i += 1; repo = Some(PathBuf::from(argv.get(i).cloned().unwrap_or_default())); }
+                "--name" => { i += 1; name = argv.get(i).cloned().unwrap_or_default(); }
+                "--worktree" => { i += 1; worktree = Some(PathBuf::from(argv.get(i).cloned().unwrap_or_default())); }
+                "--task" => { i += 1; task = argv.get(i).cloned().unwrap_or_default(); }
+                "--task-spec" => { i += 1; spec = Some(PathBuf::from(argv.get(i).cloned().unwrap_or_default())); }
+                other => { eprintln!("error: unknown subagent-launch flag {other}"); std::process::exit(2); }
+            }
+            i += 1;
+        }
+        let (repo, worktree, spec) = match (repo, worktree, spec) {
+            (Some(r), Some(w), Some(s)) => (r, w, s),
+            _ => { eprintln!("error: subagent-launch needs --repo DIR --worktree DIR --task-spec SPEC.json [--name N] [--task TEXT]"); std::process::exit(2); }
+        };
+        let role = okra_host::subagent::RoleScope {
+            readable: vec!["README.md".into()],
+            writable: vec![".".into()],
+        };
+        match crate::subagent::orchestrate_subagent(&repo, &name, &worktree, role, &task, &spec) {
+            Ok(v) => {
+                let ok = v["passed"] == serde_json::Value::Bool(true);
+                println!("ORCHESTRATION {}", serde_json::to_string(&v).unwrap_or_default());
+                std::process::exit(if ok { 0 } else { 1 });
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // `okra sessions [--cwd DIR]`: M3 strangler — task/session index query
     // (SQLite projection behind the kernel SessionHandle)
     if argv.first().map(String::as_str) == Some("sessions") {

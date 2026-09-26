@@ -165,3 +165,114 @@ pub fn run_subagent(grant: &std::path::Path, spec_path: &std::path::Path) -> Res
         "passed": passed,
     }))
 }
+
+// ---------------------------------------------------------------------------
+// Full G5 loop: launcher (real git worktree grant) → confined child run →
+// collect_work for parent review. MASTER-PLAN §4 G5 end-to-end.
+// ---------------------------------------------------------------------------
+
+/// Orchestrate one subagent run against a parent repository:
+/// 1. launch — `git worktree add` the child's grant (isolated working
+///    tree, shared object store), policy = parent ∩ role, inherit-nothing
+///    context;
+/// 2. run — the confined `run-subagent` child process applies nono
+///    self-confinement with the worktree as its only writable surface and
+///    executes the task;
+/// 3. collect — commit inside the worktree branch and return the hash for
+///    parent review; the parent checkout is never touched.
+///
+/// The task spec is copied into the worktree before the child runs (the
+/// child's world is the worktree), and child runtime artifacts
+/// (`.okra-sessions/`, the spec copy) are removed before the work commit.
+pub fn orchestrate_subagent(
+    repo_path: &std::path::Path,
+    name: &str,
+    worktree_path: &std::path::Path,
+    role: okra_host::subagent::RoleScope,
+    task: &str,
+    spec_path: &std::path::Path,
+) -> Result<serde_json::Value, String> {
+    use okra_host::subagent::{SubagentGrant, SubagentLauncher};
+    use std::process::Command;
+
+    let repo = okra_host::git::GitRepository::open(repo_path)
+        .map_err(|e| format!("open parent repo: {e}"))?;
+    // the launcher holds the parent's grants but never passes them down
+    let launcher = SubagentLauncher::new(repo.clone(), vec!["parent-session-grant".into()]);
+    let grant: SubagentGrant = launcher
+        .launch(name, worktree_path, &role, task)
+        .map_err(|e| format!("launch: {e}"))?;
+
+    // stage the task spec INSIDE the worktree (the child's world)
+    let spec_copy = worktree_path.join("task.json");
+    std::fs::copy(spec_path, &spec_copy)
+        .map_err(|e| format!("stage task spec: {e}"))?;
+
+    // confined child run: real process, kernel self-confinement inside
+    let bin = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("okra")))
+        .unwrap_or_else(|| std::path::PathBuf::from("okra"));
+    // sanctioned site: the orchestrator spawns the confined child runner
+    // itself (the child then re-confines to the worktree); arguments are
+    // host-built paths, never model text
+    #[allow(clippy::disallowed_methods)]
+    let output = Command::new(&bin)
+        .args([
+            "run-subagent",
+            "--grant",
+            &worktree_path.to_string_lossy(),
+            "--task",
+            &spec_copy.to_string_lossy(),
+        ])
+        .output()
+        .map_err(|e| format!("spawn child: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let child_line = stdout
+        .lines()
+        .find(|l| l.starts_with("SUBAGENT "))
+        .ok_or_else(|| {
+            format!(
+                "child produced no SUBAGENT verdict (exit {:?}): {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })?;
+    let child: serde_json::Value =
+        serde_json::from_str(child_line.trim_start_matches("SUBAGENT "))
+            .map_err(|e| format!("child verdict parse: {e}"))?;
+
+    // collect: drop runtime artifacts, commit the child's work on the branch
+    let _ = std::fs::remove_dir_all(worktree_path.join(".okra-sessions"));
+    let _ = std::fs::remove_file(&spec_copy);
+    // only commit if the child actually produced something
+    std::fs::remove_file(worktree_path.join(".kernel-probe")).ok();
+    let dirty = okra_host::git::GitRepository::open(worktree_path)
+        .and_then(|r| r.is_dirty())
+        .unwrap_or(false);
+    let commit = if dirty {
+        SubagentLauncher::collect_work(&grant, "subagent work").ok()
+    } else {
+        None
+    };
+
+    // parent checkout untouched?
+    let parent_repo = okra_host::git::GitRepository::open(repo_path)
+        .map_err(|e| format!("reopen parent repo: {e}"))?;
+    let parent_clean = !parent_repo.is_dirty().unwrap_or(false);
+    let parent_sentinel = std::fs::read_to_string(repo_path.join("sentinel.txt")).ok();
+
+    launcher.cleanup(&grant).map_err(|e| format!("cleanup: {e}"))?;
+
+    let passed = child["passed"] == serde_json::Value::Bool(true) && parent_clean;
+    Ok(serde_json::json!({
+        "orchestration": "g5-full-loop",
+        "branch": grant.branch,
+        "worktree": worktree_path.to_string_lossy(),
+        "child": child,
+        "commit": commit,
+        "parent_clean": parent_clean,
+        "parent_sentinel": parent_sentinel,
+        "passed": passed,
+    }))
+}

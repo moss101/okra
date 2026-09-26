@@ -1202,6 +1202,7 @@ dependencies = [
  "okra-agent-core",
  "okra-compaction",
  "okra-gateway",
+ "okra-host",
  "okra-kernel",
  "okra-memory",
  "okra-policy",
