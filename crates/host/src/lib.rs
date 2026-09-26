@@ -7,6 +7,7 @@
 //!   ownership checks (§3 #52, ChatGPT2 docs/03)
 //! - fsutil: the single sanctioned canonicalize/home_dir call sites
 
+pub mod broadcast;
 pub mod checkpoints;
 pub mod client_info;
 pub mod conversation_share;
@@ -78,6 +79,7 @@ pub use client_info::{
     client_config, load_or_create_device_identity, ClientConfig, DeviceIdentity, DAEMON_NAME,
     PROTOCOL_VERSION,
 };
+pub use broadcast::{Broadcast, BroadcastBus, BroadcastError};
 pub use checkpoints::{
     CheckpointError, CheckpointManager, FileSnapshot, GitState, RestoreReport, RewindCheckpoint,
     RewindPoint,
