@@ -87,7 +87,7 @@ pub fn serve_tcp(state: Arc<TcpServeState>, listener: std::net::TcpListener) -> 
     unreachable!()
 }
 
-fn handle_client(state: &Arc<TcpServeState>, mut stream: TcpStream) {
+fn handle_client(state: &Arc<TcpServeState>, stream: TcpStream) {
     let read_half = match stream.try_clone() { Ok(s) => s, Err(_) => return };
     let write_half = match stream.try_clone() { Ok(s) => s, Err(_) => return };
     let own_writer = Arc::new(Mutex::new(stream));

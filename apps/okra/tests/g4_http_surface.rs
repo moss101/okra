@@ -38,7 +38,7 @@ fn spawn_daemon(cwd: &Path) -> (Child, String) {
     };
     // keep draining stderr so daemon audit lines surface in test output
     {
-        let mut reader = reader;
+        let reader = reader;
         std::thread::spawn(move || {
             for line in reader.lines().map_while(Result::ok) {
                 eprintln!("DAEMON: {}", line.trim());
