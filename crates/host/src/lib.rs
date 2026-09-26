@@ -44,7 +44,7 @@ pub use skill_sync::{
     MAX_SKILL_SCAN_DEPTH, SKILL_FILE_NAME, SKILL_SCAN_EXCLUDED_DIRECTORY_NAMES,
 };
 pub use settings_sync::{
-    AgentDiscovery, DiscoveryResult, ImportMode, ImportResult, SettingsSyncService, SkipReason,
-    SourceScope, SyncAgent, SyncCandidate, SyncImportStatus,
+    AgentDiscovery, DiscoveryResult, ImportMode, ImportResult, McpCandidate, SettingsSyncService,
+    SkipReason, SourceScope, SyncAgent, SyncCandidate, SyncImportStatus,
 };
 pub use terminal::{TerminalHost, TerminalSession, TerminalSize};

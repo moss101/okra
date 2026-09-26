@@ -63,6 +63,8 @@ ed25519-dalek = { version = "2", default-features = false, features = ["fast", "
 getrandom = "0.2"
 # Skill-sync archives (#48): ustar+gzip, matching the donor's archive format.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Codex CLI configs are TOML (settings-sync MCP import).
+toml = "0.8"
 tempfile = "3"
 
 [workspace.lints.rust]
