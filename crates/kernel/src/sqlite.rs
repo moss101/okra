@@ -154,6 +154,151 @@ impl ProjectionDb {
         Ok(rows)
     }
 
+    /// Per-session incremental replace (the multi-session safe rebuild):
+    /// only THIS session's row and its tasks are touched — other
+    /// sessions' indexed state is preserved. `rebuild_from_log` clears
+    /// everything; use this from the host sync loop.
+    pub fn replace_session(
+        &self,
+        events: &[SessionEvent],
+        session_id: &str,
+        workspace: &str,
+    ) -> Result<usize, crate::storage::StorageError> {
+        self.conn.execute("DELETE FROM tasks WHERE session_id = ?1", [session_id])?;
+        self.conn
+            .execute("DELETE FROM sessions WHERE id = ?1", [session_id])?;
+        let created = events.first().map(|e| e.time).unwrap_or(0.0);
+        self.upsert_session(session_id, workspace, "", "active", created, events.len() as u64)?;
+        let now = crate::wall_clock();
+        for ev in events {
+            if ev.event_type == "task/upserted"
+                && let Some(t) = ev.data.get("task") {
+                    let input = crate::TaskRowInput {
+                        id: t.get("id").and_then(|v| v.as_str()).unwrap_or("task").to_string(),
+                        session_id: session_id.to_string(),
+                        kind: t.get("kind").and_then(|v| v.as_str()).unwrap_or("todo").to_string(),
+                        title: t.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        status: t.get("status").and_then(|v| v.as_str()).unwrap_or("pending").to_string(),
+                        payload: t.get("payload").cloned().unwrap_or(serde_json::Value::Null).to_string(),
+                        updated_at: now,
+                    };
+                    self.upsert_task(&input)?;
+                }
+        }
+        Ok(events.len())
+    }
+
+    /// Lifecycle transition on the indexed session row (the log stays
+    /// authoritative; this only moves the projection).
+    pub fn set_session_status(
+        &self,
+        session_id: &str,
+        status: &str,
+    ) -> Result<(), crate::storage::StorageError> {
+        self.conn.execute(
+            "UPDATE sessions SET status = ?2, updated_at = ?3 WHERE id = ?1",
+            rusqlite::params![session_id, status, crate::wall_clock()],
+        )?;
+        Ok(())
+    }
+
+    /// Drop a session's indexed rows (never touches the log).
+    pub fn delete_session(&self, session_id: &str) -> Result<(), crate::storage::StorageError> {
+        self.conn
+            .execute("DELETE FROM tasks WHERE session_id = ?1", [session_id])?;
+        self.conn
+            .execute("DELETE FROM sessions WHERE id = ?1", [session_id])?;
+        Ok(())
+    }
+
+    /// Catalog-style query: sessions for one workspace (None = all).
+    pub fn sessions_for_workspace(
+        &self,
+        workspace: &str,
+    ) -> Result<Vec<SessionRow>, crate::storage::StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, workspace, title, status, event_count FROM sessions
+             WHERE workspace = ?1 ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([workspace], |r| {
+                Ok(SessionRow {
+                    id: r.get(0)?,
+                    workspace: r.get(1)?,
+                    title: r.get(2)?,
+                    status: r.get(3)?,
+                    event_count: r.get::<_, i64>(4)? as u64,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Title substring search (case-insensitive), newest first.
+    pub fn search_sessions(
+        &self,
+        query: &str,
+    ) -> Result<Vec<SessionRow>, crate::storage::StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, workspace, title, status, event_count FROM sessions
+             WHERE title LIKE '%' || ?1 || '%' COLLATE NOCASE
+             ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([query], |r| {
+                Ok(SessionRow {
+                    id: r.get(0)?,
+                    workspace: r.get(1)?,
+                    title: r.get(2)?,
+                    status: r.get(3)?,
+                    event_count: r.get::<_, i64>(4)? as u64,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Cross-session task query by status and/or kind (None = any).
+    pub fn tasks_by_filter(
+        &self,
+        status: Option<&str>,
+        kind: Option<&str>,
+    ) -> Result<Vec<TaskRow>, crate::storage::StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, kind, title, status FROM tasks
+             WHERE (?1 IS NULL OR status = ?1) AND (?2 IS NULL OR kind = ?2)
+             ORDER BY updated_at",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![status, kind], |r| {
+                Ok(TaskRow {
+                    id: r.get(0)?,
+                    session_id: r.get(1)?,
+                    kind: r.get(2)?,
+                    title: r.get(3)?,
+                    status: r.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// (status → count) for one session's tasks.
+    pub fn task_status_counts(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(String, u64)>, crate::storage::StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT status, COUNT(*) FROM tasks WHERE session_id = ?1 GROUP BY status",
+        )?;
+        let rows = stmt
+            .query_map([session_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Rebuild both tables from a kernel log: the projection is a pure
     /// function of the durable truth.
     pub fn rebuild_from_log(&self, events: &[SessionEvent], session_id: &str, workspace: &str) -> Result<usize, crate::storage::StorageError> {
