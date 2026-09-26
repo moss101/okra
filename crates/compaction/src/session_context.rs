@@ -169,6 +169,8 @@ pub struct SessionContext {
     /// Tiered memory recall (#33): rendered recall text folded into the
     /// byte-stable head (memory files change rarely).
     memory_recall: Option<String>,
+    /// Progressive disclosure layer 1: the skills index (head fold).
+    skill_index: Option<String>,
     stats: CompactionStats,
     /// The byte-stable head: rendered once per install and reused verbatim.
     prefix_head: Vec<u8>,
@@ -191,6 +193,7 @@ impl SessionContext {
             hydration_root: None,
             hydration_max_files: 4,
             memory_recall: None,
+            skill_index: None,
             stats: CompactionStats {
                 prefires: 0,
                 installs: 0,
@@ -270,6 +273,38 @@ impl SessionContext {
         }
         self.memory_recall = Some(recall.to_string());
         self.refresh_world_head();
+    }
+
+    /// Paths noted so far (skills activation matches against these).
+    pub fn noted_paths(&self) -> Vec<String> {
+        self.world
+            .sections
+            .iter()
+            .find(|(sec, _)| *sec == Section::FileStates)
+            .map(|(_, entries)| entries.iter().map(|e| e.key.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Progressive disclosure layer 2: an activated skill's body enters the
+    /// world Skills section (head-rendered; stable while the activation set
+    /// is unchanged).
+    pub fn activate_skill(&mut self, name: &str, body_digest: &str) {
+        self.world.set(
+            Section::Skills,
+            name,
+            format!("ACTIVE — {body_digest}"),
+        );
+    }
+
+    /// Set the disclosure-layer-1 skill index text (head fold).
+    pub fn set_skill_index(&mut self, index: &str) {
+        self.skill_index = Some(index.to_string());
+        self.refresh_world_head();
+    }
+
+    /// The L1 skill index currently folded into the head, if any.
+    pub fn skill_index(&self) -> Option<&str> {
+        self.skill_index.as_deref()
     }
 
     /// Note a file path the agent touched (drives hydration at install).
@@ -505,6 +540,10 @@ impl SessionContext {
     /// NOT part of this render — it lives in its own message.
     fn refresh_world_head(&mut self) {
         let mut text = self.world.render();
+        if let Some(index) = &self.skill_index {
+            text.push_str(index);
+            text.push('\n');
+        }
         if let Some(memory) = &self.memory_recall {
             text.push_str("<memory_recall>\n");
             text.push_str(memory);

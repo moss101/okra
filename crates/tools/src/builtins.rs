@@ -375,13 +375,19 @@ pub fn resolve_in_workspace(
     // resolve against the ORIGINAL `path` spelling — joining onto the
     // canonical root first would double-apply the root for absolute paths.
     let normalized = if p.is_absolute() {
-        let lex = crate::pipeline::confine_lexical(&std::path::PathBuf::from("/"), &p);
+        let lex = crate::pipeline::confine_lexical(std::path::Path::new("/"), &p)
+            .ok_or(ToolError::invalid_input("path escapes the workspace"))?;
         if !lex.starts_with(&root) {
             return Err(ToolError::invalid_input("path escapes the workspace"));
         }
         lex
     } else {
-        crate::pipeline::confine_lexical(&root, &p)
+        let lex = crate::pipeline::confine_lexical(&root, &p)
+            .ok_or(ToolError::invalid_input("path escapes the workspace"))?;
+        if !lex.starts_with(&root) {
+            return Err(ToolError::invalid_input("path escapes the workspace"));
+        }
+        lex
     };
     Ok(normalized)
 }

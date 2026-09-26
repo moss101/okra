@@ -132,6 +132,10 @@ pub struct BenchVerdict {
     pub hydrated_files: u32,
     /// Tiered memory recall (#33): injected into the stable head.
     pub memory_recall_injected: bool,
+    /// Skills (M2): catalog size + path-conditional activations.
+    pub skills_available: usize,
+    pub skills_activated: u64,
+    pub skill_index_in_head: bool,
     /// Number of times the byte-stable head CHANGED across the run
     /// (initial state + one change per world mutation — bounded churn).
     pub head_changes: u64,
@@ -290,6 +294,23 @@ pub fn run_benchmark(
     if with_hydration {
         ctx.enable_hydration(ws.clone(), 8);
     }
+    // skills (M2): two skills, only one matches the bench file paths —
+    // path-conditional activation + progressive disclosure
+    let skills_dir = ws.join(".okra").join("skills");
+    std::fs::create_dir_all(&skills_dir).map_err(|e| format!("skills dir: {e}"))?;
+    std::fs::write(
+        skills_dir.join("SKILL-bench-files.md"),
+        "---\nname: bench-files\ndescription: conventions for bench data files\nmatch: bench/*.txt\n---\n# Bench files\nTrailer lines are the authoritative content marker.\n",
+    )
+    .map_err(|e| format!("write skill: {e}"))?;
+    std::fs::write(
+        skills_dir.join("SKILL-docker.md"),
+        "---\nname: docker-build\ndescription: container build conventions\nmatch: Dockerfile*\n---\n# Docker\nUse buildkit.\n",
+    )
+    .map_err(|e| format!("write skill: {e}"))?;
+    let skill_catalog = okra_memory::SkillCatalog::load_dir(&skills_dir);
+    let skills_available = skill_catalog.len();
+
     let memory_reader = if with_memory {
         Some(TieredReader::new(home.clone(), ws.clone()))
     } else {
@@ -326,6 +347,7 @@ pub fn run_benchmark(
             &mut ctx,
             &compactor,
             memory_reader.as_ref(),
+            Some(&skill_catalog),
             &format!("turn {turn}: read every bench file and summarize"),
             &mut |_| {},
         )?;
@@ -385,6 +407,16 @@ pub fn run_benchmark(
         && memory_recall_injected
         && !secret_leaked
         && head_changes <= (files + 2) as u64
+        && skills_available >= 2
+        && ctx
+            .prefix_head()
+            .windows(b"ACTIVE".len())
+            .any(|w| w == b"ACTIVE")
+        // progressive disclosure: the non-matching skill's L2 BODY never
+        // enters the context (its L1 name legitimately appears in the index)
+        && !prefix_heads
+            .iter()
+            .any(|h| h.windows(b"Use buildkit".len()).any(|w| w == b"Use buildkit"))
         && mcp_calls == turns as u64
         && hook_events >= mcp_calls * 2
         && registry_hook_failures == 0;
@@ -409,6 +441,16 @@ pub fn run_benchmark(
         evicted_bytes: ctx.evicted_bytes(),
         hydrated_files: ctx.hydrated_files(),
         memory_recall_injected,
+        skills_available,
+        skills_activated: ctx
+            .prefix_head()
+            .windows(b"ACTIVE".len())
+            .filter(|w| w == b"ACTIVE")
+            .count() as u64,
+        skill_index_in_head: ctx
+            .prefix_head()
+            .windows(b"# Skills".len())
+            .any(|w| w == b"# Skills"),
         head_changes,
         mcp_calls,
         hook_events,

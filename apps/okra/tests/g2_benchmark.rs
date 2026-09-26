@@ -70,6 +70,17 @@ fn g2_agent_continuation_benchmark_100_turns_800_reads() {
         "PreToolUse + PostToolUse hooks fire across the run ({hook_events})"
     );
     assert_eq!(verdict["hook_failures"], 0, "hooks never crash the turn");
+
+    // skills (M2): path-conditional activation + progressive disclosure
+    assert_eq!(verdict["skills_available"], 2, "two skills in the catalog");
+    assert_eq!(
+        verdict["skills_activated"], 1,
+        "only the bench/*.txt-matching skill activates"
+    );
+    assert_eq!(
+        verdict["skill_index_in_head"], true,
+        "L1 skill index folded into the stable head"
+    );
     // flat post-compaction context: max usage never ran past the limit
     let max_tokens = verdict["max_context_tokens"].as_u64().unwrap();
     let limit = verdict["limit_tokens"].as_u64().unwrap();

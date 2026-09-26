@@ -389,6 +389,7 @@ impl<S: Sampler + ?Sized> Agent<S> {
         context: &mut okra_compaction::SessionContext,
         compactor: &dyn okra_compaction::Compactor,
         memory: Option<&okra_memory::TieredReader>,
+        skills: Option<&okra_memory::SkillCatalog>,
         input: &str,
         events: &mut dyn FnMut(LoopEvent),
     ) -> Result<TurnOutcome, String> {
@@ -398,6 +399,20 @@ impl<S: Sampler + ?Sized> Agent<S> {
             let recall = okra_memory::redact_secrets(&recall);
             if !recall.trim().is_empty() {
                 context.set_memory_recall(&recall);
+            }
+        }
+        // progressive disclosure (#M2 skills): layer 1 index in the head;
+        // layer 2 bodies activate when noted paths match their patterns
+        if let Some(catalog) = skills {
+            if context.skill_index().is_none() {
+                context.set_skill_index(&catalog.disclosure_index());
+            }
+            let paths = context.noted_paths();
+            if !paths.is_empty() {
+                for skill in catalog.active_for_paths(&paths) {
+                    let digest: String = skill.body.lines().next().unwrap_or("").to_string();
+                    context.activate_skill(&skill.name, &digest);
+                }
             }
         }
         let seed = context.messages().to_vec();

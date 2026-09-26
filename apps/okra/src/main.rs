@@ -11,6 +11,8 @@
 
 mod bench;
 mod demo_sampler;
+mod quality;
+mod subagent;
 mod serve;
 mod task;
 
@@ -221,6 +223,52 @@ fn main() {
                 let passed = v.passed;
                 println!("BENCH {}", serde_json::to_string(&v).unwrap_or_default());
                 std::process::exit(if passed { 0 } else { 1 });
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // `okra bench-quality`: agent-quality benchmark suite (#65)
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("bench-quality") {
+        match quality::run_quality_suite() {
+            Ok(v) => {
+                let passed_all = v["passed_all"] == serde_json::Value::Bool(true);
+                println!("QUALITY {}", serde_json::to_string(&v).unwrap_or_default());
+                std::process::exit(if passed_all { 0 } else { 1 });
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // `okra run-subagent --grant DIR --task SPEC.json`: G5 kernel-isolated
+    if argv.first().map(String::as_str) == Some("run-subagent") {
+        let mut grant = None;
+        let mut spec = None;
+        let mut i = 1;
+        while i < argv.len() {
+            match argv[i].as_str() {
+                "--grant" => { i += 1; grant = Some(PathBuf::from(argv.get(i).cloned().unwrap_or_default())); }
+                "--task" => { i += 1; spec = Some(PathBuf::from(argv.get(i).cloned().unwrap_or_default())); }
+                other => { eprintln!("error: unknown run-subagent flag {other}"); std::process::exit(2); }
+            }
+            i += 1;
+        }
+        let (grant, spec) = match (grant, spec) {
+            (Some(g), Some(s)) => (g, s),
+            _ => { eprintln!("error: run-subagent needs --grant DIR --task SPEC.json"); std::process::exit(2); }
+        };
+        match crate::subagent::run_subagent(&grant, &spec) {
+            Ok(v) => {
+                let ok = v["passed"] == serde_json::Value::Bool(true);
+                println!("SUBAGENT {}", serde_json::to_string(&v).unwrap_or_default());
+                std::process::exit(if ok { 0 } else { 1 });
             }
             Err(e) => {
                 eprintln!("error: {e}");

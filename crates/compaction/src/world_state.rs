@@ -15,15 +15,17 @@ pub enum Section {
     SessionGoal,
     OpenTodos,
     FileStates,
+    Skills,
     Permissions,
     Environment,
 }
 
-pub const SECTION_ORDER: [Section; 6] = [
+pub const SECTION_ORDER: [Section; 7] = [
     Section::Workspace,
     Section::SessionGoal,
     Section::OpenTodos,
     Section::FileStates,
+    Section::Skills,
     Section::Permissions,
     Section::Environment,
 ];

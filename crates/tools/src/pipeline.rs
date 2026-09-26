@@ -310,18 +310,26 @@ pub fn apply_output_budget(
 
 /// Lexically confine `candidate` under `root` without touching the
 /// filesystem (write paths that do not exist yet).
-pub fn confine_lexical(root: &Path, candidate: &Path) -> PathBuf {
+/// Lexically resolve `candidate` under `root`. A `..` that would climb out
+/// of the root REFUSES the path (None) — silently dropping it would turn
+/// `../x` into `x` inside the workspace (a path-traversal hole).
+pub fn confine_lexical(root: &Path, candidate: &Path) -> Option<PathBuf> {
     let mut out = root.to_path_buf();
     for component in candidate.components() {
         match component {
             std::path::Component::Normal(c) => out.push(c),
             std::path::Component::CurDir => {}
-            // ParentDir was already collapsed against root by callers via
-            // canonicalize(root); a `..` here escapes — stop extending.
-            _ => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    return None; // escapes the root: refuse
+                }
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return None; // absolute component under a relative root: refuse
+            }
         }
     }
-    out
+    Some(out)
 }
 
 /// Ensure a path is inside the workspace root — used by builtins (M0) and
