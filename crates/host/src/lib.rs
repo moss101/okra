@@ -8,6 +8,7 @@
 //! - fsutil: the single sanctioned canonicalize/home_dir call sites
 
 pub mod fsutil;
+pub mod git;
 pub mod notifications;
 pub mod safe_fs;
 pub mod terminal;
@@ -15,5 +16,5 @@ pub mod terminal;
 pub use notifications::{
     classify, redact_body, Notification, NotificationClass, NotificationsPolicy,
 };
-pub use safe_fs::{safe_read, SafeReadError};
+pub use git::{GitError, GitHead, GitRepository, GitStatusEntry};
 pub use terminal::{TerminalHost, TerminalSession, TerminalSize};
