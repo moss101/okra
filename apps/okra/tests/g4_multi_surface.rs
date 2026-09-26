@@ -214,6 +214,30 @@ fn run_gate(addr: &str) {
         .iter()
         .all(|s| s["kind"] == "cli" && s["detached"] == serde_json::Value::Bool(false)));
 
+    // cross-session broadcast: B publishes on chat, A polls it once
+    second.send(
+        40,
+        r#"{"method":"broadcast/send","params":{"fromSession":"sess-b","topic":"chat","payload":{"text":"hi from B"}}}"#,
+    );
+    let ack = second.read_reply(40);
+    assert!(ack["result"]["broadcastId"].is_u64(), "publish assigns an id");
+    tui_surface.send(
+        41,
+        r#"{"method":"broadcast/receive","params":{"sessionId":"sess-a","topics":["chat"]}}"#,
+    );
+    let inbox = tui_surface.read_reply(41);
+    let delivered = inbox["result"]["broadcasts"].as_array().unwrap();
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0]["fromSession"], "sess-b");
+    assert_eq!(delivered[0]["payload"]["text"], "hi from B");
+    // cursor advanced: re-poll yields nothing
+    tui_surface.send(
+        42,
+        r#"{"method":"broadcast/receive","params":{"sessionId":"sess-a","topics":["chat"]}}"#,
+    );
+    let repoll = tui_surface.read_reply(42);
+    assert_eq!(repoll["result"]["broadcasts"].as_array().unwrap().len(), 0);
+
     // surface A drives the turn
     tui_surface.send(
         4,

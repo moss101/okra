@@ -50,6 +50,8 @@ pub struct TcpServeState {
     /// G4 bookkeeping: every attached surface is registered here with a
     /// kind + capabilities, heartbeated per frame, and detached on exit.
     pub surfaces: Mutex<okra_host::surfaces::SurfaceRegistry>,
+    /// Cross-session pub/sub: one session publishes, others poll.
+    pub bus: Mutex<okra_host::broadcast::BroadcastBus>,
     next_static: std::sync::atomic::AtomicU64,
 }
 
@@ -83,6 +85,7 @@ impl TcpServeState {
             steering: Mutex::new(BTreeMap::new()),
             writers: Mutex::new(Vec::new()),
             surfaces: Mutex::new(okra_host::surfaces::SurfaceRegistry::new()),
+            bus: Mutex::new(okra_host::broadcast::BroadcastBus::new(256)),
             next_static: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -229,6 +232,41 @@ fn handle_client(state: &Arc<TcpServeState>, stream: TcpStream) {
                 let envelope = &msg["params"]["envelope"];
                 let reply = command_accept(state, envelope);
                 respond(id_field, reply);
+            }
+            "broadcast/send" => {
+                let from = params["fromSession"].as_str().unwrap_or_default().to_string();
+                if from.is_empty() {
+                    respond(id_field, serde_json::json!({"error":"fromSession required"}));
+                } else {
+                    state.surfaces.lock().unwrap().heartbeat(&surface_id);
+                    let topic = params["topic"].as_str().unwrap_or("general").to_string();
+                    let payload = params.get("payload").cloned().unwrap_or(serde_json::Value::Null);
+                    let id = state.bus.lock().unwrap().publish(&topic, &from, payload);
+                    respond(id_field, serde_json::json!({"broadcastId": id}));
+                }
+            }
+            "broadcast/receive" => {
+                let subscriber = params["sessionId"].as_str().unwrap_or_default().to_string();
+                if subscriber.is_empty() {
+                    respond(id_field, serde_json::json!({"error":"sessionId required"}));
+                } else {
+                    let topics: Vec<String> = params["topics"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                        .unwrap_or_default();
+                    state
+                        .bus
+                        .lock()
+                        .unwrap()
+                        .subscribe(&subscriber, Some(topics));
+                    let delivered =
+                        state.bus.lock().unwrap().poll(&subscriber).unwrap_or_default();
+                    let delivered: Vec<serde_json::Value> = delivered
+                        .into_iter()
+                        .map(|b| serde_json::to_value(b).unwrap_or_default())
+                        .collect();
+                    respond(id_field, serde_json::json!({"broadcasts": delivered}));
+                }
             }
             _ => {}
         }

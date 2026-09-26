@@ -46,6 +46,9 @@ fn now_ms() -> u64 {
 /// The broadcast bus over one daemon.
 pub struct BroadcastBus {
     broadcasts: Vec<Broadcast>,
+    /// delivery cursor per subscriber session — survives re-subscribe so
+    /// an absent session resumes where it left off
+    cursors: BTreeMap<String, u64>,
     /// subscriber session → (set of topics or ALL, next unread broadcast id)
     subscribers: BTreeMap<String, Subscriber>,
     next_id: u64,
@@ -65,6 +68,7 @@ impl BroadcastBus {
         BroadcastBus {
             broadcasts: Vec::with_capacity(capacity.min(64)),
             subscribers: BTreeMap::new(),
+            cursors: BTreeMap::new(),
             next_id: 0,
             capacity,
         }
@@ -74,7 +78,7 @@ impl BroadcastBus {
     /// topics. Re-subscribing updates the topic set and resets the cursor
     /// to now (only future broadcasts).
     pub fn subscribe(&mut self, session_id: &str, topics: Option<Vec<String>>) {
-        let cursor = self.next_id;
+        let cursor = *self.cursors.entry(session_id.to_string()).or_insert(0);
         self.subscribers.insert(
             session_id.to_string(),
             Subscriber {
@@ -139,6 +143,7 @@ impl BroadcastBus {
             }
         }
         subscriber.cursor = max_seen;
+        self.cursors.insert(session_id.to_string(), max_seen);
         Ok(delivered)
     }
 
@@ -215,16 +220,18 @@ mod tests {
     }
 
     #[test]
-    fn resubscribe_resets_cursor_to_now() {
+    fn resubscribe_keeps_cursor_at_least_once() {
         let mut bus = BroadcastBus::new(10);
         bus.subscribe("s", None);
         bus.publish("t", "system", json!({ "i": 1 }));
         bus.publish("t", "system", json!({ "i": 2 }));
-        // re-subscribe: only future broadcasts are delivered
+        // re-subscribe: the cursor is persistent, so undelivered
+        // broadcasts are still delivered (at-least-once semantics)
         bus.subscribe("s", None);
         bus.publish("t", "system", json!({ "i": 3 }));
         let got = bus.poll("s").unwrap();
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].payload, json!({ "i": 3 }));
+        assert_eq!(got.len(), 3, "undelivered broadcasts survive re-subscribe");
+        let ids: Vec<u64> = got.iter().map(|b| b.broadcast_id).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 }
