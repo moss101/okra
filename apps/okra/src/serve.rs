@@ -562,3 +562,53 @@ pub fn serve_stdio(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) ->
     }
     std::process::exit(0);
 }
+
+/// Offline starter-scene catalog served at GET /scenes (client-scenes):
+/// the prompt-starter cards a fresh surface shows before any server call.
+pub fn starter_scene_catalog() -> okra_host::client_scenes::ClientSceneCatalog {
+    use okra_host::client_scenes::{SceneConfig, SceneItem, SceneOption};
+    
+    use std::collections::BTreeMap;
+
+    fn localized_text(en: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([("en".to_string(), en.to_string())])
+    }
+
+    let mut catalog = okra_host::client_scenes::ClientSceneCatalog::new();
+    let mut options: BTreeMap<String, SceneOption> = BTreeMap::new();
+    let mut contents: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    contents.insert("en".into(), "Depth".into());
+    let mut items = Vec::new();
+    for (id, en) in [("overview", "Overview"), ("deep", "Deep dive")] {
+        items.push(SceneItem {
+            id: id.into(),
+            item_type: "option".into(),
+            contents: localized_text(en),
+            descs: BTreeMap::new(),
+            labels: BTreeMap::new(),
+            on_finish: None,
+            img: Some("layers".into()),
+        });
+    }
+    options.insert(
+        "depth".into(),
+        SceneOption {
+            id: "depth".into(),
+            option_type: "select".into(),
+            contents: localized_text("How deep should I go?"),
+            prompts: BTreeMap::new(),
+            items,
+            refer: None,
+            cascades: BTreeMap::new(),
+            templates: BTreeMap::new(),
+        },
+    );
+    catalog.register(SceneConfig {
+        namespace: "okra".into(),
+        scene: "repo-explain".into(),
+        options,
+        created_at: None,
+        updated_at: None,
+    });
+    catalog
+}

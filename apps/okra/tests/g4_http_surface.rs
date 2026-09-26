@@ -219,7 +219,13 @@ fn run_http_gate(addr: &str) {
         assert!(reg.contains("\"sse\""), "{reg}");
         let _ = ndjson;
 
-        // 3. POST /command drives a turn from the "browser"
+        // 2b. GET /scenes serves the offline starter catalog
+    let (scenes_status, scenes_body) = http_get(addr, "/scenes");
+    assert_eq!(scenes_status, 200);
+    assert!(scenes_body.contains("repo-explain"), "{scenes_body}");
+    assert!(scenes_body.contains("depth"), "{scenes_body}");
+
+    // 3. POST /command drives a turn from the "browser"
         let (status, reply) = http_post_command(addr, &serde_json::json!({
             "commandId": "browser-1",
             "type": "sendText",

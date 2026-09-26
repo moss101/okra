@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::serve::{run_turn_streaming, uuid_v4, SessionProjection};
+use crate::serve::{starter_scene_catalog, run_turn_streaming, uuid_v4, SessionProjection};
 
 pub struct SurfaceWriter {
     inner: Arc<Mutex<TcpStream>>,
@@ -310,8 +310,16 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
         return Ok(());
     }
 
+    if method == "GET" && path == "/scenes" {
+        let catalog = starter_scene_catalog();
+        let body = serde_json::to_vec(&catalog.to_response_body()).unwrap_or_default();
+        write_http(stream, 200, "OK", &body)?;
+        return Ok(());
+    }
+
     if method == "GET" && path == "/health" {
-        write_http(stream, 200, "ok", b"{\"ok\":true,\"daemon\":\"okra\"}")?;
+        let body = serde_json::to_vec(&serde_json::json!({"ok": true, "daemon": "okra"})).unwrap_or_default();
+        write_http(stream, 200, "OK", &body)?;
         return Ok(());
     }
 
