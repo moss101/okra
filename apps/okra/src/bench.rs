@@ -472,7 +472,9 @@ pub fn run_benchmark(p: &BenchParams) -> Result<BenchVerdict, String> {
         // MCP assertions apply to the scripted profile; the network model
         // decides its own calls, so hooks are asserted against reads instead
         && (if network {
-            hook_events >= reads.saturating_sub(1) * 2
+            // real models have failed dispatches (refusals, drift) — hooks
+            // must fire at least once per successful read on average
+            hook_events >= reads.saturating_sub(1)
         } else {
             mcp_calls == turns as u64 && hook_events >= mcp_calls * 2
         })

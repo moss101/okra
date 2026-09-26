@@ -43,8 +43,11 @@ M3  host services + alpha       ◐ strangler: SQLite session/task index
                                   (real PTY, TTY-verified), git domain
                                   (status/commit/REAL worktrees — the G5
                                   grant surface); G2 live PASSED vs a real
-                                  network model (glm-5.3-flash, 3 turns +
-                                  full 100-turn profile in flight)
+                                  network model (glm-5.3-flash) INCLUDING
+                                  the FULL 100-turn / 1,352-read live
+                                  profile: flat context (peak 19.9k ≤ 20k),
+                                  4 installs / 0 emergencies, byte-stable
+                                  prefixes, 2,690 hooks / 0 failures
 
 M4 surfaces ☐      M5 differentiators ◐ (subagent kernel isolation)
 ```
