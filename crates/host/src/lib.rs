@@ -15,6 +15,7 @@ pub mod coding_plan;
 pub mod conversation_share;
 pub mod credential;
 pub mod files;
+pub mod official_mcp;
 pub mod feedback;
 pub mod feedback_logs;
 pub mod fsutil;
