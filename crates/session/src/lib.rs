@@ -7,6 +7,8 @@
 //! itself is append-only: rewind APPENDS a rewind marker event; the surface
 //! fold projects the pinned view.
 
+pub mod fork;
+
 use okra_kernel as kernel;
 use okra_kernel::SessionHandle;
 use serde::{Deserialize, Serialize};
