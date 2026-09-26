@@ -39,11 +39,12 @@ M2  context / memory / skills   ◐ #28 microcompaction, #29 hydration,
                                   profiles (layered + summary-only);
                                   remaining: skills, agent-quality bench
 M3  host services + alpha       ◐ strangler: SQLite session/task index
-                                  (`okra sessions`) + terminal/PTY domain
-                                  (real PTY sessions, TTY-verified);
-                                  G2 live: benchmark PASSED against a real
-                                  OpenAI-compatible network model
-                                  (`--provider openai`, glm-5.3-flash)
+                                  (`okra sessions`), terminal/PTY domain
+                                  (real PTY, TTY-verified), git domain
+                                  (status/commit/REAL worktrees — the G5
+                                  grant surface); G2 live PASSED vs a real
+                                  network model (glm-5.3-flash, 3 turns +
+                                  full 100-turn profile in flight)
 
 M4 surfaces ☐      M5 differentiators ◐ (subagent kernel isolation)
 ```
