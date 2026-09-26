@@ -17,6 +17,7 @@ pub mod fsutil;
 pub mod git;
 pub mod mcp_sync;
 pub mod oauth;
+pub mod onboarding;
 pub mod notifications;
 pub mod plugin_sync;
 pub mod plugins;
@@ -39,6 +40,10 @@ pub use git::{
     MAX_GIT_FILE_BYTES,
 };
 pub use oauth::{DeviceAuthorization, OAuthClient, OAuthDomain, OAuthError, TokenSet};
+pub use onboarding::{
+    DecisionReason, DecisionStatus, OnboardingDecision, OnboardingEntry, OnboardingError,
+    OnboardingRecordFile, OnboardingService, UploadState, RECORD_VERSION_CURRENT,
+};
 pub use plugins::{PluginStore, SignedPluginEnvelope, SignatureVerdict, TrustStore};
 pub use plugin_sync::{
     ComponentType, ImportOutcome as PluginImportOutcome, PluginSyncCandidate, PluginSyncError,
