@@ -11,6 +11,7 @@ pub mod broadcast;
 pub mod checkpoints;
 pub mod client_info;
 pub mod client_scenes;
+pub mod coding_plan;
 pub mod conversation_share;
 pub mod credential;
 pub mod files;
