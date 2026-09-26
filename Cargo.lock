@@ -1001,6 +1001,7 @@ name = "okra"
 version = "0.1.0"
 dependencies = [
  "okra-agent-core",
+ "okra-compaction",
  "okra-gateway",
  "okra-kernel",
  "okra-policy",

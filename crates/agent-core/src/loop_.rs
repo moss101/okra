@@ -330,13 +330,56 @@ impl<S: Sampler + ?Sized> Agent<S> {
         Ok(())
     }
 
-    /// One conversational turn. `structured_schema` optionally requests
-    /// structured output.
+    /// One conversational turn (delegates to the seeded core).
     pub fn run_turn(
         &mut self,
         input: &str,
         events: &mut dyn FnMut(LoopEvent),
     ) -> Result<TurnOutcome, String> {
+        let (outcome, _) = self.run_turn_core(Vec::new(), input, events)?;
+        Ok(outcome)
+    }
+
+    /// Agent-continuation turn (G2): seeds the model context from the
+    /// session context (compacted prefix + tail), runs the turn, then folds
+    /// the resulting messages back through the two-pass compaction cycle.
+    pub fn run_turn_continuation(
+        &mut self,
+        context: &mut okra_compaction::SessionContext,
+        compactor: &dyn okra_compaction::Compactor,
+        input: &str,
+        events: &mut dyn FnMut(LoopEvent),
+    ) -> Result<TurnOutcome, String> {
+        let seed = context.messages().to_vec();
+        let seed_len = seed.len();
+        let events_before_compactions = context.events().len();
+        let (outcome, history) = self.run_turn_core(seed, input, events)?;
+        let new_messages: Vec<Message> = history[seed_len..].to_vec();
+        context.extend(new_messages, compactor);
+        for ev in &context.events()[events_before_compactions..] {
+            if matches!(
+                ev.kind,
+                okra_compaction::CompactionKind::Install
+                    | okra_compaction::CompactionKind::Emergency
+            ) {
+                events(LoopEvent::CompactionNotice {
+                    note: format!(
+                        "context compacted ({:?}): {} -> {} messages",
+                        ev.kind, ev.messages_before, ev.messages_after
+                    ),
+                });
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// The seeded turn core.
+    fn run_turn_core(
+        &mut self,
+        seed_history: Vec<Message>,
+        input: &str,
+        events: &mut dyn FnMut(LoopEvent),
+    ) -> Result<(TurnOutcome, Vec<Message>), String> {
         self.turn_counter += 1;
         let turn_no = self.turn_counter;
         let mut out: Vec<LoopEvent> = Vec::new();
@@ -361,7 +404,8 @@ impl<S: Sampler + ?Sized> Agent<S> {
         fault_inject_at_boundary("user_message_logged");
 
         // pending tool calls awaiting results (assistant calls from last step)
-        let mut history: Vec<Message> = vec![Message::user(input)];
+        let mut history: Vec<Message> = seed_history;
+        history.push(Message::user(input));
         let mut tools_called: Vec<String> = Vec::new();
         let mut usage_total = okra_providers::Usage::default();
         let mut structured: Option<okra_providers::StructuredOutput> = None;
@@ -724,6 +768,7 @@ impl<S: Sampler + ?Sized> Agent<S> {
         for ev in out {
             events(ev);
         }
+        let final_history = history;
         let outcome_json = serde_json::to_string(&serde_json::json!({
             "kind": match &outcome {
                 TurnOutcome::Completed { .. } => "completed",
@@ -736,7 +781,7 @@ impl<S: Sampler + ?Sized> Agent<S> {
         }))
         .unwrap_or_default();
         events(LoopEvent::TurnFinished { outcome: outcome_json });
-        Ok(outcome)
+        Ok((outcome, final_history))
     }
 }
 

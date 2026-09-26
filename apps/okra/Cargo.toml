@@ -15,6 +15,7 @@ okra-kernel = { workspace = true }
 okra-tools = { workspace = true }
 okra-policy = { workspace = true }
 okra-agent-core = { workspace = true }
+okra-compaction = { workspace = true }
 okra-providers = { workspace = true }
 okra-gateway = { workspace = true }
 serde = { workspace = true }

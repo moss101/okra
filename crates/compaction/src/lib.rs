@@ -12,10 +12,15 @@
 //! ZCode post-compaction file-state hydration (§3 #29).
 
 pub mod origin;
+pub mod session_context;
 pub mod summary;
 pub mod world_state;
 
 pub use origin::{Origin, OriginTaggedMessage};
+pub use session_context::{
+    estimate_tokens, CompactionEvent, CompactionKind, Compactor, ScriptedCompactor, SessionContext,
+    SessionContextConfig,
+};
 pub use summary::{check, validate_summary, CompactionSummary, FileStateNote, SummaryValidationError};
 pub use world_state::{Entry, Section, WorldState, SECTION_ORDER};
 
