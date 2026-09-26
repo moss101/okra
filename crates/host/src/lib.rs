@@ -20,6 +20,7 @@ pub mod fsutil;
 pub mod git;
 pub mod mcp_sync;
 pub mod media;
+pub mod model_provider;
 pub mod oauth;
 pub mod onboarding;
 pub mod notifications;
