@@ -32,6 +32,10 @@ pub struct OpenAiConfig {
     pub api_key: String,
     pub model: String,
     pub timeout_secs: u64,
+    /// Extra headers (e.g. gateway session-affinity like
+    /// `x-opencode-session`), set via `OKRA_EXTRA_HEADERS` as
+    /// `Name: value; Name2: value2`.
+    pub extra_headers: Vec<(String, String)>,
 }
 
 impl OpenAiConfig {
@@ -39,11 +43,22 @@ impl OpenAiConfig {
         let api_key = std::env::var("OKRA_API_KEY")
             .or_else(|_| std::env::var("OPENAI_API_KEY"))
             .ok()?;
+        let extra_headers = std::env::var("OKRA_EXTRA_HEADERS")
+            .map(|raw| {
+                raw.split(';')
+                    .filter_map(|pair| {
+                        let (k, v) = pair.split_once(':')?;
+                        Some((k.trim().to_string(), v.trim().to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Some(OpenAiConfig {
             base_url: std::env::var("OKRA_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.into()),
             api_key,
             model: model.into(),
             timeout_secs: 120,
+            extra_headers,
         })
     }
 }
@@ -335,11 +350,14 @@ impl Sampler for OpenAiProvider {
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
         );
-        let response = self
+        let mut req = self
             .agent()
             .post(&url)
-            .set("Authorization", &format!("Bearer {}", self.config.api_key))
-            .send_json(&body);
+            .set("Authorization", &format!("Bearer {}", self.config.api_key));
+        for (name, value) in &self.config.extra_headers {
+            req = req.set(name, value);
+        }
+        let response = req.send_json(&body);
 
         match response {
             Ok(deserialized) => {
@@ -475,6 +493,7 @@ mod tests {
             api_key: "test-key".into(),
             model: "test-model".into(),
             timeout_secs: 5,
+            extra_headers: vec![],
         })
     }
 

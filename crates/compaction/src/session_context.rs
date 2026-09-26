@@ -152,6 +152,8 @@ struct CompactionStats {
     microcompactions: u32,
     evicted_bytes: u64,
     hydrated_files: u32,
+    /// Cycles where usage crossed micro_at (whether or not anything evicted).
+    micro_opportunities: u32,
 }
 
 /// The cross-turn context: owns messages, world state, and the compaction
@@ -202,6 +204,7 @@ impl SessionContext {
                 microcompactions: 0,
                 evicted_bytes: 0,
                 hydrated_files: 0,
+                micro_opportunities: 0,
             },
             prefix_head: Vec::new(),
             events: Vec::new(),
@@ -249,6 +252,10 @@ impl SessionContext {
     }
     pub fn microcompactions(&self) -> u32 {
         self.stats.microcompactions
+    }
+    /// Cycles where the micro threshold was crossed (0 = layer never needed).
+    pub fn micro_opportunities(&self) -> u32 {
+        self.stats.micro_opportunities
     }
     pub fn evicted_bytes(&self) -> u64 {
         self.stats.evicted_bytes
@@ -348,6 +355,7 @@ impl SessionContext {
         if let Some(micro_at) = self.config.microcompact_at
             && self.tokens() >= micro_at
         {
+            self.stats.micro_opportunities += 1;
             self.microcompact();
         }
 

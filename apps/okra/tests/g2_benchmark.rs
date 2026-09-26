@@ -147,7 +147,7 @@ fn g2_network_provider_live_benchmark() {
             "--provider",
             "openai",
             "--model",
-            "gpt-4o-mini",
+            &std::env::var("OKRA_BENCH_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into()),
             "--turns",
             "3",
             "--files",

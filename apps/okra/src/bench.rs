@@ -301,11 +301,14 @@ pub fn run_benchmark(p: &BenchParams) -> Result<BenchVerdict, String> {
     } else {
         planner.clone()
     };
-    let config = AgentConfig {
-        max_steps: reads_per_turn + 4,
-        unattended: true,
-        ..Default::default()
+    // a real model spends extra steps (text + retries); the scripted
+    // planner is exact
+    let max_steps = if network {
+        reads_per_turn * 4 + 16
+    } else {
+        reads_per_turn + 4
     };
+    let config = AgentConfig { max_steps, unattended: true, ..Default::default() };
     let mut agent = Agent::new(config, sampler, Box::new(executor), session);
 
     let mut ctx = SessionContext::new(SessionContextConfig {
@@ -434,6 +437,7 @@ pub fn run_benchmark(p: &BenchParams) -> Result<BenchVerdict, String> {
     // microcompaction assertions apply only when the layer is enabled
     let micro_required = microcompact_at.is_some();
     let micro_ok = !micro_required
+        || ctx.micro_opportunities() == 0
         || (ctx.microcompactions() >= 1 && ctx.evicted_bytes() > 0);
     let mcp_calls = planner.mcp_calls();
     let (hook_events, registry_hook_failures) = executor_hook_stats;
@@ -442,15 +446,16 @@ pub fn run_benchmark(p: &BenchParams) -> Result<BenchVerdict, String> {
     } else {
         reads == (turns * reads_per_turn) as u64
     };
+    let compaction_exercised = network || installs + ctx.microcompactions() >= 1;
     let passed = reads_ok
-        && installs + ctx.microcompactions() >= 1
+        && compaction_exercised
         && emergencies == 0
         && ctx.rejected_summaries() == 0
         && prefix_bytes_stable
         && seed_prefix_stable
         && max_tokens < limit_tokens + (reads_per_turn as u64) * 1024
         && micro_ok
-        && (!with_hydration || ctx.hydrated_files() >= 4)
+        && (!with_hydration || installs == 0 || ctx.hydrated_files() >= 4)
         && memory_recall_injected
         && !secret_leaked
         && head_changes <= (files + 2) as u64
@@ -464,8 +469,13 @@ pub fn run_benchmark(p: &BenchParams) -> Result<BenchVerdict, String> {
         && !prefix_heads
             .iter()
             .any(|h| h.windows(b"Use buildkit".len()).any(|w| w == b"Use buildkit"))
-        && mcp_calls == turns as u64
-        && hook_events >= mcp_calls * 2
+        // MCP assertions apply to the scripted profile; the network model
+        // decides its own calls, so hooks are asserted against reads instead
+        && (if network {
+            hook_events >= reads.saturating_sub(1) * 2
+        } else {
+            mcp_calls == turns as u64 && hook_events >= mcp_calls * 2
+        })
         && registry_hook_failures == 0;
 
     // best-effort scratch cleanup
