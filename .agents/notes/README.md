@@ -11,3 +11,4 @@ must carry a `Superseded-by`/`Because` line.
 - [N0003 — Protocol port scope: core delta ops; workflowRun.* deferred to M3](0003-protocol-port-scope.md)
 - [N0004 — grok vendoring deferred; donor contracts re-implemented with citations](0004-vendoring-deferred.md)
 - [N0005 — G0 gate: Electron UI bridge over okra serve](0005-g0-electron-bridge.md)
+- [N0006 — N0004 revisit: nono sandbox backend + OpenAI provider](0006-nono-sandbox-provider.md)

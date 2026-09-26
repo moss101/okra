@@ -17,9 +17,10 @@
 
 use okra_protocol as proto;
 
+use serde_json::Value;
 use proto::{
     apply_delta, coalesce_conversation_deltas, conflate_by_key, ConversationDelta,
-    ConversationState, ConversationRow, RowBase, StatePatch, StreamablePath, TopicWireChecksum,
+    ConversationState, ConversationRow, RowBase, StreamablePath, TopicWireChecksum,
     TopicWireFrame, TopicFrameDeliveryKind, WireVersion, ProtocolV4Limits,
     crc32_wire_bytes, decode_wire_base64, encode_wire_bytes_base64,
 };
@@ -56,7 +57,9 @@ fn apply_all(deltas: &[ConversationDelta]) -> ConversationState {
 }
 
 fn canon(state: &ConversationState) -> String {
-    // canonical form matching the generator's rows/state shape
+    // canonical form matching the generator's rows/state shape; state keys
+    // are SORTED explicitly (serde_json Map ordering can become
+    // insertion-ordered when another dependency enables `preserve_order`)
     let rows: Vec<(u64, String)> = state
         .rows
         .iter()
@@ -69,7 +72,9 @@ fn canon(state: &ConversationState) -> String {
             (r.row_id(), text)
         })
         .collect();
-    format!("{rows:?}|{:?}", state.state)
+    let sorted: std::collections::BTreeMap<&String, &Value> =
+        state.state.iter().collect();
+    format!("{rows:?}|{sorted:?}")
 }
 
 #[test]

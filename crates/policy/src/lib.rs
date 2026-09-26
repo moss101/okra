@@ -19,6 +19,7 @@ pub mod approval;
 pub mod confine;
 pub mod grants;
 pub mod lattice;
+pub mod nono_backend;
 pub mod profiles;
 
 pub use approval::{
@@ -32,6 +33,9 @@ pub use confine::{
 };
 pub use grants::{Grant, GrantDecision, GrantScope, GrantStore};
 pub use lattice::{Decision, MediationPolicy, PermissionLattice, RuleEffect, RuleSource, PermissionRule};
+pub use nono_backend::{
+    mode_for_profile_name, path_within, ConfinementReport, NonoSandboxBackend, SelfConfinement,
+};
 pub use profiles::{
     merge_configs, parse_profile_name, resolve_profile, strict_profile, PathAccess, ProfileName,
     ProfileConfig, SandboxConfig, SandboxProfile,

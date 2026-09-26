@@ -5,9 +5,7 @@
 use std::sync::Arc;
 
 use okra_agent_core as core;
-use core::loop_::{
-    Agent, AgentConfig, LoopEvent, PolicyToolExecutor, ToolExecutor,
-};
+use core::loop_::{Agent, AgentConfig, LoopEvent, PolicyToolExecutor};
 use core::steering::PendingInterjection;
 use core::turn::{CompletedStop, TurnOutcome};
 use okra_kernel as kernel;

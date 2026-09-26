@@ -10,6 +10,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
+nono = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# nono is a main dependency (nono_backend); nothing extra needed here

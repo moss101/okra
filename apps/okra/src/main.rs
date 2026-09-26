@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use okra_agent_core::loop_::{Agent, AgentConfig, LoopEvent, PolicyToolExecutor};
 use okra_kernel as kernel;
+use okra_policy::SelfConfinement;
 use okra_policy::approval::{ApprovalPolicy, ApprovalService};
 use okra_providers::Sampler;
 use okra_tools::Registry;
@@ -32,6 +33,9 @@ struct Args {
     fork_session: bool,
     worktree: Option<PathBuf>,
     task_spec: Option<PathBuf>,
+    sandbox: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
     prompt: String,
 }
 
@@ -45,6 +49,9 @@ fn parse_args() -> Result<Args, String> {
     let mut fork_session = false;
     let mut worktree = None;
     let mut task_spec: Option<PathBuf> = None;
+    let mut sandbox: Option<String> = None;
+    let mut provider: Option<String> = None;
+    let mut model: Option<String> = None;
     let mut prompt: Option<String> = None;
 
     while let Some(arg) = args.next() {
@@ -69,6 +76,15 @@ fn parse_args() -> Result<Args, String> {
             "--task" => {
                 task_spec = Some(PathBuf::from(args.next().ok_or("--task needs a spec path")?));
             }
+            "--sandbox" => {
+                sandbox = Some(args.next().ok_or("--sandbox needs read-only|workspace-write|strict|off")?);
+            }
+            "--provider" => {
+                provider = Some(args.next().ok_or("--provider needs openai")?);
+            }
+            "--model" => {
+                model = Some(args.next().ok_or("--model needs a model name")?);
+            }
             "--fork-session" => fork_session = true,
             "--worktree" => {
                 worktree = Some(PathBuf::from(args.next().ok_or("--worktree needs a path")?));
@@ -86,7 +102,7 @@ fn parse_args() -> Result<Args, String> {
     } else {
         prompt.ok_or("missing prompt (try: okra --json \"read hello.txt\")")?
     };
-    Ok(Args { json, cwd, max_turns, kill_at_phase, kill_at_boundary, fork_session, worktree, task_spec, prompt })
+    Ok(Args { json, cwd, max_turns, kill_at_phase, kill_at_boundary, fork_session, worktree, task_spec, sandbox, provider, model, prompt })
 }
 
 fn print_help() {
@@ -102,6 +118,9 @@ fn print_help() {
          --max-turns N           step budget for the turn (default 32)\n  \
          --kill-at-phase P:N     fault injection: abort at phase P on occurrence N\n  \
          --kill-at-boundary B:N  abort after durable boundary B (G1 matrix)\n  \
+         --sandbox MODE          kernel-confine this process: read-only|strict|workspace-write\n  \
+         --provider openai       real network model provider (OKRA_API_KEY/OPENAI_API_KEY)\n  \
+         --model NAME            model name for the provider\n  \
          --task SPEC.json        run a scripted multi-file coding task\n  \
          --fork-session          fork instead of reusing the last session\n  \
          --worktree PATH         run against an isolated worktree\n  \
@@ -291,17 +310,69 @@ fn main() {
         }
     }
 
+    // Kernel-enforced self-confinement (N0006): irreversible; the process
+    // physically cannot leave the workspace (or touch the network under
+    // read-only/strict) from this point on.
+    let extra_writable: Vec<PathBuf> = vec![sessions_root.clone()];
+    if let Some(mode_str) = &args.sandbox
+        && mode_str != "off" {
+            let mode = match mode_str.as_str() {
+                "read-only" | "readonly" => okra_policy::SandboxMode::ReadOnly,
+                "strict" => okra_policy::SandboxMode::ReadOnly,
+                "workspace-write" => okra_policy::SandboxMode::WorkspaceWrite,
+                other => {
+                    eprintln!("error: unknown --sandbox mode {other}");
+                    std::process::exit(2);
+                }
+            };
+            let policy = okra_policy::SandboxExecutionPolicy {
+                mode,
+                workspace_root: args.cwd.clone(),
+                session_id: Some(session_id.clone()),
+            };
+            // network follows the mode: blocked under read-only/strict,
+            // allowed under workspace-write (the model provider needs it)
+            let backend = okra_policy::NonoSandboxBackend::new();
+            match backend.apply_to_self(&policy, &extra_writable) {
+                Ok(report) => {
+                    eprintln!(
+                        "[sandbox] enforcement={:?} platform={} network_blocked={} workspace={}",
+                        report.enforcement, report.platform, report.network_blocked,
+                        report.workspace.display()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("error: sandbox apply failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    drop(extra_writable);
+
     // sampler: task spec planner (G1) or interactive demo planner (G0)
     #[allow(unused_variables)] // sampler unused when only serve paths built
-    let sampler: Arc<dyn Sampler> = match &args.task_spec {
-        Some(spec_path) => {
-            let spec = task::TaskSpec::load(spec_path).unwrap_or_else(|e| {
-                eprintln!("error: {e}");
-                std::process::exit(2);
-            });
-            Arc::new(task::TaskPlanner::new(spec))
+    let sampler: Arc<dyn Sampler> = if let Some(provider_kind) = &args.provider {
+        if provider_kind != "openai" {
+            eprintln!("error: unknown provider {provider_kind} (supported: openai)");
+            std::process::exit(2);
         }
-        None => Arc::new(demo_sampler),
+        let model = args.model.clone().unwrap_or_else(|| "gpt-4o-mini".to_string());
+        let provider = okra_providers::OpenAiProvider::from_env(model).unwrap_or_else(|| {
+            eprintln!("error: set OKRA_API_KEY (or OPENAI_API_KEY) to use --provider openai");
+            std::process::exit(2);
+        });
+        Arc::new(provider)
+    } else {
+        match &args.task_spec {
+            Some(spec_path) => {
+                let spec = task::TaskSpec::load(spec_path).unwrap_or_else(|e| {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                });
+                Arc::new(task::TaskPlanner::new(spec))
+            }
+            None => Arc::new(demo_sampler),
+        }
     };
     let config = AgentConfig { max_steps: args.max_turns, unattended: true, ..Default::default() };
     let mut agent = Agent::new(config, sampler, Box::new(executor), session);

@@ -152,7 +152,7 @@ fn dispatch_validates_stream_and_routes_conflicts() {
     let rf = tools::builtins::read_file_tool(root.clone());
     registry
         .register(ErasedTool::simple(rf.entry(), vec![ResourceAccess::read_file("*")], {
-            let root = root.clone();
+            let _root = root.clone();
             move |args| rf.execute(args, None)
         }))
         .unwrap();
