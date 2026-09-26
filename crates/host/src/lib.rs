@@ -16,6 +16,7 @@ pub mod feedback;
 pub mod fsutil;
 pub mod git;
 pub mod mcp_sync;
+pub mod media;
 pub mod oauth;
 pub mod onboarding;
 pub mod notifications;
@@ -42,6 +43,7 @@ pub use git::{
     MAX_GIT_FILE_BYTES,
 };
 pub use oauth::{DeviceAuthorization, OAuthClient, OAuthDomain, OAuthError, TokenSet};
+pub use media::{image_dimensions, sniff_mime, MediaError, MediaInfo};
 pub use onboarding::{
     DecisionReason, DecisionStatus, OnboardingDecision, OnboardingEntry, OnboardingError,
     OnboardingRecordFile, OnboardingService, UploadState, RECORD_VERSION_CURRENT,
