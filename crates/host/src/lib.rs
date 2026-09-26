@@ -12,6 +12,7 @@ pub mod client_info;
 pub mod conversation_share;
 pub mod credential;
 pub mod files;
+pub mod feedback;
 pub mod fsutil;
 pub mod git;
 pub mod mcp_sync;
@@ -69,6 +70,10 @@ pub use checkpoints::{
 pub use conversation_share::{
     build_integrity, build_public_projection, canonical_json, verify_integrity, PublicProjection,
     ProjectionErrorKind, ShareError, ShareIntegrity,
+};
+pub use feedback::{
+    FeedbackAttachment, FeedbackComment, FeedbackError, FeedbackTicket, FeedbackTicketStore,
+    ListQuery, TicketStatus, TicketType,
 };
 pub use files::{
     Attachment, AttachmentKind, AttachmentOrigin, AttachmentStore, ChangeKind, DownloadEntry,
