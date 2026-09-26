@@ -32,6 +32,7 @@ pub mod subagent;
 pub mod usage;
 pub mod skill_sync;
 pub mod surfaces;
+pub mod system_info;
 pub mod telemetry;
 pub mod terminal;
 
@@ -62,6 +63,10 @@ pub use prompt_transfer::{
     adopt as adopt_prompt_attachment, cancel as cancel_prompt_transfer,
     validate_ref as validate_prompt_ref, LocalTransfer, StageParams, StageResult,
     StagingTransfer, TransferError, TransferPhase, TransferProgress,
+};
+pub use system_info::{
+    integrated_terminal_shells, probe_intranet, system_info, IntranetProbeResult, IsExecutable,
+    ProbeOutcome, ProbeTarget, SystemInfo, TcpConnect, TcpProbe,
 };
 pub use telemetry::{TelemetryEvent, TelemetryLog};
 pub use settings::{SettingsError as SettingsStoreError, SettingsScope, SettingsStore};
