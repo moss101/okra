@@ -15,6 +15,7 @@ pub mod git;
 pub mod mcp_sync;
 pub mod oauth;
 pub mod notifications;
+pub mod plugin_sync;
 pub mod plugins;
 pub mod safe_fs;
 pub mod settings_sync;
@@ -30,6 +31,12 @@ pub use git::{
 };
 pub use oauth::{DeviceAuthorization, OAuthClient, OAuthDomain, OAuthError, TokenSet};
 pub use plugins::{PluginStore, SignedPluginEnvelope, SignatureVerdict, TrustStore};
+pub use plugin_sync::{
+    ComponentType, ImportOutcome as PluginImportOutcome, PluginSyncCandidate, PluginSyncError,
+    PluginSyncService, RemoteSkipReason, RemoteStatus, SyncStatus as PluginSyncStatus,
+    DEFAULT_MAX_ARCHIVE_BYTES as PLUGIN_SYNC_MAX_ARCHIVE_BYTES, INLINE_PLUGIN_MARKETPLACE,
+    METADATA_ARCHIVE_PATH,
+};
 pub use checkpoints::{
     CheckpointError, CheckpointManager, FileSnapshot, GitState, RestoreReport, RewindCheckpoint,
     RewindPoint,

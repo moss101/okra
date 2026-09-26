@@ -711,7 +711,7 @@ impl SettingsSyncService {
         self.root_for(&[".okra", "config.json"], scope, workspace)
     }
 
-    fn find_plugin_manifest(plugin_path: &Path) -> Option<PathBuf> {
+    pub(crate) fn find_plugin_manifest(plugin_path: &Path) -> Option<PathBuf> {
         for dir in PLUGIN_MANIFEST_PATHS {
             let candidate = plugin_path.join(dir).join("plugin.json");
             if candidate.exists() {
@@ -1024,7 +1024,7 @@ impl SettingsSyncService {
     }
 }
 
-fn read_json_file_or_empty(path: &Path) -> Map<String, Value> {
+pub(crate) fn read_json_file_or_empty(path: &Path) -> Map<String, Value> {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|c| serde_json::from_str::<Value>(&c).ok())
@@ -1032,7 +1032,7 @@ fn read_json_file_or_empty(path: &Path) -> Map<String, Value> {
         .unwrap_or_default()
 }
 
-fn write_json_file(path: &Path, value: &Value) -> Result<(), std::io::Error> {
+pub(crate) fn write_json_file(path: &Path, value: &Value) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

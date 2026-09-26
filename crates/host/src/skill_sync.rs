@@ -657,7 +657,7 @@ fn tar_header(entry_path: &str, size: u64, type_flag: u8) -> [u8; TAR_BLOCK] {
     header
 }
 
-fn append_tar_entry(tar: &mut Vec<u8>, source: &Path, archive_path: &str) -> Result<(), SkillSyncError> {
+pub(crate) fn append_tar_entry(tar: &mut Vec<u8>, source: &Path, archive_path: &str) -> Result<(), SkillSyncError> {
     let meta = std::fs::symlink_metadata(source)?;
     if meta.is_dir() {
         let dir_path = format!("{archive_path}/");
@@ -687,6 +687,14 @@ fn append_tar_entry(tar: &mut Vec<u8>, source: &Path, archive_path: &str) -> Res
     Ok(())
 }
 
+
+/// Seal a built tar stream into the gzip'd archive format.
+pub(crate) fn gzip_tar(tar: Vec<u8>) -> Result<Vec<u8>, SkillSyncError> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    std::io::Write::write_all(&mut encoder, &tar)?;
+    Ok(encoder.finish()?)
+}
+
 fn read_tar_string(header: &[u8], offset: usize, len: usize) -> String {
     header[offset..offset + len]
         .iter()
@@ -710,7 +718,7 @@ fn read_tar_size(header: &[u8]) -> Result<u64, SkillSyncError> {
 
 /// `extractSkillSyncArchive`: gunzip, walk ustar blocks, enforce entry
 /// path containment and the extracted-bytes budget.
-fn extract_archive(archive: &[u8], target_dir: &Path, max_extracted: u64) -> Result<(), SkillSyncError> {
+pub(crate) fn extract_archive(archive: &[u8], target_dir: &Path, max_extracted: u64) -> Result<(), SkillSyncError> {
     let mut gz = GzDecoder::new(archive);
     let mut tar = Vec::new();
     gz.read_to_end(&mut tar)
