@@ -10,6 +10,7 @@
 pub mod broadcast;
 pub mod checkpoints;
 pub mod client_info;
+pub mod client_scenes;
 pub mod conversation_share;
 pub mod credential;
 pub mod files;
@@ -83,6 +84,7 @@ pub use client_info::{
 };
 pub use broadcast::{Broadcast, BroadcastBus, BroadcastError};
 pub use feedback_logs::{attach_logs_to_ticket, DiagnosticAttachment, FeedbackArchiveError};
+pub use client_scenes::{cascaded_items, localized, parse_response_body, ClientSceneCatalog, SceneConfig, SceneItem, SceneOption};
 pub use checkpoints::{
     CheckpointError, CheckpointManager, FileSnapshot, GitState, RestoreReport, RewindCheckpoint,
     RewindPoint,
