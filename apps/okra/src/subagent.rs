@@ -125,12 +125,18 @@ pub fn run_subagent(grant: &std::path::Path, spec_path: &std::path::Path) -> Res
     let mut executor = PolicyToolExecutor::new(registry, approvals);
     executor.ceiling = okra_policy::ToolApprovalCeiling::UnattendedAllowed;
 
+    // fork linkage (MASTER-PLAN #38): when the orchestrator provides the
+    // parent session id, the child's kernel session header links back to
+    // it so rewind/fork bookkeeping can traverse the family tree
+    let parent_session = std::env::var("OKRA_SUBAGENT_PARENT")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
     let header = kernel::SessionHeader {
         version: kernel::SESSION_FORMAT_VERSION,
         id: "subagent".into(),
         created_at: kernel::wall_clock(),
         cwd: grant.to_string_lossy().into_owned(),
-        parent_session: None,
+        parent_session: parent_session.clone(),
         is_seeded: false,
     };
     let session = match kernel::SessionHandle::open(
@@ -229,6 +235,7 @@ pub fn run_subagent(grant: &std::path::Path, spec_path: &std::path::Path) -> Res
         "kernel_write_inside_grant": if write_inside { "ok" } else { "failed" },
         "kernel_write_outside_grant": if write_outside { "ALLOWED" } else { "denied" },
         "sampler": sampler,
+        "parent_session": parent_session,
         "passed": passed,
     }))
 }
@@ -258,6 +265,7 @@ pub fn orchestrate_subagent(
     role: okra_host::subagent::RoleScope,
     task: &str,
     spec_path: &std::path::Path,
+    parent_session: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     use okra_host::subagent::{SubagentGrant, SubagentLauncher};
     use std::process::Command;
@@ -284,14 +292,23 @@ pub fn orchestrate_subagent(
     // itself (the child then re-confines to the worktree); arguments are
     // host-built paths, never model text
     #[allow(clippy::disallowed_methods)]
-    let output = Command::new(&bin)
-        .args([
-            "run-subagent",
-            "--grant",
-            &worktree_path.to_string_lossy(),
-            "--task",
-            &spec_copy.to_string_lossy(),
-        ])
+    let mut command = Command::new(&bin);
+    command.args([
+        "run-subagent",
+        "--grant",
+        &worktree_path.to_string_lossy(),
+        "--task",
+        &spec_copy.to_string_lossy(),
+    ]);
+    // fork linkage: the child's kernel session header links to the
+    // parent so rewind/fork bookkeeping can traverse the family tree
+    if let Some(parent) = parent_session {
+        command.env("OKRA_SUBAGENT_PARENT", parent);
+    }
+    // sanctioned site: spawning the confined child runner; the child
+    // re-applies nono self-confinement to the worktree before any work
+    #[allow(clippy::disallowed_methods)]
+    let output = command
         .output()
         .map_err(|e| format!("spawn child: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();

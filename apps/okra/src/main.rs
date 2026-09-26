@@ -292,6 +292,7 @@ fn main() {
         let mut worktree = None;
         let mut task = String::from("execute the task");
         let mut spec = None;
+        let mut parent_session = None;
         let mut i = 1;
         while i < argv.len() {
             match argv[i].as_str() {
@@ -300,6 +301,7 @@ fn main() {
                 "--worktree" => { i += 1; worktree = Some(PathBuf::from(argv.get(i).cloned().unwrap_or_default())); }
                 "--task" => { i += 1; task = argv.get(i).cloned().unwrap_or_default(); }
                 "--task-spec" => { i += 1; spec = Some(PathBuf::from(argv.get(i).cloned().unwrap_or_default())); }
+                "--parent-session" => { i += 1; parent_session = Some(argv.get(i).cloned().unwrap_or_default()); }
                 other => { eprintln!("error: unknown subagent-launch flag {other}"); std::process::exit(2); }
             }
             i += 1;
@@ -312,7 +314,7 @@ fn main() {
             readable: vec!["README.md".into()],
             writable: vec![".".into()],
         };
-        match crate::subagent::orchestrate_subagent(&repo, &name, &worktree, role, &task, &spec) {
+        match crate::subagent::orchestrate_subagent(&repo, &name, &worktree, role, &task, &spec, parent_session.as_deref()) {
             Ok(v) => {
                 let ok = v["passed"] == serde_json::Value::Bool(true);
                 println!("ORCHESTRATION {}", serde_json::to_string(&v).unwrap_or_default());

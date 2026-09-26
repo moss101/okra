@@ -62,6 +62,8 @@ fn g5_launcher_confined_child_and_collect_work() {
             &repo_path.join("task.json").to_string_lossy(),
             "--task",
             "produce deliverable.md inside the grant",
+            "--parent-session",
+            "sess-parent-main",
         ])
         .output()
         .expect("run subagent-launch");
@@ -117,6 +119,12 @@ fn g5_launcher_confined_child_and_collect_work() {
         "main workspace sentinel"
     );
     assert_eq!(verdict["parent_clean"], serde_json::Value::Bool(true));
+    // fork linkage: the child's kernel session header links to the parent
+    assert_eq!(
+        verdict["child"]["parent_session"].as_str(),
+        Some("sess-parent-main"),
+        "fork linkage recorded in the child session header"
+    );
 
     // escape attempt never landed in the parent
     assert!(!repo_path.join("escape-attempt.txt").exists());
