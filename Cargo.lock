@@ -1276,6 +1276,7 @@ dependencies = [
  "okra-protocol",
  "portable-pty",
  "regex",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",

@@ -20,6 +20,7 @@ pub mod plugins;
 pub mod safe_fs;
 pub mod settings_sync;
 pub mod storage;
+pub mod usage;
 pub mod skill_sync;
 pub mod terminal;
 
@@ -38,6 +39,7 @@ pub use plugin_sync::{
     DEFAULT_MAX_ARCHIVE_BYTES as PLUGIN_SYNC_MAX_ARCHIVE_BYTES, INLINE_PLUGIN_MARKETPLACE,
     METADATA_ARCHIVE_PATH,
 };
+pub use usage::{GroupedUsage, UsageError, UsageLedger, UsageRecord, UsageSnapshot, UsageTotals};
 pub use storage::{CatalogEntry, StorageError as StorageDomainError, StorageService};
 pub use checkpoints::{
     CheckpointError, CheckpointManager, FileSnapshot, GitState, RestoreReport, RewindCheckpoint,
