@@ -133,12 +133,22 @@ fn spawn_daemon(cwd: &Path) -> (Child, String) {
             Ok(_) => {}
             Err(e) => panic!("read stderr: {e}"),
         }
+        eprintln!("DAEMON: {}", line.trim());
         if let Some(rest) = line.strip_prefix("[serve-tcp] multi-surface daemon on ") {
             let rest = rest.trim();
             let addr = rest.split(" (").next().unwrap_or(rest);
             break addr.to_string();
         }
     };
+    // keep draining stderr so turn-thread panics surface in test output
+    {
+        let mut reader = reader;
+        std::thread::spawn(move || {
+            for line in reader.lines().map_while(Result::ok) {
+                eprintln!("DAEMON: {}", line.trim());
+            }
+        });
+    }
     (child, addr)
 }
 
