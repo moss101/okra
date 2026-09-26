@@ -21,6 +21,40 @@ use std::sync::Arc;
 
 use crate::task::{TaskPlanner, TaskSpec};
 
+thread_local! {
+    static SAMPLER_KIND: std::cell::Cell<&'static str> = const { std::cell::Cell::new("task-planner") };
+}
+
+/// Sampler wrapper that records per-turn token usage into the usage
+/// ledger (telemetry domain) while delegating to the real provider. The
+/// rusqlite connection is not Sync, so it sits behind a mutex.
+struct RecordingSampler {
+    inner: okra_providers::OpenAiProvider,
+    ledger: std::sync::Mutex<okra_host::usage::UsageLedger>,
+    session_id: String,
+}
+
+impl Sampler for RecordingSampler {
+    fn sample(
+        &self,
+        request: &okra_providers::SampleRequest,
+    ) -> Result<okra_providers::SampleResponse, okra_providers::SamplerError> {
+        let response = self.inner.sample(request)?;
+        let _ = self.ledger.lock().unwrap().record(&okra_host::usage::UsageRecord {
+            session_id: self.session_id.clone(),
+            provider: "openai".into(),
+            model: "subagent".into(),
+            input_tokens: response.usage.input_tokens,
+            output_tokens: response.usage.output_tokens,
+            recorded_at_epoch_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        });
+        Ok(response)
+    }
+}
+
 pub fn run_subagent(grant: &std::path::Path, spec_path: &std::path::Path) -> Result<serde_json::Value, String> {
     if !grant.is_dir() {
         return Err(format!("grant dir {} is not a directory", grant.display()));
@@ -110,7 +144,38 @@ pub fn run_subagent(grant: &std::path::Path, spec_path: &std::path::Path) -> Res
         Err(e) => return Err(format!("open session: {e}")),
     };
 
-    let sampler: Arc<dyn Sampler> = Arc::new(TaskPlanner::new(spec));
+    // sampler selection: a REAL OpenAI-compatible model when the
+    // orchestrator env configures it (base URL + key + model), else the
+    // deterministic offline TaskPlanner. The OpenAI path wraps the
+    // provider in a RecordingSampler so every turn's token usage lands in
+    // the usage ledger (inside the grant, harvested by the orchestrator).
+    let env_base = std::env::var("OKRA_SUBAGENT_BASE_URL").ok();
+    let env_key = std::env::var("OKRA_SUBAGENT_API_KEY").ok();
+    let env_model = std::env::var("OKRA_SUBAGENT_MODEL").ok();
+    let sampler: Arc<dyn Sampler> = match (env_base, env_key, env_model) {
+        (Some(base), Some(key), Some(model)) => {
+            let ledger = std::sync::Mutex::new(okra_host::usage::UsageLedger::open(
+                &sessions_root.join("usage.db"),
+            )
+            .map_err(|e| format!("open usage ledger: {e}"))?);
+            SAMPLER_KIND.with(|k| k.set("openai"));
+            Arc::new(RecordingSampler {
+                inner: okra_providers::OpenAiProvider::new(okra_providers::OpenAiConfig {
+                    base_url: base,
+                    api_key: key,
+                    model,
+                    timeout_secs: 120,
+                    extra_headers: vec![],
+                }),
+                ledger,
+                session_id: format!("subagent-{}", std::process::id()),
+            })
+        }
+        _ => {
+            SAMPLER_KIND.with(|k| k.set("task-planner"));
+            Arc::new(TaskPlanner::new(spec))
+        }
+    };
     let mut agent = Agent::new(
         AgentConfig { max_steps: 32, unattended: true, ..Default::default() },
         sampler,
@@ -154,6 +219,7 @@ pub fn run_subagent(grant: &std::path::Path, spec_path: &std::path::Path) -> Res
     extra_writable.clear();
 
     let passed = task_completed && files_ok && write_inside && !write_outside;
+    let sampler = SAMPLER_KIND.with(|k| k.get());
     Ok(json!({
         "grant": grant.to_string_lossy(),
         "enforcement": format!("{:?}", report.enforcement),
@@ -162,6 +228,7 @@ pub fn run_subagent(grant: &std::path::Path, spec_path: &std::path::Path) -> Res
         "files_verified": files_ok,
         "kernel_write_inside_grant": if write_inside { "ok" } else { "failed" },
         "kernel_write_outside_grant": if write_outside { "ALLOWED" } else { "denied" },
+        "sampler": sampler,
         "passed": passed,
     }))
 }
@@ -242,7 +309,18 @@ pub fn orchestrate_subagent(
         serde_json::from_str(child_line.trim_start_matches("SUBAGENT "))
             .map_err(|e| format!("child verdict parse: {e}"))?;
 
-    // collect: drop runtime artifacts, commit the child's work on the branch
+    // collect: harvest usage telemetry, drop runtime artifacts, commit the
+    // child's work on the branch
+    let usage_db = worktree_path.join(".okra-sessions").join("usage.db");
+    let usage = if usage_db.exists() {
+        okra_host::usage::UsageLedger::open(&usage_db)
+            .and_then(|l| l.snapshot(None))
+            .ok()
+            .map(|snap| serde_json::to_value(&snap).unwrap_or(serde_json::Value::Null))
+            .unwrap_or(serde_json::Value::Null)
+    } else {
+        serde_json::Value::Null
+    };
     let _ = std::fs::remove_dir_all(worktree_path.join(".okra-sessions"));
     let _ = std::fs::remove_file(&spec_copy);
     // only commit if the child actually produced something
@@ -259,7 +337,10 @@ pub fn orchestrate_subagent(
     // parent checkout untouched?
     let parent_repo = okra_host::git::GitRepository::open(repo_path)
         .map_err(|e| format!("reopen parent repo: {e}"))?;
-    let parent_clean = !parent_repo.is_dirty().unwrap_or(false);
+    let parent_status = parent_repo.status().unwrap_or_default();
+    let parent_status_dump: Vec<String> =
+        parent_status.iter().map(|e| format!("{} {}", e.code, e.path)).collect();
+    let parent_clean = parent_status.is_empty();
     let parent_sentinel = std::fs::read_to_string(repo_path.join("sentinel.txt")).ok();
 
     launcher.cleanup(&grant).map_err(|e| format!("cleanup: {e}"))?;
@@ -272,7 +353,9 @@ pub fn orchestrate_subagent(
         "child": child,
         "commit": commit,
         "parent_clean": parent_clean,
+        "parent_status": parent_status_dump,
         "parent_sentinel": parent_sentinel,
+        "usage": usage,
         "passed": passed,
     }))
 }
