@@ -1,0 +1,21 @@
+[package]
+name = "okra-agent-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Turn phase machine, governors, steering, backstops, one task runtime, sync turn loop"
+
+[dependencies]
+okra-protocol = { workspace = true }
+okra-kernel = { workspace = true }
+okra-tools = { workspace = true }
+okra-policy = { workspace = true }
+okra-providers = { workspace = true }
+okra-compaction = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

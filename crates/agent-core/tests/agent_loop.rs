@@ -1,0 +1,343 @@
+//! End-to-end turn tests (MASTER-PLAN M0 gate: "wire grok's
+//! SessionActor → kernel event log → one tool (`read_file`) through the
+//! daemon") + the killAtPhase crash-recovery harness (§3 #63).
+
+use std::sync::Arc;
+
+use okra_agent_core as core;
+use core::loop_::{
+    Agent, AgentConfig, LoopEvent, PolicyToolExecutor, ToolExecutor,
+};
+use core::steering::PendingInterjection;
+use core::turn::{CompletedStop, TurnOutcome};
+use okra_kernel as kernel;
+use okra_policy::approval::{ApprovalChannel, ApprovalOutcome, ApprovalPolicy, ApprovalService};
+use okra_providers::{SamplerError, ScriptedModel, ScriptedStep, ToolCall};
+use okra_tools::Registry;
+use serde_json::json;
+
+struct AllowChannel;
+impl ApprovalChannel for AllowChannel {
+    fn answer(&self, _req: &okra_policy::ApprovalRequest) -> Option<ApprovalOutcome> {
+        Some(ApprovalOutcome::AllowedOnce)
+    }
+}
+
+/// Build an agent over a scripted model + read_file/list_dir tools rooted
+/// at `root`, logging to a kernel session.
+static SESSION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn build_agent(
+    root: &std::path::Path,
+    steps: Vec<ScriptedStep>,
+    unattended: bool,
+) -> Agent<ScriptedModel> {
+    let session_id = format!(
+        "agent-e2e-{}",
+        std::process::id() as u64 * 1000
+            + std::sync::atomic::AtomicU64::fetch_add(&SESSION_SEQ, 1, std::sync::atomic::Ordering::SeqCst)
+    );
+    let mut registry = Registry::new();
+    let rf = okra_tools::builtins::read_file_tool(root.to_path_buf());
+    let entry = rf.entry();
+    let entry_clone = entry.clone();
+    registry
+        .register(okra_tools::ErasedTool::simple(
+            entry,
+            vec![okra_tools::ResourceAccess::read_file("*")],
+            move |args| rf.execute(args, None),
+        ))
+        .unwrap();
+    let _ = entry_clone;
+    let ld = okra_tools::builtins::list_dir_tool(root.to_path_buf());
+    let ld_entry = ld.entry();
+    registry
+        .register(okra_tools::ErasedTool::simple(
+            ld_entry,
+            vec![okra_tools::ResourceAccess::tree(
+                okra_tools::FileAccessOperation::Read,
+                "*",
+            )],
+            move |args| ld.execute(args),
+        ))
+        .unwrap();
+
+    let mut approvals = ApprovalService::new(if unattended {
+        ApprovalPolicy::Never
+    } else {
+        ApprovalPolicy::Ask
+    });
+    approvals.add_channel(Box::new(AllowChannel));
+    let executor = PolicyToolExecutor::new(registry, approvals);
+
+    let header = kernel::SessionHeader {
+        version: kernel::SESSION_FORMAT_VERSION,
+        id: session_id.clone(),
+        created_at: 1.0,
+        cwd: root.to_string_lossy().into_owned(),
+        parent_session: None,
+        is_seeded: false,
+    };
+    let session =
+        kernel::SessionHandle::create(&root.join(".okra-sessions"), &header).unwrap();
+    drop(session_id);
+
+    let sampler = Arc::new(ScriptedModel::new(steps));
+    Agent::new(AgentConfig { unattended, ..Default::default() }, sampler, Box::new(executor), session)
+}
+
+fn collect(events: &mut Vec<LoopEvent>) -> impl FnMut(LoopEvent) + '_ {
+    |ev| events.push(ev)
+}
+
+#[test]
+fn m0_gate_read_file_turn_through_daemon() {
+    let td = tempfile::tempdir().unwrap();
+    std::fs::write(td.path().join("hello.txt"), "okra reads files").unwrap();
+
+    let steps = vec![
+        // step 1: model calls read_file
+        ScriptedStep {
+            text: "Let me read the file.".into(),
+            tool_calls: vec![ToolCall {
+                id: "call-1".into(),
+                name: "read_file".into(),
+                args_json: r#"{"path":"hello.txt"}"#.into(),
+            }],
+            ..Default::default()
+        },
+        // step 2: model sees the result and ends the turn (semantic)
+        ScriptedStep {
+            text: "The file says: okra reads files".into(),
+            ..Default::default()
+        },
+    ];
+    let mut agent = build_agent(td.path(), steps, true);
+    let mut events = Vec::new();
+    let outcome = agent.run_turn("read hello.txt", &mut collect(&mut events)).unwrap();
+
+    // semantic termination: completed with EndTurn
+    match &outcome {
+        TurnOutcome::Completed { tools_called, stop, .. } => {
+            assert_eq!(tools_called, &vec!["read_file".to_string()]);
+            assert_eq!(stop, &CompletedStop::EndTurn);
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+
+    // the event stream shows the full pipeline
+    assert!(events.iter().any(|e| matches!(e, LoopEvent::TurnStarted { turn: 1 })));
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, LoopEvent::ToolCallStarted { name, .. } if name == "read_file")));
+    let finished = events
+        .iter()
+        .find(|e| matches!(e, LoopEvent::ToolCallFinished { name, .. } if name == "read_file"))
+        .unwrap();
+    if let LoopEvent::ToolCallFinished { output, is_error, .. } = finished {
+        assert!(!is_error);
+        assert!(output.contains("okra reads files"), "{output}");
+    }
+    assert!(events.iter().any(|e| matches!(e, LoopEvent::TurnFinished { .. })));
+
+    // durable truth: the kernel log reconstructs the turn
+    let events_log = agent.session().read_all().unwrap();
+    kernel::check_log(&events_log).unwrap();
+    assert!(events_log.iter().any(|e| e.event_type == "turn/start"));
+    assert!(events_log
+        .iter()
+        .any(|e| e.event_type == "user/message" && e.surface_op.is_some()));
+    assert!(events_log.iter().any(|e| e.event_type == "tool/call"));
+    assert!(events_log.iter().any(|e| e.event_type == "tool/result"));
+
+    // model-visible means logged: the assistant text is in the log
+    assert!(events_log
+        .iter()
+        .any(|e| e.event_type == "assistant/message"
+            && e.data["text"]
+                .as_str()
+                .unwrap()
+                .contains("okra reads files")));
+}
+
+#[test]
+fn approval_denial_blocks_side_effect_and_logs_result() {
+    let td = tempfile::tempdir().unwrap();
+
+    struct DenyChannel;
+    impl ApprovalChannel for DenyChannel {
+        fn answer(&self, _req: &okra_policy::ApprovalRequest) -> Option<ApprovalOutcome> {
+            Some(ApprovalOutcome::Rejected)
+        }
+    }
+
+    // side-effecting tool (needs approval): write_file stub via a denied
+    // read of a *new* read-only tool? read-only tools never prompt; use a
+    // custom non-read-only tool entry.
+    let mut registry = Registry::new();
+    let mut entry = okra_tools::builtins::read_file_tool(td.path().to_path_buf()).entry();
+    entry.spec.name = "deploy".into();
+    entry.spec.idempotent = false;
+    entry.spec.read_only = false;
+    entry.metadata.read_only = false;
+    entry.metadata.needs_approval = true;
+    registry
+        .register(okra_tools::ErasedTool::simple(entry, vec![], |_args| {
+            // this must never run when approval is denied
+            okra_tools::ToolStream::terminal_only(Ok(okra_tools::ToolOutput::text(
+                "DEPLOYED!",
+            )))
+        }))
+        .unwrap();
+    let mut approvals = ApprovalService::new(ApprovalPolicy::Ask);
+    approvals.add_channel(Box::new(DenyChannel));
+    let executor = PolicyToolExecutor::new(registry, approvals);
+
+    let header = kernel::SessionHeader {
+        version: kernel::SESSION_FORMAT_VERSION,
+        id: "deny-e2e".into(),
+        created_at: 1.0,
+        cwd: "/tmp".into(),
+        parent_session: None,
+        is_seeded: false,
+    };
+    let session =
+        kernel::SessionHandle::create(&td.path().join(".okra-sessions"), &header).unwrap();
+    let mut agent = Agent::new(Default::default(), Arc::new(ScriptedModel::new(vec![
+        ScriptedStep {
+            text: "deploying".into(),
+            tool_calls: vec![ToolCall {
+                id: "d1".into(),
+                name: "deploy".into(),
+                args_json: "{}".into(),
+            }],
+            ..Default::default()
+        },
+        ScriptedStep { text: "denied, stopping.".into(), ..Default::default() },
+    ])), Box::new(executor), session);
+
+    let mut events = Vec::new();
+    let outcome = agent.run_turn("deploy please", &mut collect(&mut events)).unwrap();
+    assert!(matches!(outcome, TurnOutcome::Completed { stop: CompletedStop::EndTurn, .. }));
+
+    // the denied tool's effect never happened
+    let finished = events
+        .iter()
+        .find(|e| matches!(e, LoopEvent::ToolCallFinished { name, .. } if name == "deploy"))
+        .unwrap();
+    if let LoopEvent::ToolCallFinished { output, is_error, .. } = finished {
+        assert!(*is_error);
+        assert!(output.contains("denied"), "{output}");
+        assert!(!output.contains("DEPLOYED!"));
+    }
+}
+
+#[test]
+fn kill_at_phase_crash_leaves_recoverable_log() {
+    // Simulate the killAtPhase harness: run the turn in a child process
+    // that aborts mid-turn, then reopen the session and verify recovery.
+    // (In-process abort would take the test runner down; use a child.)
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path().to_path_buf();
+    std::fs::write(root.join("f.txt"), "data").unwrap();
+
+    // locate the okra binary next to the test executable (target/debug/)
+    let exe = std::env::current_exe().unwrap();
+    let target_dir = exe.ancestors().nth(2).unwrap().to_path_buf();
+    let bin = target_dir.join("okra");
+    if !bin.exists() {
+        panic!("okra binary not built at {}", bin.display());
+    }
+    let kill_spec = "ExecutingTools:1";
+    let status = std::process::Command::new(&bin)
+        .args(["--json", "--cwd", root.to_str().unwrap(), "--kill-at-phase", kill_spec, "read f.txt"])
+        .env("OKRA_KILL_AT_PHASE", kill_spec)
+        .output()
+        .expect("spawn okra child");
+    assert!(
+        status.status.code().is_none() || status.status.code() == Some(134),
+        "child should have aborted (signal), got {:?} stderr={}",
+        status.status.code(),
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    // recovery: reopen the session — complete events survive, torn tail is
+    // invisible, and a new write handle repairs + continues
+    let sessions = root.join(".okra-sessions");
+    let mut w = kernel::SessionHandle::open(&sessions, "cli", kernel::SessionAccess::Write).unwrap();
+    let recovered = w.read_all().unwrap();
+    kernel::check_log(&recovered).unwrap();
+    // the user message landed before the abort
+    assert!(recovered
+        .iter()
+        .any(|e| e.event_type == "user/message"));
+    // write handle repairs any torn tail and continues the seq space
+    let mut ev = kernel::make_event("user/message", json!({ "text": "after crash" }), kernel::wall_clock);
+    ev.seq = 0;
+    w.append_durable(vec![ev]).unwrap();
+    let after = w.read_all().unwrap();
+    kernel::check_log(&after).unwrap();
+    assert!(after
+        .iter()
+        .any(|e| e.data.get("text").and_then(|t| t.as_str()) == Some("after crash")));
+}
+
+#[test]
+fn length_salvage_continues_after_truncation() {
+    let td = tempfile::tempdir().unwrap();
+    let steps = vec![
+        // truncated response
+        ScriptedStep {
+            text: "partial ans".into(),
+            truncate_at: Some(8),
+            ..Default::default()
+        },
+        // continuation
+        ScriptedStep { text: "wer completed".into(), ..Default::default() },
+    ];
+    let mut agent = build_agent(td.path(), steps, true);
+    let mut events = Vec::new();
+    let outcome = agent.run_turn("answer me", &mut collect(&mut events)).unwrap();
+    assert!(matches!(
+        outcome,
+        TurnOutcome::Completed { stop: CompletedStop::EndTurn, .. }
+    ));
+}
+
+#[test]
+fn sampler_401_parks_uncharged_then_recovers() {
+    let td = tempfile::tempdir().unwrap();
+    let steps = vec![
+        ScriptedStep {
+            error: Some(SamplerError::Unauthorized),
+            ..Default::default()
+        },
+        ScriptedStep { text: "recovered after auth".into(), ..Default::default() },
+    ];
+    let mut agent = build_agent(td.path(), steps, true);
+    let outcome = agent.run_turn("go", &mut |_| {}).unwrap();
+    assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+}
+
+#[test]
+fn steering_drains_at_step_boundary() {
+    let td = tempfile::tempdir().unwrap();
+    let mut agent = build_agent(td.path(), vec![
+        ScriptedStep { text: "working...".into(), ..Default::default() },
+        ScriptedStep { text: "done with steering".into(), ..Default::default() },
+    ], true);
+    let sender = agent.steering_sender();
+    // queue a mid-turn steering entry (submitted_while_running = true) —
+    // the loop drains it at the first step boundary
+    let _ = sender.send(core::steering::Tagged {
+        interjection: PendingInterjection { text: "mid-turn note".into() },
+        submitted_while_running: true,
+    });
+    let mut events = Vec::new();
+    let outcome = agent.run_turn("start", &mut collect(&mut events)).unwrap();
+    assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+    // the queued note is drained at the first step boundary
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, LoopEvent::SteeringInjected { text } if text.contains("mid-turn note"))));
+}

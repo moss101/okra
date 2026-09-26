@@ -1,0 +1,17 @@
+//! okra-host — host services (MASTER-PLAN §3 #48/#51/#52). The ~50 ZCode
+//! domains migrate strangler-style behind the protocol from M3; M1 lands
+//! the three safety-bearing pieces:
+//! - notifications policy: exactly 3 native classes + body redaction +
+//!   focus suppression (§3 #51, ChatGPT2 study — fixes their leak)
+//! - file-management safe-read: O_NOFOLLOW|O_NONBLOCK + regular-file +
+//!   ownership checks (§3 #52, ChatGPT2 docs/03)
+//! - fsutil: the single sanctioned canonicalize/home_dir call sites
+
+pub mod fsutil;
+pub mod notifications;
+pub mod safe_fs;
+
+pub use notifications::{
+    classify, redact_body, Notification, NotificationClass, NotificationsPolicy,
+};
+pub use safe_fs::{safe_read, SafeReadError};

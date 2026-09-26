@@ -1,0 +1,62 @@
+# okra — one Rust daemon, any surface.
+#
+# Workspace layout follows work/20260925-nextgen-workbench/MASTER-PLAN.md §2
+# ("workbench/" tree), renamed to the okra namespace per decision N0002.
+# Edition 2024 matches the grok-build donor (rust-toolchain 1.94+).
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/protocol",
+    "crates/kernel",
+    "crates/tools",
+    "crates/policy",
+    "crates/agent-core",
+    "crates/providers",
+    "crates/compaction",
+    "crates/memory",
+    "crates/session",
+    "crates/workflow",
+    "crates/host",
+    "crates/gateway",
+    "crates/computer",
+    "crates/tui",
+    "apps/okra",
+]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://example.invalid/okra"
+rust-version = "1.94"
+
+[workspace.dependencies]
+okra-protocol = { path = "crates/protocol" }
+okra-kernel = { path = "crates/kernel" }
+okra-tools = { path = "crates/tools" }
+okra-policy = { path = "crates/policy" }
+okra-agent-core = { path = "crates/agent-core" }
+okra-providers = { path = "crates/providers" }
+okra-compaction = { path = "crates/compaction" }
+okra-memory = { path = "crates/memory" }
+okra-session = { path = "crates/session" }
+okra-workflow = { path = "crates/workflow" }
+okra-host = { path = "crates/host" }
+okra-gateway = { path = "crates/gateway" }
+okra-computer = { path = "crates/computer" }
+okra-tui = { path = "crates/tui" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+sha2 = "0.10"
+regex = "1"
+libc = "0.2"
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# TODO(M1): opt production crates into clippy::indexing_slicing like grok does.
+unwrap_used = { level = "warn", priority = -1 }

@@ -1,0 +1,31 @@
+# cargo-deny config for okra (MASTER-PLAN §3 #61: crate boundaries as cargo-deny).
+# Run: cargo deny check
+#
+# Note: `[graph]`-level cycle checks between okra crates are enforced by
+# scripts/check-boundaries.sh (dependency direction rules) because cargo-deny
+# bans are license/advisory oriented. Keep both green.
+
+[graph]
+all-features = true
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[[bans.deny]]
+# The donor's product namespace must never leak into okra (MASTER-PLAN §1:
+# "x.ai/* namespace — renamed to ours").
+name = "xai-*"
+wildcards = "deny"

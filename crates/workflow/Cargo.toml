@@ -1,0 +1,14 @@
+[package]
+name = "okra-workflow"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Workflow run records, budgets, and the NDJSON run journal (Rhai engine: M3)"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

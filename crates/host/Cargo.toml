@@ -1,0 +1,18 @@
+[package]
+name = "okra-host"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Host services: notifications policy, safe file service, fsutil, automation guard"
+
+[dependencies]
+okra-kernel = { workspace = true }
+okra-policy = { workspace = true }
+okra-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

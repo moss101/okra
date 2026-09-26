@@ -1,0 +1,148 @@
+//! Erased tool dispatch + registry — grok `ToolDyn`/`ToolDispatch`
+//! (`tool.rs:322-350`, `dispatch.rs:32-68`) flattened for the sync runtime:
+//! a tool is a boxed fn from approved args to a validated `ToolStream`.
+
+use serde_json::Value;
+use std::collections::HashMap;
+
+use crate::pipeline::{normalize_before_hooks, ArgumentNormalizer, PipelineError, PreToolUseHook};
+use crate::scheduler::ToolAccesses;
+use crate::spec::ToolEntry;
+use crate::stream::ToolStream;
+
+/// The erased tool: executes APPROVED bytes only.
+pub struct ErasedTool {
+    pub entry: ToolEntry,
+    /// Declared footprint for the scheduler (kimi semantics).
+    pub accesses_for: Box<dyn Fn(&Value) -> ToolAccesses + Send + Sync>,
+    pub execute: Box<dyn Fn(&Value) -> ToolStream + Send + Sync>,
+}
+
+impl std::fmt::Debug for ErasedTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ErasedTool")
+            .field("name", &self.entry.spec.name)
+            .field("idempotent", &self.entry.spec.idempotent)
+            .finish()
+    }
+}
+
+impl ErasedTool {
+    pub fn simple(
+        entry: ToolEntry,
+        accesses: ToolAccesses,
+        execute: impl Fn(&Value) -> ToolStream + Send + Sync + 'static,
+    ) -> Self {
+        ErasedTool {
+            entry,
+            accesses_for: Box::new(move |_| accesses.clone()),
+            execute: Box::new(execute),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RegistryError {
+    #[error("unknown tool `{0}`")]
+    UnknownTool(String),
+    #[error("duplicate tool `{0}`")]
+    Duplicate(String),
+    #[error("pipeline: {0}")]
+    Pipeline(#[from] PipelineError),
+    #[error("stream protocol violation: {0}")]
+    StreamProtocol(String),
+}
+
+/// The tool registry + dispatch funnel: every call — whatever the source —
+/// goes through `dispatch`, which runs normalize→hooks→execute and validates
+/// the stream invariant. This is the M0 shape of grok's
+/// "use_tool-style single dispatch funnel" (MASTER-PLAN §3 #47).
+pub struct Registry {
+    tools: HashMap<String, ErasedTool>,
+    normalizers: Vec<Box<dyn ArgumentNormalizer>>,
+    hooks: Vec<Box<dyn PreToolUseHook>>,
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Registry {
+    pub fn new() -> Self {
+        Registry { tools: HashMap::new(), normalizers: Vec::new(), hooks: Vec::new() }
+    }
+
+    pub fn register(&mut self, tool: ErasedTool) -> Result<(), RegistryError> {
+        let name = tool.entry.spec.name.clone();
+        if self.tools.insert(name.clone(), tool).is_some() {
+            return Err(RegistryError::Duplicate(name));
+        }
+        Ok(())
+    }
+
+    pub fn add_normalizer(&mut self, n: Box<dyn ArgumentNormalizer>) {
+        self.normalizers.push(n);
+    }
+
+    pub fn add_hook(&mut self, h: Box<dyn PreToolUseHook>) {
+        self.hooks.push(h);
+    }
+
+    pub fn normalizers_iter(&self) -> impl Iterator<Item = &dyn ArgumentNormalizer> {
+        self.normalizers.iter().map(|b| b.as_ref())
+    }
+
+    pub fn hooks_iter(&self) -> impl Iterator<Item = &dyn PreToolUseHook> {
+        self.hooks.iter().map(|b| b.as_ref())
+    }
+
+    pub fn entries(&self) -> Vec<&ToolEntry> {
+        let mut v: Vec<&ToolEntry> = self.tools.values().map(|t| &t.entry).collect();
+        v.sort_by(|a, b| a.spec.name.cmp(&b.spec.name));
+        v
+    }
+
+    pub fn get(&self, name: &str) -> Result<&ErasedTool, RegistryError> {
+        self.tools.get(name).ok_or_else(|| RegistryError::UnknownTool(name.to_string()))
+    }
+
+    /// normalize → hooks → execute(approved bytes), then validate the stream
+    /// invariant ([Progress*, exactly one Terminal]).
+    pub fn dispatch(
+        &self,
+        tool_name: &str,
+        raw_args: &Value,
+        extra_hooks: &[&dyn PreToolUseHook],
+    ) -> Result<ToolStream, RegistryError> {
+        let tool = self.get(tool_name)?;
+        let normalizers: Vec<&dyn ArgumentNormalizer> =
+            self.normalizers.iter().map(|b| b.as_ref()).collect();
+        let mut hooks: Vec<&dyn PreToolUseHook> =
+            self.hooks.iter().map(|b| b.as_ref()).collect();
+        for h in extra_hooks {
+            hooks.push(*h);
+        }
+        let approved =
+            normalize_before_hooks(&tool.entry, raw_args, &normalizers, &hooks)?;
+        let args = approved.args();
+        let stream = (tool.execute)(&args);
+        stream.validate().map_err(|e| RegistryError::StreamProtocol(match &e {
+            crate::stream::ToolError::Custom { code, message } => format!("{code}: {message}"),
+            other => format!("{other:?}"),
+        }))?;
+        Ok(stream)
+    }
+
+    /// Registry-scoped hook verdict without executing (policy probes).
+    pub fn probe(&self, tool_name: &str, raw_args: &Value) -> Result<Vec<String>, RegistryError> {
+        let tool = self.get(tool_name)?;
+        let normalizers: Vec<&dyn ArgumentNormalizer> =
+            self.normalizers.iter().map(|b| b.as_ref()).collect();
+        let hooks: Vec<&dyn PreToolUseHook> = self.hooks.iter().map(|b| b.as_ref()).collect();
+        let approved =
+            normalize_before_hooks(&tool.entry, raw_args, &normalizers, &hooks)?;
+        Ok(approved.approved_by)
+    }
+}

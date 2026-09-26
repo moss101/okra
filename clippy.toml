@@ -1,0 +1,24 @@
+# okra day-1 lint bans (MASTER-PLAN §3 #61; policy adapted from grok-build/clippy.toml).
+#
+# clippy uses the NEAREST clippy.toml (no merging), so per-crate configs would
+# have to duplicate these. Keep everything here.
+#
+# Bans:
+# - raw child-process spawn: an unenrolled child outlives the session that
+#   started it. All spawning goes through okra_policy's confined runner
+#   (confine(argv) → enrolled spawn), which also enforces the sandbox policy.
+# - raw canonicalize: reserved for okra's future Windows port (M6); today the
+#   reason documents the constraint for every caller.
+# - std::env::home_dir: platform-quirk-ridden; home resolution goes through
+#   okra_host's dirs helper once it lands (allow-invalid until then).
+
+disallowed-methods = [
+    { path = "std::process::Command::spawn", reason = "an unenrolled child outlives its session and bypasses the sandbox; spawn through okra_policy (confine + enrolled runner)" },
+    { path = "std::process::Command::status", reason = "bypasses confinement accounting; run through okra_policy's confined runner" },
+    { path = "std::process::Command::output", reason = "bypasses confinement accounting; run through okra_policy's confined runner" },
+    { path = "std::env::home_dir", reason = "home resolution goes through okra_host::fsutil::home_dir (single sanctioned call site)", allow-invalid = true },
+    { path = "std::path::Path::canonicalize", reason = "returns \\\\?\\ verbatim paths on Windows (M6 target); use okra_host::fsutil::canonicalize once it lands", allow-invalid = true },
+    { path = "std::fs::canonicalize", reason = "returns \\\\?\\ verbatim paths on Windows (M6 target); use okra_host::fsutil::canonicalize once it lands", allow-invalid = true },
+]
+
+allow-indexing-slicing-in-tests = true

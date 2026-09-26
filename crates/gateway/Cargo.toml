@@ -1,0 +1,12 @@
+[package]
+name = "okra-gateway"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "NDJSON event bus: ring replay, Last-Event-ID reconnect, slow-client eviction"
+
+[dependencies]
+okra-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
