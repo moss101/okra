@@ -12,6 +12,7 @@
 mod bench;
 mod demo_sampler;
 mod quality;
+mod serve_tcp;
 mod subagent;
 mod serve;
 mod task;
@@ -317,6 +318,44 @@ fn main() {
         }
     }
 
+
+    // `okra serve --tcp ADDR --cwd DIR`: G4 multi-surface daemon
+    if argv.first().map(String::as_str) == Some("serve")
+        && argv.iter().any(|a| a == "--tcp")
+    {
+        let mut tcp_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut addr = String::from("127.0.0.1:0");
+        let mut i = 1;
+        while i < argv.len() {
+            match argv[i].as_str() {
+                "--tcp" => {}
+                "--cwd" => {
+                    i += 1;
+                    tcp_cwd = PathBuf::from(argv.get(i).cloned().unwrap_or_default());
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        // loopback-only posture
+        let host_part = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(&addr).to_string();
+        if !host_part.starts_with("127.0.0.1") && !host_part.starts_with("localhost") && !host_part.starts_with("[::1]") {
+            eprintln!("error: --tcp binds must be loopback (got {addr})");
+            std::process::exit(2);
+        }
+        let listener = std::net::TcpListener::bind(&addr).unwrap_or_else(|e| {
+            eprintln!("error: cannot bind {addr}: {e}");
+            std::process::exit(1);
+        });
+        let bound = listener.local_addr().unwrap();
+        eprintln!("[serve-tcp] multi-surface daemon on {bound} (loopback only)");
+        let sessions_dir = tcp_cwd.join(".okra-sessions");
+        let state = std::sync::Arc::new(serve_tcp::TcpServeState::new(
+            tcp_cwd.clone(),
+            sessions_dir,
+        ));
+        serve_tcp::serve_tcp(state, listener);
+    }
 
     // `okra serve --stdio --cwd DIR [--sessions DIR]`: G0 daemon mode
     let argv: Vec<String> = std::env::args().skip(1).collect();
