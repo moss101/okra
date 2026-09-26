@@ -2,11 +2,16 @@
 //! `conversation-share/`): integrity contracts, public projection,
 //! artifact discovery kernels, and the share HTTP client.
 
+pub mod artifact_source;
 pub mod artifacts;
 pub mod http;
 pub mod integrity;
 pub mod projection;
 
+pub use artifact_source::{
+    ArtifactRead, ArtifactSourceError, ArtifactStat, LocalArtifactSource, MaterializedArtifact,
+    RemoteArtifactSource, RemoteFileService,
+};
 pub use integrity::{
     build_integrity, canonical_json, sha256_canonical, verify_integrity, ShareError,
     ShareIntegrity,
