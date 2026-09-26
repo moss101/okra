@@ -21,6 +21,7 @@ pub mod plugins;
 pub mod safe_fs;
 pub mod settings;
 pub mod settings_sync;
+pub mod prompt_transfer;
 pub mod storage;
 pub mod subagent;
 pub mod usage;
@@ -45,6 +46,11 @@ pub use plugin_sync::{
 };
 pub use subagent::{
     ProjectedContext, RoleScope, SubagentGrant, SubagentLaunchError, SubagentLauncher,
+};
+pub use prompt_transfer::{
+    adopt as adopt_prompt_attachment, cancel as cancel_prompt_transfer,
+    validate_ref as validate_prompt_ref, LocalTransfer, StageParams, StageResult,
+    StagingTransfer, TransferError, TransferPhase, TransferProgress,
 };
 pub use settings::{SettingsError as SettingsStoreError, SettingsScope, SettingsStore};
 pub use surfaces::{AttachDecision, SurfaceError, SurfaceInfo, SurfaceKind, SurfaceRegistry};
