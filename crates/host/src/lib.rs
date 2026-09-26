@@ -9,6 +9,7 @@
 
 pub mod checkpoints;
 pub mod conversation_share;
+pub mod credential;
 pub mod files;
 pub mod fsutil;
 pub mod git;
@@ -47,6 +48,7 @@ pub use subagent::{
 pub use settings::{SettingsError as SettingsStoreError, SettingsScope, SettingsStore};
 pub use usage::{GroupedUsage, UsageError, UsageLedger, UsageRecord, UsageSnapshot, UsageTotals};
 pub use storage::{CatalogEntry, StorageError as StorageDomainError, StorageService};
+pub use credential::{CredentialError, CredentialStore};
 pub use checkpoints::{
     CheckpointError, CheckpointManager, FileSnapshot, GitState, RestoreReport, RewindCheckpoint,
     RewindPoint,
