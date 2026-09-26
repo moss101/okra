@@ -28,6 +28,7 @@ pub mod onboarding;
 pub mod notifications;
 pub mod plugin_sync;
 pub mod plugins;
+pub mod process_tree;
 pub mod remote_access;
 pub mod log_archive;
 pub mod safe_fs;

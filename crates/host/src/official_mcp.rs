@@ -539,10 +539,7 @@ impl IssuanceAudit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_provider::{
-        ApiConfig, ModelCatalog, ProviderConfig, RegistryProvider, RegistryView,
-    };
-    use std::cell::RefCell;
+    use crate::model_provider::{ApiConfig, ProviderConfig, RegistryProvider, RegistryView};
 
     // ---- test seams -------------------------------------------------------
 
@@ -565,7 +562,7 @@ mod tests {
         fn load(&self, key: &str) -> Option<String> {
             let n = self.loads.get();
             self.loads.set(n + 1);
-            let map = if n % 2 == 0 { &self.first } else { &self.second };
+            let map = if n.is_multiple_of(2) { &self.first } else { &self.second };
             map.get(key).cloned()
         }
     }
