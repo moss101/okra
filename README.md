@@ -80,6 +80,21 @@ M6  scale                      ◐ i18n slice: daemon-side en-US/zh-CN catalog
                                   reused TS UI)
 ```
 
+## Real-Zed ACP drive (2026-09-27)
+
+Zed 1.21.0 drove the okra daemon end-to-end over the Agent Client
+Protocol — the G4 editor leg with the real editor. `~/.config/zed/
+settings.json` registers okra as a custom agent server launching
+`scripts/zed-acp-wrapper.sh` (tees both wire directions to
+`~/.okra-zed-acp/`). Evidence in one drive: Zed → `initialize`
+(protocolVersion 1 negotiated, clientInfo zed/1.21.0) → `session/new`
+(workspace cwd honored — the editor's project, not the daemon's launch
+dir) → two `session/prompt` turns on ONE session id, okra streaming
+`agent_message_chunk` + tool_call updates and replying `end_turn`;
+Zed's Agent Panel rendered the user row, the read_file/list_dir tool
+cards, and the assistant markdown. Wire logs + full-turn screenshots
+captured.
+
 ## G0 demo (2026-09-26)
 
 The ZCode Dev Electron app, launched with `ZCODE_OKRA_DAEMON=<okra binary>
