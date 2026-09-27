@@ -2,6 +2,12 @@
 //! the worktree API backs G5 subagent grants (shared object store, isolated
 //! working tree).
 
+
+// Test harness: these acceptance tests execute the compiled crate binary as
+// the system under test. The no-raw-spawn/canonicalize bans target production
+// paths (production spawning goes through okra_policy's confined runner); the
+// acceptance harness must exercise the real binary end-to-end.
+#![allow(clippy::disallowed_methods)]
 use okra_host::git::GitRepository;
 
 fn git_available() -> bool {

@@ -14,6 +14,12 @@
 //!    and carries exactly one `tool/result` — interrupted calls are closed
 //!    by the repair with `TOOL_OUTCOME_UNKNOWN`, never re-executed.
 
+
+// Test harness: these acceptance tests execute the compiled crate binary as
+// the system under test. The no-raw-spawn/canonicalize bans target production
+// paths (production spawning goes through okra_policy's confined runner); the
+// acceptance harness must exercise the real binary end-to-end.
+#![allow(clippy::disallowed_methods)]
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

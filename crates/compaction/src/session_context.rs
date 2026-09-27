@@ -707,7 +707,7 @@ mod tests {
         // old ones stubbed with the outcome preserved
         let (content0, err0) = result_content(ctx.messages(), "c0").unwrap();
         assert!(content0.contains("microcompacted") && content0.contains("bytes of tool output evicted"));
-        assert!(err0 == false);
+        assert!(!err0);
         let (content1, err1) = result_content(ctx.messages(), "c1").unwrap();
         assert!(content1.contains("microcompacted"));
         assert!(err1, "error outcome preserved through stubbing");

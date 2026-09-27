@@ -108,7 +108,7 @@ mod tests {
             .create("crash report", crate::feedback::TicketType::Bug, Some("high"), None, "details")
             .unwrap();
 
-        let attachment = attach_logs_to_ticket(&feedback, &ticket.id, &sessions, &home).unwrap();
+        let attachment = attach_logs_to_ticket(&feedback, &ticket.id, &sessions, home).unwrap();
         assert!(attachment.archive_path.exists());
         assert_eq!(attachment.sha256.len(), 64);
 
@@ -137,7 +137,7 @@ mod tests {
         std::fs::write(dir.join("session.jsonl"), "{}\n").unwrap();
 
         let feedback = FeedbackTicketStore::with_device(home, "device-a");
-        let err = attach_logs_to_ticket(&feedback, "fb-missing", &sessions, &home).unwrap_err();
+        let err = attach_logs_to_ticket(&feedback, "fb-missing", &sessions, home).unwrap_err();
         assert!(matches!(err, FeedbackArchiveError::UnknownTicket(_)), "{err}");
         // the archive side effects were cleaned: no tarball left behind
         assert!(!home.join("feedback-gate").exists());

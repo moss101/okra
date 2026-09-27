@@ -2,6 +2,12 @@
 //! SessionActor → kernel event log → one tool (`read_file`) through the
 //! daemon") + the killAtPhase crash-recovery harness (§3 #63).
 
+
+// Test harness: these acceptance tests execute the compiled crate binary as
+// the system under test. The no-raw-spawn/canonicalize bans target production
+// paths (production spawning goes through okra_policy's confined runner); the
+// acceptance harness must exercise the real binary end-to-end.
+#![allow(clippy::disallowed_methods)]
 use std::sync::Arc;
 
 use okra_agent_core as core;

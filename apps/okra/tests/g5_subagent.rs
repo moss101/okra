@@ -12,6 +12,12 @@
 //!   the task itself makes (policy layer refuses it first; the kernel is
 //!   the backstop for anything that slips past policy).
 
+
+// Test harness: these acceptance tests execute the compiled crate binary as
+// the system under test. The no-raw-spawn/canonicalize bans target production
+// paths (production spawning goes through okra_policy's confined runner); the
+// acceptance harness must exercise the real binary end-to-end.
+#![allow(clippy::disallowed_methods)]
 use std::process::Command;
 
 const TASK_JSON: &str = r##"{

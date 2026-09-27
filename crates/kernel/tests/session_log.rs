@@ -212,12 +212,10 @@ fn surface_fold_append_and_replace() {
         ),
     ];
     // validate before folding (seqs assigned as they would be on append)
-    let mut seq = 0;
-    for ev in &events {
+    for (seq, ev) in events.iter().enumerate() {
         let mut ev = ev.clone();
-        ev.seq = seq;
+        ev.seq = seq as u64;
         kernel::validate_event(&ev, &kernel::CORE_EVENT_TYPES).unwrap();
-        seq += 1;
     }
     let mut assigned = events.clone();
     for (i, ev) in assigned.iter_mut().enumerate() {

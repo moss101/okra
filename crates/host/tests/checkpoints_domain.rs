@@ -3,6 +3,12 @@
 //! external-modification detection, the durable JSONL mirror with lenient
 //! reads and truncation, and the git domain reset.
 
+
+// Test harness: these acceptance tests execute the compiled crate binary as
+// the system under test. The no-raw-spawn/canonicalize bans target production
+// paths (production spawning goes through okra_policy's confined runner); the
+// acceptance harness must exercise the real binary end-to-end.
+#![allow(clippy::disallowed_methods)]
 use okra_host::checkpoints::{CheckpointError, CheckpointManager};
 use okra_host::git::GitRepository;
 

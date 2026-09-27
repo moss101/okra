@@ -377,6 +377,8 @@ mod tests {
         assert_eq!(projected.writable, vec!["src/a".to_string()]);
     }
 
+    // test-only helper; the raw-spawn ban targets production paths
+    #[allow(clippy::disallowed_methods)]
     fn git_available() -> bool {
         std::process::Command::new("git")
             .arg("--version")

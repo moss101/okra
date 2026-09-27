@@ -15,12 +15,11 @@ struct LowercasePathNormalizer;
 impl tools::ArgumentNormalizer for LowercasePathNormalizer {
     fn normalize(&self, _tool: &str, args: &serde_json::Value) -> Result<serde_json::Value, PipelineError> {
         let mut out = args.clone();
-        if let Some(obj) = out.as_object_mut() {
-            if let Some(p) = obj.get("path").and_then(|v| v.as_str()) {
+        if let Some(obj) = out.as_object_mut()
+            && let Some(p) = obj.get("path").and_then(|v| v.as_str()) {
                 let trimmed = p.trim().to_string();
                 obj.insert("path".into(), json!(trimmed));
             }
-        }
         Ok(out)
     }
 }
@@ -33,11 +32,10 @@ impl tools::PreToolUseHook for AccessDeniedHook {
         "access-guard"
     }
     fn on_tool_use(&self, _tool: &str, args: &serde_json::Value) -> HookVerdict {
-        if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
-            if self.deny_paths.iter().any(|d| p.starts_with(d)) {
+        if let Some(p) = args.get("path").and_then(|v| v.as_str())
+            && self.deny_paths.iter().any(|d| p.starts_with(d)) {
                 return HookVerdict::Deny { reason: format!("{p} is access-denied") };
             }
-        }
         HookVerdict::Allow
     }
 }
@@ -52,11 +50,10 @@ fn normalize_runs_before_hooks_and_bytes_are_frozen() {
     impl tools::ArgumentNormalizer for UppercaseNormalizer {
         fn normalize(&self, _t: &str, args: &serde_json::Value) -> Result<serde_json::Value, PipelineError> {
             let mut out = args.clone();
-            if let Some(obj) = out.as_object_mut() {
-                if let Some(p) = obj.get("path").and_then(|v| v.as_str()) {
+            if let Some(obj) = out.as_object_mut()
+                && let Some(p) = obj.get("path").and_then(|v| v.as_str()) {
                     obj.insert("path".into(), json!(p.to_uppercase()));
                 }
-            }
             Ok(out)
         }
     }

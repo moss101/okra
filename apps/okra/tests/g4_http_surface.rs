@@ -4,6 +4,12 @@
 //! `POST /command` (the same v4 envelope as the NDJSON surfaces). A
 //! browser needs nothing but EventSource + fetch to be a full surface.
 
+
+// Test harness: these acceptance tests execute the compiled crate binary as
+// the system under test. The no-raw-spawn/canonicalize bans target production
+// paths (production spawning goes through okra_policy's confined runner); the
+// acceptance harness must exercise the real binary end-to-end.
+#![allow(clippy::disallowed_methods)]
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
@@ -13,9 +19,19 @@ use std::path::Path;
 
 /// Spawn the real daemon and read its advertised bind address from stderr.
 fn spawn_daemon(cwd: &Path) -> (Child, String) {
+    spawn_daemon_env(cwd, &[])
+}
+
+/// `extra_env`: (key, value) pairs set on the daemon process (e.g.
+/// `OKRA_DEMO_DELAY_MS` to widen the steering window).
+fn spawn_daemon_env(cwd: &Path, extra_env: &[(&str, &str)]) -> (Child, String) {
     let bin = env!("CARGO_BIN_EXE_okra");
-    let mut child = Command::new(bin)
-        .args(["serve", "--tcp", "--cwd", &cwd.to_string_lossy()])
+    let mut cmd = Command::new(bin);
+    cmd.args(["serve", "--tcp", "--cwd", &cwd.to_string_lossy()]);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn okra serve --tcp");
@@ -69,11 +85,15 @@ fn http_get(addr: &str, path: &str) -> (u16, String) {
 }
 
 fn http_post_command(addr: &str, envelope: &serde_json::Value) -> (u16, serde_json::Value) {
+    http_post(addr, "/command", envelope)
+}
+
+fn http_post(addr: &str, path: &str, body_json: &serde_json::Value) -> (u16, serde_json::Value) {
     let mut stream = TcpStream::connect(addr).unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-    let body = envelope.to_string();
+    let body = body_json.to_string();
     let request = format!(
-        "POST /command HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     );
@@ -258,5 +278,199 @@ fn run_http_gate(addr: &str) {
         }
         let _ = sse_thread.join();
         let _ = writer_frames;
+    }
+}
+
+/// Wait until `pred` holds for some collected SSE frame (30s deadline).
+fn wait_for(frames: &Mutex<Vec<serde_json::Value>>, pred: &dyn Fn(&[serde_json::Value]) -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if pred(&frames.lock().unwrap()) {
+            return true;
+        }
+        if Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn completed_with_steered(frames: &[serde_json::Value], steered_text: &str) -> bool {
+    frames.iter().any(|f| {
+        f["params"]["control"]["phase"] == "completedSuccess"
+            && f["params"]["rows"].as_array().map(|rows| {
+                rows.iter().any(|r| {
+                    r["kind"] == "userInput"
+                        && r["text"].as_str().map(|t| t.contains(steered_text)).unwrap_or(false)
+                })
+            }).unwrap_or(false)
+    })
+}
+
+/// G4 breadth — steering: a command on a session with a live turn must be
+/// STEERING (`steeringQueued`, `[steered]` row on the same turn), never a
+/// second parallel turn thread racing the same projection. The scripted
+/// stub's `OKRA_DEMO_DELAY_MS` widens the running window so the second
+/// command deterministically lands mid-turn.
+#[test]
+fn g4_command_on_running_session_steers_instead_of_parallel_turn() {
+    let td = tempfile::tempdir().unwrap();
+    std::fs::write(td.path().join("notes.md"), "# notes\nsteering breadth\n").unwrap();
+    let (mut daemon, addr) = spawn_daemon_env(td.path(), &[("OKRA_DEMO_DELAY_MS", "1200")]);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let frames = std::sync::Arc::new(mutex_vec());
+        let writer_frames = std::sync::Arc::clone(&frames);
+        let addr_owned = addr.clone();
+        let sse_thread = std::thread::spawn(move || {
+            sse_collect(&addr_owned, "steer-session", &writer_frames, &|frames| {
+                completed_with_steered(frames, "[steered] focus on the tools")
+            })
+        });
+        std::thread::sleep(Duration::from_millis(300));
+
+        // 1. start the turn (sampler now sleeping 1200ms per step)
+        let (status, reply) = http_post_command(&addr, &serde_json::json!({
+            "commandId": "steer-1",
+            "type": "sendText",
+            "sessionId": "steer-session",
+            "payload": { "text": "summarize notes.md" }
+        }));
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(reply["status"], "accepted");
+        assert_eq!(reply["result"]["type"], "inputAccepted");
+
+        // 2. a second command mid-turn is steering, not a parallel turn
+        let (status2, reply2) = http_post_command(&addr, &serde_json::json!({
+            "commandId": "steer-2",
+            "type": "sendText",
+            "sessionId": "steer-session",
+            "payload": { "text": "focus on the tools" }
+        }));
+        assert_eq!(status2, 200, "{reply2}");
+        assert_eq!(reply2["status"], "accepted", "{reply2}");
+        assert_eq!(reply2["result"]["type"], "steeringQueued", "{reply2}");
+
+        // 3. the steered text lands as a [steered] user row on the SAME turn
+        let got = wait_for(&frames, &|frames| {
+            completed_with_steered(frames, "[steered] focus on the tools")
+        });
+        assert!(got, "steered text never reached the live turn; frames: {frames:?}");
+
+        // 4. single-turn-thread invariant: exactly ONE turnHeader in the
+        // final projection (the old bug spawned a racing second turn)
+        let tail = frames.lock().unwrap().last().cloned().unwrap_or_default();
+        let headers = tail["params"]["rows"].as_array().map(|rows| {
+            rows.iter().filter(|r| r["kind"] == "turnHeader").count()
+        }).unwrap_or(0);
+        assert_eq!(headers, 1, "expected exactly one turn thread, final frame: {tail}");
+        let _ = sse_thread.join();
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// G4 breadth — `POST /steer`: the explicit browser steer endpoint queues
+/// onto the session's steering queue (consumed by the live or next turn);
+/// missing fields are a 400.
+#[test]
+fn g4_steer_endpoint_queues_text() {
+    let td = tempfile::tempdir().unwrap();
+    std::fs::write(td.path().join("notes.md"), "# notes\nsteer endpoint\n").unwrap();
+    let (mut daemon, addr) = spawn_daemon_env(td.path(), &[("OKRA_DEMO_DELAY_MS", "1200")]);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // malformed steer → 400
+        let (status, _) = http_post(&addr, "/steer", &serde_json::json!({ "text": "x" }));
+        assert_eq!(status, 400);
+
+        let frames = std::sync::Arc::new(mutex_vec());
+        let writer_frames = std::sync::Arc::clone(&frames);
+        let addr_owned = addr.clone();
+        let sse_thread = std::thread::spawn(move || {
+            sse_collect(&addr_owned, "steer-endpoint", &writer_frames, &|frames| {
+                completed_with_steered(frames, "[steered] endpoint steer landed")
+            })
+        });
+        std::thread::sleep(Duration::from_millis(300));
+
+        // steer BEFORE the turn exists: queued, consumed by the next turn
+        let (status, reply) = http_post(&addr, "/steer", &serde_json::json!({
+            "sessionId": "steer-endpoint",
+            "text": "endpoint steer landed"
+        }));
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(reply["steered"], true, "{reply}");
+
+        let (status, reply) = http_post_command(&addr, &serde_json::json!({
+            "commandId": "steer-endpoint-1",
+            "type": "sendText",
+            "sessionId": "steer-endpoint",
+            "payload": { "text": "summarize notes.md" }
+        }));
+        assert_eq!(status, 200, "{reply}");
+
+        let got = wait_for(&frames, &|frames| {
+            completed_with_steered(frames, "[steered] endpoint steer landed")
+        });
+        assert!(got, "POST /steer text never reached a turn; frames: {frames:?}");
+        let _ = sse_thread.join();
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// G4 breadth — the served page is a real steering surface: subscribes via
+/// EventSource, renders projections, and posts commands/steers. When node
+/// is available the inline script is also syntax-checked (the original demo
+/// page carried a SyntaxError — a newline inside a string literal — that
+/// only a real parse catches).
+#[test]
+fn g4_demo_page_is_a_steering_surface() {
+    let td = tempfile::tempdir().unwrap();
+    let (mut daemon, addr) = spawn_daemon(td.path());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (status, page) = http_get(&addr, "/");
+        assert_eq!(status, 200);
+        for marker in [
+            "EventSource(",
+            "post('/command'",
+            "post('/steer'",
+            "id=\"prompt\"",
+            "id=\"steer\"",
+            "id=\"session\"",
+            "onmessage",
+            "/scenes",
+        ] {
+            assert!(page.contains(marker), "page missing `{marker}`");
+        }
+
+        // syntax-check the inline script with node, when node exists
+        let script = page
+            .split("<script>")
+            .nth(1)
+            .and_then(|s| s.split("</script>").next())
+            .expect("page has an inline script");
+        let js = tempfile::Builder::new().suffix(".js").tempfile().unwrap();
+        std::fs::write(js.path(), script).unwrap();
+        match Command::new("node").arg("--check").arg(js.path()).output() {
+            Ok(out) => {
+                assert!(
+                    out.status.success(),
+                    "demo page script does not parse: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            Err(_) => eprintln!("node not available; skipped script syntax check"),
+        }
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
     }
 }

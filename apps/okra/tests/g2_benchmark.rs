@@ -3,6 +3,12 @@
 //! must pass: flat post-compaction context, byte-identical prefixes,
 //! validated-only summaries, zero emergency passes.
 
+
+// Test harness: these acceptance tests execute the compiled crate binary as
+// the system under test. The no-raw-spawn/canonicalize bans target production
+// paths (production spawning goes through okra_policy's confined runner); the
+// acceptance harness must exercise the real binary end-to-end.
+#![allow(clippy::disallowed_methods)]
 use std::process::Command;
 
 fn run_bench(extra: &[&str]) -> serde_json::Value {

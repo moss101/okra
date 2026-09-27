@@ -52,6 +52,11 @@ pub struct TcpServeState {
     pub surfaces: Mutex<okra_host::surfaces::SurfaceRegistry>,
     /// Cross-session pub/sub: one session publishes, others poll.
     pub bus: Mutex<okra_host::broadcast::BroadcastBus>,
+    /// Sessions with a live turn thread (G4 breadth): a command on a
+    /// running session is STEERING — it queues onto the live turn instead
+    /// of spawning a second parallel turn thread on the same projection
+    /// (two writers raced rows/revision and interleaved control frames).
+    pub running_turns: Mutex<std::collections::BTreeSet<String>>,
     next_static: std::sync::atomic::AtomicU64,
 }
 
@@ -86,6 +91,7 @@ impl TcpServeState {
             writers: Mutex::new(Vec::new()),
             surfaces: Mutex::new(okra_host::surfaces::SurfaceRegistry::new()),
             bus: Mutex::new(okra_host::broadcast::BroadcastBus::new(256)),
+            running_turns: Mutex::new(std::collections::BTreeSet::new()),
             next_static: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -283,7 +289,10 @@ fn handle_client(state: &Arc<TcpServeState>, stream: TcpStream) {
 /// - `GET /sse/<session>`     → 200 text/event-stream; broadcasts flow
 ///   as SSE `data:` frames for that session until the client disconnects
 /// - `POST /command`          → body is the same v4 command envelope as
-///   the NDJSON protocol; responds with the accept/reject JSON
+///   the NDJSON protocol; responds with the accept/reject JSON (a command
+///   on a running session is steering: `result.type == "steeringQueued"`)
+/// - `POST /steer`            → body `{sessionId, text}` queued onto the
+///   session's steering queue (consumed by the live or next turn)
 fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result<()> {
     let read_half = stream.try_clone()?;
     let mut reader = BufReader::new(read_half);
@@ -312,6 +321,31 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();
     let path = parts.next().unwrap_or_default().to_string();
+
+    if method == "POST" && path == "/steer" {
+        // Explicit browser steering: body {sessionId, text} is pushed onto
+        // the session's steering queue, which the live turn drains at every
+        // projection event (steered text becomes a `[steered]` user row).
+        // Queued while idle → consumed by the next turn's first event.
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body)?;
+        let parsed: serde_json::Value = serde_json::from_slice(&body)
+            .unwrap_or(serde_json::Value::Null);
+        let session_id = parsed["sessionId"].as_str().unwrap_or_default().to_string();
+        let text = parsed["text"].as_str().unwrap_or_default().to_string();
+        if session_id.is_empty() || text.is_empty() {
+            write_http(stream, 400, "bad request", br#"{"error":"sessionId and text required"}"#)?;
+            return Ok(());
+        }
+        let queue = state.steering.lock().unwrap()
+            .entry(session_id)
+            .or_insert_with(|| Arc::new(Mutex::new(VecDeque::new())))
+            .clone();
+        queue.lock().unwrap().push_back(text);
+        let reply = serde_json::json!({ "steered": true, "queued_len": queue.lock().unwrap().len() });
+        write_http(stream, 200, "OK", serde_json::to_vec(&reply).unwrap_or_default().as_slice())?;
+        return Ok(());
+    }
 
     if method == "POST" && path == "/command" {
         let mut body = vec![0u8; content_length];
@@ -417,44 +451,200 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
 }
 
 /// The browser demo surface: one static page that subscribes to the SSE
-/// stream, renders every projection frame, and sends commands with fetch.
+/// stream, renders every projection row, and drives turns + steering with
+/// fetch. Kept dependency-free so the daemon serves it from one string.
+/// NOTE: embedded in `r#"…"#` — the body must not contain the `"#` pair.
 fn browser_demo_page() -> String {
     let page = r#"<!doctype html>
-<html><head><meta charset="utf-8"><title>okra surface</title></head>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>okra surface</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { font-family: ui-monospace, Menlo, Consolas, monospace; background: #14161a; color: #d6dae0; margin: 0; padding: 1.1rem; max-width: 46rem; margin-inline: auto; }
+  h1 { font-size: 1.05rem; margin: 0 0 .35rem; }
+  .sub { color: #8a919c; font-size: .78rem; margin-bottom: 1rem; }
+  .dot { display: inline-block; width: .6rem; height: .6rem; border-radius: 50%; background: #b3413c; margin-right: .35rem; vertical-align: 1px; }
+  .dot.on { background: #4fae54; }
+  .panel { border: 1px solid #2a2e35; border-radius: 8px; padding: .75rem .85rem; margin-bottom: .85rem; background: #191c21; }
+  label { font-size: .7rem; color: #8a919c; display: block; margin-bottom: .25rem; text-transform: uppercase; letter-spacing: .05em; }
+  .mt { margin-top: .6rem; }
+  textarea, input[type=text] { width: 100%; background: #101216; color: #e8eaee; border: 1px solid #2a2e35; border-radius: 6px; padding: .45rem; font: inherit; }
+  button { background: #2f6feb; border: 0; color: white; border-radius: 6px; padding: .45rem .9rem; font: inherit; cursor: pointer; margin-top: .45rem; }
+  button.alt { background: #3a3f47; }
+  .chips span { display: inline-block; border: 1px solid #2a2e35; border-radius: 999px; padding: .15rem .6rem; margin: .2rem .25rem 0 0; font-size: .72rem; color: #a9b1ba; }
+  .row { border-left: 3px solid #2a2e35; padding: .35rem .6rem; margin: .4rem 0; border-radius: 4px; background: #101216; white-space: pre-wrap; word-break: break-word; font-size: .8rem; }
+  .row.userInput { border-left-color: #2f6feb; }
+  .row.assistantText { border-left-color: #4fae54; }
+  .row.toolCall { border-left-color: #b58a3c; }
+  .row.turnHeader { border-left-color: #5a616c; color: #9aa2ad; }
+  .badge { font-size: .62rem; text-transform: uppercase; letter-spacing: .05em; color: #8a919c; display: block; margin-bottom: .15rem; }
+  #steerstate { color: #8a919c; font-size: .75rem; margin-left: .5rem; }
+  .foot { color: #5a616c; font-size: .7rem; margin-top: 1.2rem; }
+</style>
+</head>
 <body>
 <h1>okra surface</h1>
-<p>session: demo-session</p>
-<button id="send">send turn</button>
-<pre id="log">frames: 0</pre>
+<div class="sub">
+  <span class="dot" id="conn"></span><span id="connlabel">connecting</span>
+  · <span id="daemon">daemon: ?</span>
+  · frames <span id="frames">0</span>
+  · phase <span id="phase">-</span>
+</div>
+<div class="panel">
+  <label>session</label>
+  <input type="text" id="session" value="">
+  <label class="mt">prompt</label>
+  <textarea id="prompt" rows="2" placeholder="summarize notes.md"></textarea>
+  <button id="send">send turn</button>
+  <span id="sendstate"></span>
+</div>
+<div class="panel">
+  <label>steer (queued onto the live turn; runs as its own turn when idle)</label>
+  <input type="text" id="steer" placeholder="focus on the tools section">
+  <button class="alt" id="steerbtn">steer</button>
+  <span id="steerstate"></span>
+</div>
+<div class="panel">
+  <label>starter scenes · GET /scenes</label>
+  <div class="chips" id="scenes">loading…</div>
+</div>
+<div id="transcript"></div>
+<div class="foot">GET /sse/&lt;session&gt; streams every projection frame; POST /command and POST /steer drive the same v4 seam the NDJSON and Electron surfaces use.</div>
 <script>
-const session = "demo-session";
-let frames = 0;
-const es = new EventSource("/sse/" + session);
-es.onmessage = (e) => {
-  frames += 1;
-  let preview = e.data;
-  try {
-    const msg = JSON.parse(e.data);
-    if (msg.params && msg.params.control) preview = "phase=" + msg.params.control.phase;
-  } catch (_) {}
-  document.getElementById("log").textContent =
-    "frames: " + frames + "
-last: " + preview;
-};
-document.getElementById("send").addEventListener("click", () => {
-  fetch("/command", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      commandId: "browser-" + Date.now(),
-      type: "sendText",
-      sessionId: session,
-      payload: { text: "summarize notes.md" }
-    })
+'use strict';
+var sessionEl = document.getElementById('session');
+sessionEl.value = 'browser-' + Math.random().toString(36).slice(2, 6);
+var frames = 0;
+var es = null;
+
+function esc(s) {
+  return String(s).replace(/[&<>]/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c];
+  });
+}
+function post(path, body, onreply) {
+  fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  })
+    .then(function (r) { return r.json(); })
+    .then(onreply)
+    .catch(function (e) { note('steerstate', 'error: ' + e); });
+}
+function note(id, t) { document.getElementById(id).textContent = t; }
+function resultKind(r) {
+  return r && r.result && r.result.type ? r.result.type : (r && r.status);
+}
+function send() {
+  var text = document.getElementById('prompt').value.trim();
+  if (!text) { return; }
+  post('/command', {
+    commandId: 'browser-' + Date.now(),
+    type: 'sendText',
+    sessionId: sessionEl.value,
+    payload: { text: text }
+  }, function (r) { note('sendstate', '→ ' + resultKind(r)); });
+}
+function steer() {
+  var text = document.getElementById('steer').value.trim();
+  if (!text) { return; }
+  post('/steer', { sessionId: sessionEl.value, text: text }, function (r) {
+    note('steerstate', '→ ' + (r && r.steered ? 'steered' : 'rejected'));
+  });
+}
+document.getElementById('send').addEventListener('click', send);
+document.getElementById('steerbtn').addEventListener('click', steer);
+document.getElementById('prompt').addEventListener('keydown', function (e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+document.getElementById('steer').addEventListener('keydown', function (e) {
+  if (e.key === 'Enter') { e.preventDefault(); steer(); }
+});
+sessionEl.addEventListener('change', function () { connect(); });
+
+fetch('/health').then(function (r) { return r.json(); }).then(function (h) {
+  document.getElementById('daemon').textContent = 'daemon: ' + h.daemon + ' (ok=' + h.ok + ')';
+});
+fetch('/scenes').then(function (r) { return r.json(); }).then(function (c) {
+  var host = document.getElementById('scenes');
+  host.textContent = '';
+  var data = (c && c.data) || [];
+  if (!data.length) { host.textContent = 'none'; return; }
+  data.forEach(function (s) {
+    var opts = [];
+    Object.keys(s.options || {}).forEach(function (k) {
+      (s.options[k].items || []).forEach(function (it) {
+        var names = it.contents || {};
+        opts.push(names.en || Object.keys(names).map(function (t) { return names[t]; })[0] || it.id);
+      });
+    });
+    var el = document.createElement('span');
+    el.textContent = s.namespace + ':' + s.scene + (opts.length ? ' [' + opts.join(' / ') + ']' : '');
+    host.appendChild(el);
   });
 });
+
+function rowHead(r) {
+  if (r.kind === 'toolCall') { return 'tool ' + r.toolName + ' · ' + r.status; }
+  if (r.kind === 'turnHeader') { return 'turn · ' + r.state; }
+  if (r.kind === 'assistantText') { return 'assistant · ' + (r.state || ''); }
+  if (r.kind === 'userInput') { return 'user'; }
+  return r.kind;
+}
+function rowBody(r) {
+  if (r.kind === 'toolCall') {
+    var out = r.output && r.output.text ? String(r.output.text) : '';
+    if (out.length > 400) { out = out.slice(0, 400) + '…'; }
+    return out || (r.error && r.error.message) || '';
+  }
+  return r.text || '';
+}
+function render(params) {
+  var t = document.getElementById('transcript');
+  t.textContent = '';
+  (params.rows || []).forEach(function (r) {
+    var div = document.createElement('div');
+    div.className = 'row ' + r.kind;
+    var b = document.createElement('span');
+    b.className = 'badge';
+    b.textContent = rowHead(r);
+    div.appendChild(b);
+    div.appendChild(document.createTextNode(rowBody(r)));
+    t.appendChild(div);
+  });
+}
+function connect() {
+  if (es) { es.close(); }
+  es = new EventSource('/sse/' + encodeURIComponent(sessionEl.value));
+  es.onopen = function () {
+    document.getElementById('conn').className = 'dot on';
+    document.getElementById('connlabel').textContent = 'connected (sse)';
+  };
+  es.onerror = function () {
+    document.getElementById('conn').className = 'dot';
+    document.getElementById('connlabel').textContent = 'reconnecting';
+  };
+  es.onmessage = function (e) {
+    frames += 1;
+    document.getElementById('frames').textContent = String(frames);
+    var msg;
+    try { msg = JSON.parse(e.data); } catch (_) { return; }
+    if (!msg.params) { return; }
+    if (msg.params.control) {
+      document.getElementById('phase').textContent = msg.params.control.phase || '-';
+    }
+    render(msg.params);
+  };
+}
+connect();
 </script>
-</body></html>
+</body>
+</html>
 "#;
     page.trim_end().to_string()
 }
@@ -488,6 +678,27 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
     let steer_queue = state.steering.lock().unwrap()
         .entry(session_id.clone()).or_insert_with(|| Arc::new(Mutex::new(VecDeque::new()))).clone();
     let input_id = format!("in-{}", state.next_static());
+
+    // G4 breadth: claim the turn gate atomically. If the session already
+    // has a live turn, this command is steering — queue onto the live turn
+    // and report `steeringQueued` (the drain becomes a `[steered]` user row
+    // at the next projection event). This is also the browser's steer path:
+    // a double-clicked "send" or POST /steer can no longer spawn a second
+    // parallel turn thread on the same projection.
+    let gate_acquired = state
+        .running_turns
+        .lock().unwrap()
+        .insert(session_id.clone());
+    if !gate_acquired {
+        steer_queue.lock().unwrap().push_back(text);
+        eprintln!("[serve-tcp] steered: session={session_id} cmd={command_id} type={cmd_type}");
+        return serde_json::json!({
+            "commandId": command_id,
+            "status": "accepted",
+            "revisionAtDecision": 0,
+            "result": { "type": "steeringQueued", "delivery": "queued", "inputId": input_id }
+        });
+    }
     let result = if cmd_type == "createSession" {
         serde_json::json!({"type":"createSession","sessionId":session_id,
             "input":{"delivery":"startNow","inputId":input_id}})
@@ -526,6 +737,11 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
             if queued.is_empty() { break; }
             current_input = queued.join("\n");
         }
+        // release the turn gate LAST: a command landing just before this is
+        // queued and drains at the next turn's first projection event (as a
+        // `[steered]` row), so no text is lost and only one turn thread per
+        // session ever exists.
+        state2.running_turns.lock().unwrap().remove(&turn_session);
     });
     accepted
 }

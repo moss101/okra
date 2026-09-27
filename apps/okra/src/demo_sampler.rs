@@ -12,11 +12,19 @@ use std::sync::Mutex;
 pub struct DemoPlanner {
     turn: Mutex<usize>,
     cwd: std::path::PathBuf,
+    /// Scripted-stub `delayMs` (MASTER-PLAN block #63): per-sample pause so
+    /// harnesses have a window to steer mid-turn. `OKRA_DEMO_DELAY_MS`, 0 by
+    /// default.
+    delay_ms: u64,
 }
 
 impl DemoPlanner {
     pub fn new(cwd: std::path::PathBuf) -> Self {
-        DemoPlanner { turn: Mutex::new(0), cwd }
+        let delay_ms = std::env::var("OKRA_DEMO_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        DemoPlanner { turn: Mutex::new(0), cwd, delay_ms }
     }
 
     fn find_named_file(&self, prompt: &str) -> Option<String> {
@@ -67,6 +75,9 @@ fn last_tool_output(messages: &[Message]) -> String {
 
 impl Sampler for DemoPlanner {
     fn sample(&self, request: &SampleRequest) -> Result<SampleResponse, SamplerError> {
+        if self.delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
+        }
         let mut turn = self.turn.lock().unwrap();
         *turn += 1;
         let n = *turn;

@@ -5,6 +5,12 @@
 //! same session state, and the TUI renders the same rows as a third
 //! surface.
 
+
+// Test harness: these acceptance tests execute the compiled crate binary as
+// the system under test. The no-raw-spawn/canonicalize bans target production
+// paths (production spawning goes through okra_policy's confined runner); the
+// acceptance harness must exercise the real binary end-to-end.
+#![allow(clippy::disallowed_methods)]
 use std::io::{BufRead, BufReader};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
@@ -99,7 +105,7 @@ fn read_line_timeout(reader: &mut BufReader<TcpStream>) -> Option<String> {
     }
 }
 
-fn projections<'a>(inbox: &'a [serde_json::Value]) -> Vec<&'a serde_json::Value> {
+fn projections(inbox: &[serde_json::Value]) -> Vec<&serde_json::Value> {
     inbox
         .iter()
         .filter(|m| m["method"] == "v4/projection")

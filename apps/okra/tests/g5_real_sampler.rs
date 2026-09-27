@@ -4,6 +4,12 @@
 //! Authorization header flowed, serves a scripted tool-call turn then an
 //! end turn, and the orchestrator harvests token usage into the verdict.
 
+
+// Test harness: these acceptance tests execute the compiled crate binary as
+// the system under test. The no-raw-spawn/canonicalize bans target production
+// paths (production spawning goes through okra_policy's confined runner); the
+// acceptance harness must exercise the real binary end-to-end.
+#![allow(clippy::disallowed_methods)]
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::process::Command;
@@ -205,7 +211,7 @@ fn g5_real_sampler_drives_confined_child() {
             "-C",
             &repo_path.to_string_lossy(),
             "show",
-            &format!("real-sampler:deliverable.md"),
+            "real-sampler:deliverable.md",
         ])
         .output()
         .unwrap();

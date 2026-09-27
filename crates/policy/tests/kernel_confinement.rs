@@ -5,6 +5,12 @@
 //! Runs as a child process because `Sandbox::apply` is irreversible —
 //! applying it in-process would confine the whole test runner.
 
+
+// Test harness: these acceptance tests execute the compiled crate binary as
+// the system under test. The no-raw-spawn/canonicalize bans target production
+// paths (production spawning goes through okra_policy's confined runner); the
+// acceptance harness must exercise the real binary end-to-end.
+#![allow(clippy::disallowed_methods)]
 use std::io::Read;
 use std::process::Command;
 

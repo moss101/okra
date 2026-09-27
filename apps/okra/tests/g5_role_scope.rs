@@ -4,6 +4,12 @@
 //! kernel — defense in depth on top of the nono confinement (which stays
 //! the hard backstop). An unset variable means no tool-plane restriction.
 
+
+// Test harness: these acceptance tests execute the compiled crate binary as
+// the system under test. The no-raw-spawn/canonicalize bans target production
+// paths (production spawning goes through okra_policy's confined runner); the
+// acceptance harness must exercise the real binary end-to-end.
+#![allow(clippy::disallowed_methods)]
 use std::process::Command;
 
 fn spec(path: &str) -> String {

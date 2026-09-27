@@ -206,7 +206,7 @@ fn rejects_unsafe_or_unsettled_conversations() {
 
     // empty selection
     err(
-        build_public_projection(&[base.clone()], &[]).unwrap_err(),
+        build_public_projection(std::slice::from_ref(&base), &[]).unwrap_err(),
         ProjectionErrorKind::InvalidConversation,
     );
 

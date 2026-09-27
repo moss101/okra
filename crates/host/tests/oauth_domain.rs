@@ -38,8 +38,8 @@ impl MockIssuer {
                     };
                     raw.extend_from_slice(&buf[..n]);
                     let text = String::from_utf8_lossy(&raw).into_owned();
-                    if header_end.is_none() {
-                        if let Some(i) = text.find("\r\n\r\n") {
+                    if header_end.is_none()
+                        && let Some(i) = text.find("\r\n\r\n") {
                             header_end = Some(i + 4);
                             for line in text[..i].lines() {
                                 let lower = line.to_lowercase();
@@ -48,12 +48,10 @@ impl MockIssuer {
                                 }
                             }
                         }
-                    }
-                    if let Some(he) = header_end {
-                        if raw.len() >= he + content_len {
+                    if let Some(he) = header_end
+                        && raw.len() >= he + content_len {
                             break;
                         }
-                    }
                 }
                 let text = String::from_utf8_lossy(&raw).into_owned();
                 let body_start = text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(text.len());

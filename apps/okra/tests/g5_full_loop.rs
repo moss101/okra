@@ -6,6 +6,12 @@
 //! work as a branch commit for review — and the parent checkout stays
 //! untouched throughout.
 
+
+// Test harness: these acceptance tests execute the compiled crate binary as
+// the system under test. The no-raw-spawn/canonicalize bans target production
+// paths (production spawning goes through okra_policy's confined runner); the
+// acceptance harness must exercise the real binary end-to-end.
+#![allow(clippy::disallowed_methods)]
 use std::process::Command;
 
 const TASK_JSON: &str = r##"{
@@ -101,7 +107,7 @@ fn g5_launcher_confined_child_and_collect_work() {
             "-C",
             &repo_path.to_string_lossy(),
             "show",
-            &format!("g5-loop:deliverable.md"),
+            "g5-loop:deliverable.md",
         ])
         .output()
         .unwrap();
