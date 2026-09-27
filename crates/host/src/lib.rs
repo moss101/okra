@@ -12,6 +12,7 @@ pub mod checkpoints;
 pub mod client_info;
 pub mod client_scenes;
 pub mod coding_plan;
+pub mod commands;
 pub mod conversation_share;
 pub mod credential;
 pub mod files;
@@ -126,3 +127,4 @@ pub use settings_sync::{
     SkipReason, SourceScope, SyncAgent, SyncCandidate, SyncImportStatus,
 };
 pub use terminal::{TerminalHost, TerminalSession, TerminalSize};
+pub use commands::{Command, CommandScope, CommandSource, CommandsError, CommandsList, CommandsService, ParsedCommandFile, WriteCommandParams};
