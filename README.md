@@ -42,10 +42,14 @@ M3  host services + alpha       ◐ strangler: SQLite session/task index
                                   (`okra sessions`), terminal/PTY domain
                                   (real PTY, TTY-verified), git domain
                                   (status/commit/REAL worktrees — the G5
-                                  grant surface), user/slash commands
-                                  domain (ZCode services/commands: parser,
-                                  discovery order, enable overrides,
-                                  plugin command roots); G2 live PASSED vs a real
+                                  grant surface), user/slash commands domain
+                                  (parser, discovery order, enable
+                                  overrides, plugin command roots),
+                                  BigModel entitlement + team-plan API keys
+                                  (three-valued entitlement, envelope
+                                  contract, ensure flow), Claude/Gemini
+                                  plugin converters (#46 CLOSED — data-only,
+                                  fail-closed path handling); G2 live PASSED vs a real
                                   network model (glm-5.3-flash) INCLUDING
                                   the FULL 100-turn / 1,352-read live
                                   profile: flat context (peak 19.9k ≤ 20k),
@@ -62,8 +66,18 @@ M4  surfaces                  ◐ NDJSON two-surface + cross-surface steering,
                                   second parallel turn thread), while an
                                   NDJSON surface attached to the same daemon
                                   receives the identical projection frames.
-                                  Still open: ACP/Zed attach, leader/roster.
+                                  **ACP gateway live** (`okra serve --acp`:
+                                  initialize/version negotiation, session/new,
+                                  session/prompt with streamed session/update,
+                                  honest stop reasons — scripted-editor e2e
+                                  green; a real Zed drive awaits a Zed install)
+                                  + **leader/roster** (one leader per daemon,
+                                  term-bumped claims, `roster/claim`).
 M5  differentiators ◐ (subagent kernel isolation)
+M6  scale                      ◐ i18n slice: daemon-side en-US/zh-CN catalog
+                                  domain (locale negotiation, fallback chain,
+                                  interpolation; the UI catalog stays in the
+                                  reused TS UI)
 ```
 
 ## G0 demo (2026-09-26)
