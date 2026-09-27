@@ -72,6 +72,10 @@ struct AcpState {
 
 struct AcpSession {
     kernel_id: String,
+    /// The workspace this session operates on: session/new's `cwd` when the
+    /// client provides a real directory (ACP: all paths absolute), else the
+    /// daemon cwd.
+    session_cwd: std::path::PathBuf,
 }
 
 /// `okra serve --acp`: JSON-RPC/ACP loop over stdin/stdout.
@@ -130,11 +134,17 @@ pub fn serve_acp(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) -> !
             "session/new" => {
                 let session_id = format!("acp-{}", uuid_v4());
                 let kernel_id = format!("session-{session_id}");
+                // the client's workspace wins when it is a real directory —
+                // the editor's project, not the daemon's launch dir
+                let session_cwd = match params["cwd"].as_str() {
+                    Some(c) if std::path::Path::new(c).is_dir() => std::path::PathBuf::from(c),
+                    _ => cwd.clone(),
+                };
                 let header = kernel::SessionHeader {
                     version: kernel::SESSION_FORMAT_VERSION,
                     id: kernel_id.clone(),
                     created_at: now_ms(),
-                    cwd: cwd.to_string_lossy().into_owned(),
+                    cwd: session_cwd.to_string_lossy().into_owned(),
                     parent_session: None,
                     is_seeded: false,
                 };
@@ -144,14 +154,15 @@ pub fn serve_acp(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) -> !
                 }
                 state.sessions.lock().unwrap().insert(
                     session_id.clone(),
-                    AcpSession { kernel_id },
+                    AcpSession { kernel_id, session_cwd },
                 );
                 outbound.result(&id, serde_json::json!({ "sessionId": session_id }));
             }
             "session/prompt" => {
                 let session_id = params["sessionId"].as_str().unwrap_or_default().to_string();
-                let kernel_id = state.sessions.lock().unwrap().get(&session_id).map(|s| s.kernel_id.clone());
-                let Some(kernel_id) = kernel_id else {
+                let session = state.sessions.lock().unwrap().get(&session_id)
+                    .map(|s| (s.kernel_id.clone(), s.session_cwd.clone()));
+                let Some((kernel_id, session_cwd)) = session else {
                     outbound.error(&id, -32002, &format!("unknown session: {session_id}"));
                     continue;
                 };
@@ -181,7 +192,7 @@ pub fn serve_acp(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) -> !
                         serde_json::json!({ "sessionId": sid, "update": update }),
                     );
                 };
-                match acp_turn(&cwd, &sessions_dir, &kernel_id, &text, &mut notify) {
+                match acp_turn(&session_cwd, &sessions_dir, &kernel_id, &text, &mut notify) {
                     Ok(stop_reason) => {
                         outbound.result(&id, serde_json::json!({ "stopReason": stop_reason }))
                     }

@@ -83,7 +83,11 @@ fn kill(mut child: Child) {
 #[test]
 fn g4_acp_editor_seam_end_to_end() {
     let td = tempfile::tempdir().unwrap();
-    std::fs::write(td.path().join("notes.md"), "# acp notes\nthe editor seam works\n").unwrap();
+    // the EDITOR's workspace differs from the daemon's launch cwd: the turn
+    // must read from the workspace passed in session/new (ACP `cwd`)
+    let workspace = td.path().join("zed-project");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("notes.md"), "# acp notes\nthe editor seam works\n").unwrap();
     let mut agent = spawn_agent(td.path());
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut client = AcpClient {
@@ -110,7 +114,7 @@ fn g4_acp_editor_seam_end_to_end() {
         assert_eq!(future["result"]["protocolVersion"], 1, "{future}");
 
         // 2. session/new
-        let new = client.request("session/new", serde_json::json!({ "cwd": td.path() }));
+        let new = client.request("session/new", serde_json::json!({ "cwd": workspace }));
         assert!(new["error"].is_null(), "{new}");
         let session_id = new["result"]["sessionId"].as_str().expect("sessionId").to_string();
         assert!(session_id.starts_with("acp-"));
