@@ -49,7 +49,18 @@ M3  host services + alpha       ◐ strangler: SQLite session/task index
                                   4 installs / 0 emergencies, byte-stable
                                   prefixes, 2,690 hooks / 0 failures
 
-M4 surfaces ☐      M5 differentiators ◐ (subagent kernel isolation)
+M4  surfaces                  ◐ NDJSON two-surface + cross-surface steering,
+                                  TUI render; **G4 breadth closed (2026-09-27):
+                                  hands-on browser drive** — the served page
+                                  (GET /) sends a turn and steers it MID-TURN
+                                  from a real browser engine over SSE
+                                  (steeringQueued semantics + POST /steer; a
+                                  concurrent sendText can no longer spawn a
+                                  second parallel turn thread), while an
+                                  NDJSON surface attached to the same daemon
+                                  receives the identical projection frames.
+                                  Still open: ACP/Zed attach, leader/roster.
+M5  differentiators ◐ (subagent kernel isolation)
 ```
 
 ## G0 demo (2026-09-26)

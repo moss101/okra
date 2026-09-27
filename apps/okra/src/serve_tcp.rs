@@ -338,11 +338,13 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
             return Ok(());
         }
         let queue = state.steering.lock().unwrap()
-            .entry(session_id)
+            .entry(session_id.clone())
             .or_insert_with(|| Arc::new(Mutex::new(VecDeque::new())))
             .clone();
         queue.lock().unwrap().push_back(text);
-        let reply = serde_json::json!({ "steered": true, "queued_len": queue.lock().unwrap().len() });
+        let queued_len = queue.lock().unwrap().len();
+        let reply = serde_json::json!({ "steered": true, "queued_len": queued_len });
+        eprintln!("[serve-tcp] steered via /steer: session={session_id} queued_len={queued_len}");
         write_http(stream, 200, "OK", serde_json::to_vec(&reply).unwrap_or_default().as_slice())?;
         return Ok(());
     }
