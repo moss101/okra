@@ -25,7 +25,6 @@ fn spawn_agent(cwd: &Path) -> Child {
 struct AcpClient {
     stdin: std::process::ChildStdin,
     reader: BufReader<std::process::ChildStdout>,
-    stderr: Mutex<std::process::ChildStderr>,
     next_id: i64,
 }
 
@@ -90,7 +89,6 @@ fn g4_acp_editor_seam_end_to_end() {
         let mut client = AcpClient {
             stdin: agent.stdin.take().unwrap(),
             reader: BufReader::new(agent.stdout.take().unwrap()),
-            stderr: Mutex::new(agent.stderr.take().unwrap()),
             next_id: 1,
         };
 
@@ -157,7 +155,7 @@ fn g4_acp_editor_seam_end_to_end() {
         }).collect();
         assert_eq!(finished.len(), 1);
         assert_eq!(finished[0]["update"]["status"], "completed");
-        assert!(finished[0]["update"]["content"].as_array().unwrap().len() >= 1);
+        assert!(!finished[0]["update"]["content"].as_array().unwrap().is_empty());
         let tool_text = finished[0]["update"]["content"][0]["content"]["text"]
             .as_str()
             .unwrap_or_default();

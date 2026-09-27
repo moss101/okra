@@ -195,14 +195,14 @@ pub fn serve_acp(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) -> !
 }
 
 fn handle_notification(state: &AcpState, method: &str, params: &serde_json::Value) {
-    if method == "session/cancel" {
-        if let Some(session_id) = params["sessionId"].as_str() {
-            // accepted and recorded; the running turn completes and returns
-            // its real stop reason (no mid-turn abort seam yet — the module
-            // doc records this v1 limitation)
-            state.cancel_seen.lock().unwrap().insert(session_id.to_string());
-            eprintln!("[serve-acp] session/cancel recorded: {session_id}");
-        }
+    if method == "session/cancel"
+        && let Some(session_id) = params["sessionId"].as_str()
+    {
+        // accepted and recorded; the running turn completes and returns
+        // its real stop reason (no mid-turn abort seam yet — the module
+        // doc records this v1 limitation)
+        state.cancel_seen.lock().unwrap().insert(session_id.to_string());
+        eprintln!("[serve-acp] session/cancel recorded: {session_id}");
     }
 }
 

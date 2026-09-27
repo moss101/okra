@@ -11,6 +11,8 @@
 //! The end-to-end flow is `install_signed`: verify envelope → verify
 //! digest → content-addressed install.
 
+pub mod converters;
+pub use converters::{convert_claude_plugin, convert_gemini_extension, convert_toml_command, ConversionOutcome};
 pub mod manifest;
 pub mod signing;
 pub mod store;

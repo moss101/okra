@@ -214,7 +214,7 @@ fn handle_client(state: &Arc<TcpServeState>, stream: TcpStream) {
             ),
             "ping" => respond(id_field, serde_json::json!({"pong":true})),
             "surfaces/list" => {
-                let mut surfaces = state.surfaces.lock().unwrap();
+                let surfaces = state.surfaces.lock().unwrap();
                 let list: Vec<serde_json::Value> = surfaces
                     .list()
                     .iter()

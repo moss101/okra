@@ -20,7 +20,7 @@
 
 use std::path::Path;
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 use super::manifest::{
     check_plugin_path, parse_manifest, PluginAuthor, PluginDiagnostic, PluginManifest,
@@ -42,7 +42,7 @@ pub struct ConversionOutcome {
 impl ConversionOutcome {
     fn warn(&mut self, message: impl Into<String>) {
         self.diagnostics.push(PluginDiagnostic {
-            severity: super::manifest::DiagnosticSeverity::Warning,
+            severity: super::manifest::DiagnosticSeverity::Warn,
             message: message.into(),
         });
     }
@@ -89,6 +89,10 @@ fn confined_path_list(value: &Value, field: &str, out: &mut ConversionOutcome) -
     };
     let mut kept = Vec::new();
     for item in items {
+        if Path::new(item).is_absolute() {
+            out.error(format!("{field}: `{item}` dropped (absolute path)"));
+            continue;
+        }
         let prefixed = if item.starts_with("./") {
             item.to_string()
         } else {
@@ -329,7 +333,23 @@ mod tests {
     #[test]
     fn path_lists_confine_escapes() {
         let mut out = ConversionOutcome {
-            manifest: PluginManifest::default(),
+            manifest: PluginManifest {
+                name: "t".into(),
+                version: None,
+                description: None,
+                keywords: vec![],
+                homepage: None,
+                license: None,
+                author: None,
+                skills: vec![],
+                agents: vec![],
+                session_start: None,
+                mcp_servers: None,
+                hooks: None,
+                commands: vec![],
+                skill_instructions: None,
+                system_prompt: None,
+            },
             generated_files: vec![],
             diagnostics: vec![],
         };

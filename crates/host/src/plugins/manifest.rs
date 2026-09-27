@@ -292,7 +292,9 @@ pub fn check_plugin_path(entry: &str) -> Result<(), &'static str> {
     let mut depth: usize = 1;
     for comp in entry.trim_start_matches("./").split('/') {
         match comp {
-            "" | "." => {}
+            // an empty segment would let ".//x" re-anchor at "/" on join
+            "" => return Err("empty path segment"),
+            "." => {}
             ".." => {
                 if depth == 1 {
                     return Err("path resolves outside the plugin");

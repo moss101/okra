@@ -234,15 +234,13 @@ impl SurfaceRegistry {
         }
         if let Some((id, term, renewed)) = self.leader_live() {
             let _ = renewed;
-            let leader_id = id;
-            let term = term;
-            if leader_id == surface_id {
+            if id == surface_id {
                 // re-claiming the crown you already hold renews it
-                self.leader = Some((leader_id, term, self.now));
+                self.leader = Some((id, term, self.now));
                 return Ok(LeaderDecision::BecameLeader { term });
             }
             return Ok(LeaderDecision::Follower {
-                leader_surface: leader_id,
+                leader_surface: id,
                 term,
             });
         }
