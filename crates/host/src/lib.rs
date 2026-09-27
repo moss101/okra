@@ -21,6 +21,7 @@ pub mod official_mcp;
 pub mod feedback;
 pub mod feedback_logs;
 pub mod fsutil;
+pub mod i18n;
 pub mod git;
 pub mod mcp_sync;
 pub mod media;
@@ -130,3 +131,4 @@ pub use settings_sync::{
 pub use terminal::{TerminalHost, TerminalSession, TerminalSize};
 pub use commands::{Command, CommandScope, CommandSource, CommandsError, CommandsList, CommandsService, ParsedCommandFile, WriteCommandParams};
 pub use bigmodel::{ApiKeyEnsureResult, ApiKeyEnsureStatus, BizClient, BizEnvelopeDiagnostics, CodingPlanEntitlement, TeamPlanBizContext, UnavailableReason, UreqBizClient, classify_personal_entitlement, classify_team_entitlement, ensure_team_plan_project_api_key, is_active_personal_coding_plan};
+pub use i18n::{negotiate_locale, parse_catalog_document, Catalog, LocaleTag};
