@@ -197,7 +197,12 @@ fn handle_client(state: &Arc<TcpServeState>, stream: TcpStream) {
     let reader = std::io::BufReader::new(read_half);
     for line in reader.lines().map_while(Result::ok) {
         if line.trim().is_empty() { continue; }
-        state.surfaces.lock().unwrap().heartbeat(&surface_id);
+        {
+            let mut surfaces = state.surfaces.lock().unwrap();
+            surfaces.heartbeat(&surface_id);
+            // leadership renewal rides the same heartbeat cadence
+            surfaces.renew_leader(&surface_id);
+        }
         let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else { continue; };
         let id_field = msg["id"].as_u64().unwrap_or(0);
         let method = msg["method"].as_str().unwrap_or_default().to_string();
@@ -209,15 +214,29 @@ fn handle_client(state: &Arc<TcpServeState>, stream: TcpStream) {
             ),
             "ping" => respond(id_field, serde_json::json!({"pong":true})),
             "surfaces/list" => {
-                let list: Vec<serde_json::Value> = state
-                    .surfaces
-                    .lock()
-                    .unwrap()
+                let mut surfaces = state.surfaces.lock().unwrap();
+                let list: Vec<serde_json::Value> = surfaces
                     .list()
                     .iter()
                     .map(|s| serde_json::to_value(s).unwrap_or_default())
                     .collect();
-                respond(id_field, serde_json::json!({ "surfaces": list }));
+                let leader = surfaces.leader().map(|(id, term)| {
+                    serde_json::json!({ "surfaceId": id, "term": term })
+                });
+                respond(
+                    id_field,
+                    serde_json::json!({ "surfaces": list, "leader": leader }),
+                );
+            }
+            "roster/claim" => {
+                // G4 leader/roster: exactly one leading surface per daemon;
+                // followers attach alongside (same projections, no parallel
+                // leadership). Leadership releases on detach/expiry.
+                let decision = state.surfaces.lock().unwrap().claim_leader(&surface_id);
+                match decision {
+                    Ok(d) => respond(id_field, serde_json::to_value(d).unwrap_or_default()),
+                    Err(e) => respond(id_field, serde_json::json!({ "error": e.to_string() })),
+                }
             }
             "v4/conversation/subscribe" => {
                 let session_id = params["sessionId"].as_str().unwrap_or_default().to_string();

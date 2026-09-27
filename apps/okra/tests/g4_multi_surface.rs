@@ -306,3 +306,46 @@ fn run_gate(addr: &str) {
     assert!(joined.contains("> [steered] also check the todo file"), "{joined}");
     assert!(joined.contains("✓ read_file"), "tool activity rendered: {joined}");
 }
+
+/// G4 leader/roster: exactly ONE leading surface per daemon. The first
+/// claim leads; a second surface follows the live leader (same term); the
+/// leader's disconnect releases leadership and the next claim elects a
+/// new leader with a bumped term. (MASTER-PLAN §3 #57 leader/roster)
+#[test]
+fn g4_leader_roster_one_leader_per_daemon() {
+    let td = tempfile::tempdir().unwrap();
+    let (mut daemon, addr) = spawn_daemon(td.path());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut leader = Surface::attach(&addr);
+        let mut follower = Surface::attach(&addr);
+
+        // first claim leads
+        leader.send(2, r#"{"method":"roster/claim"}"#);
+        let d1 = leader.read_reply(2);
+        assert_eq!(d1["result"]["becameLeader"]["term"], 1, "{d1}");
+
+        // a second surface follows the live leader
+        follower.send(2, r#"{"method":"roster/claim"}"#);
+        let d2 = follower.read_reply(2);
+        assert_eq!(d2["result"]["follower"]["leaderSurface"], "surf-1", "{d2}");
+        assert_eq!(d2["result"]["follower"]["term"], 1);
+
+        // both see the leader in surfaces/list
+        follower.send(3, r#"{"method":"surfaces/list"}"#);
+        let list = follower.read_reply(3);
+        assert_eq!(list["result"]["leader"]["surfaceId"], "surf-1");
+        assert_eq!(list["result"]["leader"]["term"], 1);
+
+        // the leader disconnecting releases leadership
+        drop(leader);
+        std::thread::sleep(Duration::from_millis(300));
+        follower.send(4, r#"{"method":"roster/claim"}"#);
+        let d3 = follower.read_reply(4);
+        assert_eq!(d3["result"]["becameLeader"]["term"], 2, "{d3}");
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}

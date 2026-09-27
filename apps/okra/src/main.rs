@@ -9,6 +9,7 @@
 //! through the full policy + kernel pipeline); real model providers wire in
 //! behind the same Sampler seam at M1.
 
+mod acp;
 mod bench;
 mod demo_sampler;
 mod quality;
@@ -400,8 +401,38 @@ fn main() {
         serve_tcp::serve_tcp(state, listener);
     }
 
-    // `okra serve --stdio --cwd DIR [--sessions DIR]`: G0 daemon mode
+    // `okra serve --acp --cwd DIR [--sessions DIR]`: ACP agent over stdio
+    // (G4 remainder: the editor seam — Zed et al. drive the same daemon)
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("serve")
+        && argv.iter().any(|a| a == "--acp")
+    {
+        let mut acp_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut acp_sessions = None;
+        let mut i = 1;
+        while i < argv.len() {
+            match argv[i].as_str() {
+                "--acp" => {}
+                "--cwd" => {
+                    i += 1;
+                    acp_cwd = PathBuf::from(argv.get(i).cloned().unwrap_or_default());
+                }
+                "--sessions" => {
+                    i += 1;
+                    acp_sessions = Some(PathBuf::from(argv.get(i).cloned().unwrap_or_default()));
+                }
+                other => {
+                    eprintln!("error: unknown serve flag {other}");
+                    std::process::exit(2);
+                }
+            }
+            i += 1;
+        }
+        let acp_sessions = acp_sessions.unwrap_or_else(|| acp_cwd.join(".okra-sessions"));
+        acp::serve_acp(acp_cwd, acp_sessions);
+    }
+
+    // `okra serve --stdio --cwd DIR [--sessions DIR]`: G0 daemon mode
     if argv.first().map(String::as_str) == Some("serve") {
         let mut cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let mut sessions_dir = None;
