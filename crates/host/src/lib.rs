@@ -7,6 +7,7 @@
 //!   ownership checks (§3 #52, ChatGPT2 docs/03)
 //! - fsutil: the single sanctioned canonicalize/home_dir call sites
 
+pub mod bigmodel;
 pub mod broadcast;
 pub mod checkpoints;
 pub mod client_info;
@@ -128,3 +129,4 @@ pub use settings_sync::{
 };
 pub use terminal::{TerminalHost, TerminalSession, TerminalSize};
 pub use commands::{Command, CommandScope, CommandSource, CommandsError, CommandsList, CommandsService, ParsedCommandFile, WriteCommandParams};
+pub use bigmodel::{ApiKeyEnsureResult, ApiKeyEnsureStatus, BizClient, BizEnvelopeDiagnostics, CodingPlanEntitlement, TeamPlanBizContext, UnavailableReason, UreqBizClient, classify_personal_entitlement, classify_team_entitlement, ensure_team_plan_project_api_key, is_active_personal_coding_plan};
