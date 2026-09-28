@@ -342,6 +342,21 @@ impl ManagedPin {
     }
 }
 
+/// Load a provisioned trust file: a JSON array of hex Ed25519 public keys
+/// whose signed pins are approved. `None` = no trust file provisioned
+/// (any valid-signature signer enforces, tamper-evident via provenance).
+pub fn load_trusted_signers(path: &Path) -> Option<Vec<String>> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let parsed: Value = serde_json::from_str(&raw).ok()?;
+    let list = parsed.as_array()?;
+    Some(
+        list.iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
 /// Approval resolution under the pin: an `approvalMustAsk` pin clamps
 /// `never` → `ask`, and reports the override.
 pub fn resolve_approval(pin: &ManagedPin, user_allows_never: bool) -> (bool, bool) {
@@ -513,4 +528,23 @@ mod tests {
             PinState::FailClosed { .. }
         ));
     }
+}
+
+#[test]
+fn dump_signed_fixture_for_manual_cli_debug() {
+    use ed25519_dalek::{Signer, SigningKey};
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let policy_json = r#"{ "source": "org-it", "sandboxCeiling": "read-only" }"#;
+    use sha2::Digest as _;
+    let mut h = Sha256::new();
+    h.update(policy_json.as_bytes());
+    let sig = key.sign(&h.finalize());
+    let signer_hex: String = key.verifying_key().to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    let sig_hex: String = sig.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    let doc = serde_json::json!({ "payload": policy_json, "signer": signer_hex, "signature": sig_hex });
+    let dir = std::path::Path::new("/tmp/pin-debug");
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("managed-policy.json"), serde_json::to_string(&doc).unwrap()).unwrap();
+    std::fs::write(dir.join("signer.hex"), &signer_hex).unwrap();
+    println!("fixture at /tmp/pin-debug signer={signer_hex}");
 }

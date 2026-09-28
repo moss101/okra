@@ -57,3 +57,70 @@ fn pin_status_reports_all_three_states_honestly() {
     assert!(stdout.contains("\"state\":\"fail_closed\""), "{stdout}");
     assert!(stdout.contains("pin is not valid JSON"), "{stdout}");
 }
+
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn pin_status_reports_signer_trust_from_the_provisioned_file() {
+    use ed25519_dalek::{Signer, SigningKey};
+
+    let bin = env!("CARGO_BIN_EXE_okra");
+    let td = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let signer_hex: String = key
+        .verifying_key()
+        .to_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let policy_json = r#"{ "source": "org-it", "sandboxCeiling": "read-only" }"#;
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(policy_json.as_bytes());
+    let sig_hex: String = key
+        .sign(&h.finalize())
+        .to_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let pin_path = td.path().join("managed-policy.json");
+    std::fs::write(
+        &pin_path,
+        serde_json::json!({
+            "payload": policy_json,
+            "signer": signer_hex,
+            "signature": sig_hex,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let run_with = |trust_file: Option<&std::path::Path>| {
+        let mut cmd = Command::new(bin);
+        cmd.arg("pin-status").arg("--pin").arg(&pin_path);
+        if let Some(tf) = trust_file {
+            cmd.arg("--trust-file").arg(tf);
+        }
+        eprintln!("TEST CMD ARGS: {:?}", cmd);
+        let out = cmd.output().expect("run pin-status");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // no trust file: signature verified against the embedded key, but the
+    // trust state is UNKNOWN (null) — never silently "trusted"
+    let stdout = run_with(None);
+    assert!(stdout.contains("\"signerTrusted\":null"), "{stdout}");
+    assert!(stdout.contains("\"signatureVerified\":true"), "{stdout}");
+
+    // provisioned trust file containing the signer → trusted
+    let trust = td.path().join("trust.json");
+    std::fs::write(&trust, serde_json::json!([signer_hex]).to_string()).unwrap();
+    let stdout = run_with(Some(&trust));
+    assert!(stdout.contains("\"signerTrusted\":true"), "{stdout}");
+
+    // trust file without the signer → the pin FAILS CLOSED: a valid
+    // signature from an unapproved key is a lockdown, not a soft "no"
+    std::fs::write(&trust, serde_json::json!(["deadbeef"]).to_string()).unwrap();
+    let stdout = run_with(Some(&trust));
+    assert!(stdout.contains("\"state\":\"fail_closed\""), "{stdout}");
+    assert!(stdout.contains("pin signer not trusted"), "{stdout}");
+}

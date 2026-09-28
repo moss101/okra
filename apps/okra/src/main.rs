@@ -331,12 +331,17 @@ fn main() {
     // pin — which bytes are in force, from where, under which state.
     if argv.first().map(String::as_str) == Some("pin-status") {
         let mut pin_path: Option<PathBuf> = None;
+        let mut trust_file: Option<PathBuf> = None;
         let mut i = 1;
         while i < argv.len() {
             match argv[i].as_str() {
                 "--pin" => {
                     i += 1;
                     pin_path = Some(PathBuf::from(argv.get(i).cloned().unwrap_or_default()));
+                }
+                "--trust-file" => {
+                    i += 1;
+                    trust_file = Some(PathBuf::from(argv.get(i).cloned().unwrap_or_default()));
                 }
                 other => {
                     eprintln!("error: unknown pin-status flag {other}");
@@ -345,12 +350,19 @@ fn main() {
             }
             i += 1;
         }
+        let trusted_signers = trust_file
+            .as_deref()
+            .and_then(okra_host::load_trusted_signers);
         let default_path = okra_host::fsutil::home_dir()
             .unwrap_or_else(|| PathBuf::from("/"))
             .join(".okra")
             .join("managed-policy.json");
         let path = pin_path.unwrap_or(default_path);
-        let pin = okra_host::load_managed_pin(&path);
+        let _ = std::fs::write(
+            std::path::Path::new("/tmp/pin-debug/last-run.txt"),
+            format!("{trust_file:?} {trusted_signers:?} argv={argv:?}"),
+        );
+        let pin = okra_host::load_managed_pin_verified(&path, trusted_signers.as_deref());
         let prov = pin.provenance.clone();
         println!(
             "{}",
@@ -361,6 +373,25 @@ fn main() {
                 "source": prov.as_ref().map(|p| p.source.clone()),
                 "sandboxCeiling": pin.sandbox_ceiling().map(|c| serde_json::to_value(c).unwrap_or_default()),
                 "approvalMustAsk": if pin.approval_must_ask() { Some(true) } else { None },
+                "signatureVerified": prov.as_ref().and_then(|p| p.signature_verified),
+                // trust is three-valued: Some(only when a trust list is
+                // provisioned AND the verified signer is on it); no trust
+                // file = UNKNOWN, never silently "trusted"
+                "signerTrusted": pin
+                    .provenance
+                    .as_ref()
+                    .and_then(|prov| {
+                        prov.signature_verified
+                            .map(|verified| (verified, prov.signer.clone()))
+                    })
+                    .and_then(|(verified, signer)| {
+                        trusted_signers.as_ref().map(|list| {
+                            verified
+                                && signer.as_deref().map_or(false, |s| {
+                                    list.iter().any(|t| t.eq_ignore_ascii_case(s))
+                                })
+                        })
+                    }),
                 "diagnostics": pin.diagnostics,
             })
         );
