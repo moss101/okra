@@ -28,8 +28,10 @@ stream_line=
 if [ -n "$stream" ]; then
     mkdir -p streams
     if [ -f "$stream" ]; then
-        cp "$stream" streams/$label.ndjson
-        stream_n=$(wc -l < streams/$label.ndjson)
+        cp "$stream" "streams/$label.ndjson"
+        # BSD wc pads its count with spaces; strip them or the journal
+        # line reads "(     2 lines)" (day-1 dogfood finding #3)
+        stream_n=$(wc -l < "streams/$label.ndjson" | tr -d '[:space:]')
         stream_line="streams/$label.ndjson ($stream_n lines)"
     else
         stream_line="missing ($stream)"
