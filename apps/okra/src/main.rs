@@ -387,7 +387,7 @@ fn main() {
                     .and_then(|(verified, signer)| {
                         trusted_signers.as_ref().map(|list| {
                             verified
-                                && signer.as_deref().map_or(false, |s| {
+                                && signer.as_deref().is_some_and(|s| {
                                     list.iter().any(|t| t.eq_ignore_ascii_case(s))
                                 })
                         })
