@@ -551,6 +551,57 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
     }
 
 
+    // staging + commit (N0014): read-write git operations
+    if method == "POST" && (path == "/api/git/stage" || path == "/api/git/unstage") {
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body)?;
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        let paths: Vec<String> = parsed["paths"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        return match serve::git_stage(&state.cwd, &paths, path == "/api/git/unstage") {
+            Ok(body) => write_http(
+                stream,
+                200,
+                "OK",
+                serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+            ),
+            Err((code, msg)) => write_http(
+                stream,
+                code,
+                "error",
+                serde_json::to_vec(&serde_json::json!({ "error": msg }))
+                    .unwrap_or_default()
+                    .as_slice(),
+            ),
+        };
+    }
+    if method == "POST" && path == "/api/git/commit" {
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body)?;
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        let message = parsed["message"].as_str().unwrap_or_default();
+        return match serve::git_commit(&state.cwd, message) {
+            Ok(body) => write_http(
+                stream,
+                200,
+                "OK",
+                serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+            ),
+            Err((code, msg)) => write_http(
+                stream,
+                code,
+                "error",
+                serde_json::to_vec(&serde_json::json!({ "error": msg }))
+                    .unwrap_or_default()
+                    .as_slice(),
+            ),
+        };
+    }
+
     if method == "GET" {
         // static workbench assets (embedded; the daemon stays
         // dependency-free — no build step, no node_modules)
@@ -677,6 +728,7 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
                 ),
             };
         }
+
 
         if path == "/api/sessions" {
             let sessions = state.sessions.lock().unwrap();

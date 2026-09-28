@@ -169,25 +169,95 @@ function renderChanges() {
   if (!ov) { host.appendChild(el('div', 'tree-empty', 'loading…')); return; }
   if (!ov.repository) {
     host.appendChild(el('div', 'tree-empty', 'This workspace is not a git repository.'));
+    $('commit-box').hidden = true;
     return;
   }
+
+  // porcelain XY: X = staged, Y = unstaged; '??' = untracked
+  const staged = [];
+  const unstaged = [];
+  for (const c of ov.changes || []) {
+    const code = c.code || '';
+    if (code === '??') { unstaged.push(c); continue; }
+    const x = code[0] || ' ';
+    const y = code[1] || ' ';
+    if (x !== ' ') staged.push(c);
+    if (y !== ' ') unstaged.push({ ...c, code: y });
+  }
+
   const headRow = el('div', 'git-head');
   headRow.appendChild(el('span', 'git-branch', ov.branch || 'HEAD'));
-  const dirty = (ov.changes || []).length;
-  headRow.appendChild(el('span', 'git-dirty', dirty ? dirty + ' changed' : 'clean'));
+  headRow.appendChild(el('span', 'git-dirty',
+    (ov.changes || []).length ? (ov.changes.length + ' changed') : 'clean'));
   host.appendChild(headRow);
-  if (!dirty) {
+
+  if (!(ov.changes || []).length) {
     host.appendChild(el('div', 'tree-empty', 'No working-tree changes.'));
-    return;
   }
-  for (const c of ov.changes || []) {
-    const row = el('button', 'tree-row');
-    row.type = 'button';
-    row.appendChild(el('span', 'git-code ' + statusClass(c.code), c.code || 'M'));
-    row.appendChild(el('span', 'f-name', c.path));
-    row.addEventListener('click', () => openDiff(c.path));
-    host.appendChild(row);
+
+  const section = (label) => {
+    const h = el('div', 'git-section');
+    h.textContent = label;
+    host.appendChild(h);
+  };
+
+  if (unstaged.length) {
+    section('Changes');
+    for (const c of unstaged) {
+      host.appendChild(changeRow(c, false));
+    }
   }
+  if (staged.length) {
+    section('Staged');
+    for (const c of staged) {
+      host.appendChild(changeRow(c, true));
+    }
+  }
+
+  // commit box: needs staged changes + a message
+  $('commit-box').hidden = !staged.length;
+  updateCommitButton();
+}
+
+function changeRow(c, isStaged) {
+  const row = el('div', 'tree-row');
+  const code = el('span', 'git-code ' + statusClass(c.code), c.code || 'M');
+  row.appendChild(code);
+  row.appendChild(el('span', 'f-name', c.path));
+  const toggle = el('button', 'stage-btn', isStaged ? '−' : '+');
+  toggle.type = 'button';
+  toggle.title = isStaged ? 'Unstage' : 'Stage';
+  toggle.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    try {
+      await post(isStaged ? '/api/git/unstage' : '/api/git/stage', { paths: [c.path] });
+      loadGit();
+    } catch (_) { /* transient */ }
+  });
+  row.appendChild(toggle);
+  row.addEventListener('click', () => openDiff(c.path));
+  return row;
+}
+
+async function commitStaged() {
+  const message = $('commit-message').value.trim();
+  if (!message) return;
+  try {
+    const r = await post('/api/git/commit', { message });
+    if (r.error) { toast('error', 'Commit failed', r.error); return; }
+    $('commit-message').value = '';
+    toast('ok', 'Committed', r.hash ? r.hash.slice(0, 10) + ' on ' + (r.branch || '') : '');
+    loadGit();
+  } catch (e) {
+    toast('error', 'Commit failed', String(e));
+  }
+}
+
+function updateCommitButton() {
+  const stagedCount = (gitState.overview && gitState.overview.changes || [])
+    .filter((c) => (c.code || ' ')[0] !== ' ' && c.code !== '??').length;
+  $('commit-btn').disabled = stagedCount === 0
+    || $('commit-message').value.trim().length === 0;
 }
 
 function statusClass(code) {
@@ -1337,6 +1407,11 @@ function init() {
   $('tab-tasks').addEventListener('click', () => switchTab('tasks'));
   $('tab-files').addEventListener('click', () => switchTab('files'));
   $('tab-changes').addEventListener('click', () => switchTab('changes'));
+  $('commit-btn').addEventListener('click', commitStaged);
+  $('commit-message').addEventListener('input', updateCommitButton);
+  $('commit-message').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !$('commit-btn').disabled) commitStaged();
+  });
   $('preview-close').addEventListener('click', closePreview);
   $('preview-backdrop').addEventListener('click', closePreview);
 

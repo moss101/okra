@@ -175,6 +175,12 @@ anchored so content never jumps when checkpoints refine). A 2k-row
 streaming task stays bounded and smooth; verified live at 127 rows with a
 24-node window and across replay.
 
+**Staging + commit (N0014):** the Changes tab acts — staged/unstaged
+sections from the raw porcelain codes, per-file `+`/`−` stage toggles,
+and a commit box over `POST /api/git/stage|unstage|commit`. Commits are
+STAGED-ONLY (the working tree is never swept in); refusals are honest
+(empty message, nothing staged, non-repo).
+
 **Notifications (N0013):** the 3-class boundary is live — the daemon
 classifies and REDACTS (`v4/notification` frames on turn completion and
 permission asks; labels are metadata, content never leaves the process)

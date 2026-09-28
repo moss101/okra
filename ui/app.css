@@ -1106,6 +1106,67 @@ html[data-theme="light"] .icon-moon { display: none; }
   word-break: break-word;
 }
 
+/* ---------- commit box ---------- */
+
+.git-section {
+  font-size: var(--text-xs);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  padding: 10px 10px 2px;
+  user-select: none;
+}
+
+.stage-btn {
+  margin-left: auto;
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--border-default);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: 1;
+  transition: background var(--duration) var(--ease), color var(--duration) var(--ease);
+}
+.stage-btn:hover { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+
+.commit-box {
+  display: flex;
+  gap: 6px;
+  padding: 10px 8px 12px;
+  border-top: 1px solid var(--border-subtle);
+  margin-top: 8px;
+}
+
+.commit-box input {
+  flex: 1;
+  min-width: 0;
+  background: var(--surface-base);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--text-sm);
+  padding: 6px 8px;
+  outline: none;
+}
+.commit-box input:focus { border-color: color-mix(in srgb, var(--accent) 55%, var(--border-default)); }
+
+.commit-btn {
+  flex: none;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  background: var(--accent);
+  color: var(--accent-contrast);
+  border-radius: var(--radius-sm);
+  padding: 6px 12px;
+  transition: opacity var(--duration) var(--ease), background var(--duration) var(--ease);
+}
+.commit-btn:hover { background: var(--accent-hover); }
+.commit-btn:disabled { opacity: 0.4; cursor: default; }
+.commit-btn:disabled:hover { background: var(--accent); }
+
 /* ---------- virtualizer spacers ---------- */
 
 .vspacer { width: 100%; flex: none; }

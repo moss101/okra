@@ -1170,6 +1170,31 @@ pub fn git_diff(cwd: &Path, rel_raw: &str) -> Result<serde_json::Value, (u16, St
     Ok(serde_json::json!({ "path": path, "diff": diff }))
 }
 
+/// POST /api/git/stage|unstage {paths:[...]} — index operations.
+pub fn git_stage(cwd: &Path, raw_paths: &[String], unstage: bool) -> Result<serde_json::Value, (u16, String)> {
+    if raw_paths.is_empty() {
+        return Err((400, "paths required".to_string()));
+    }
+    let repo = okra_host::git::GitRepository::open(cwd)
+        .map_err(|_| (400, "not a git repository".to_string()))?;
+    let paths: Vec<&str> = raw_paths.iter().map(String::as_str).collect();
+    let r = if unstage {
+        repo.unstage(&paths)
+    } else {
+        repo.stage(&paths)
+    };
+    r.map_err(|e| (400, e.to_string()))?;
+    Ok(serde_json::json!({ "staged": !unstage, "count": paths.len() }))
+}
+
+/// POST /api/git/commit {message} — commit the staged index.
+pub fn git_commit(cwd: &Path, message: &str) -> Result<serde_json::Value, (u16, String)> {
+    let repo = okra_host::git::GitRepository::open(cwd)
+        .map_err(|_| (400, "not a git repository".to_string()))?;
+    let hash = repo.commit(message).map_err(|e| (400, e.to_string()))?;
+    Ok(serde_json::json!({ "hash": hash, "branch": repo.head().map(|h| h.branch).unwrap_or_default() }))
+}
+
 /// Read one session's durable log (the replay source of truth).
 pub fn session_events(
     sessions_dir: &Path,

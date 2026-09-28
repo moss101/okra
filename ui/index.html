@@ -38,8 +38,12 @@
       <!-- populated by app.js -->
     </nav>
     <nav class="file-tree" id="changes-list" aria-label="Changes" hidden>
-      <!-- populated by app.js -->
     </nav>
+    <div class="commit-box" id="commit-box" hidden>
+      <input type="text" id="commit-message" placeholder="Commit message…"
+        aria-label="Commit message" maxlength="200">
+      <button class="commit-btn" id="commit-btn" type="button" disabled>Commit</button>
+    </div>
 
     <div class="sidebar-footer">
       <span class="conn-dot" id="conn-dot" aria-hidden="true"></span>

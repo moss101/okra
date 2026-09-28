@@ -1033,3 +1033,111 @@ fn g4_notifications_classify_and_redact_over_the_wire() {
         std::panic::resume_unwind(panic);
     }
 }
+
+/// N0014 — staging + commit: per-file staging over the wire, a staged-only
+/// commit (untouched paths stay dirty), and honest refusals (no repo,
+/// empty message, nothing staged).
+#[test]
+fn g4_git_stage_and_commit_over_the_wire() {
+    let td = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(td.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    run(&["init", "-q"]);
+    run(&["config", "user.email", "drive@okra.local"]);
+    run(&["config", "user.name", "okra drive"]);
+    std::fs::write(td.path().join("a.txt"), "alpha\n").unwrap();
+    std::fs::write(td.path().join("b.txt"), "beta\n").unwrap();
+    run(&["add", "-A"]);
+    run(&["commit", "-q", "-m", "seed"]);
+    // both files change; only one gets staged
+    std::fs::write(td.path().join("a.txt"), "alpha edited\n").unwrap();
+    std::fs::write(td.path().join("b.txt"), "beta edited\n").unwrap();
+
+    let (mut daemon, addr) = spawn_daemon(td.path());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // 1. stage ONE file
+        let (status, reply) = http_post(
+            &addr,
+            "/api/git/stage",
+            &serde_json::json!({ "paths": ["a.txt"] }),
+        );
+        assert_eq!(status, 200, "{reply}");
+
+        // status shows a.txt staged (X), b.txt unstaged (Y)
+        let (status, body) = http_get(&addr, "/api/git");
+        assert_eq!(status, 200, "{body}");
+        // staged a.txt carries its staged X; b.txt is unstaged
+        // raw porcelain codes survive: a.txt staged-only is "M "
+        // (X=M, Y=space); b.txt unstaged-only is " M"
+        assert!(body.contains("\"code\":\"M \""), "staged code missing: {body}");
+        assert!(body.contains("\"code\":\" M\""), "unstaged code missing: {body}");
+
+        // 2. commit ONLY what is staged
+        let (status, reply) = http_post(
+            &addr,
+            "/api/git/commit",
+            &serde_json::json!({ "message": "stage a only" }),
+        );
+        assert_eq!(status, 200, "{reply}");
+        let hash = reply["hash"].as_str().expect("commit hash").to_string();
+        assert_eq!(hash.len(), 40, "{reply}");
+
+        // a.txt is committed; b.txt must still be dirty
+        let show = Command::new("git")
+            .args(["show", "--name-only", "--format=", &hash])
+            .current_dir(td.path())
+            .output()
+            .unwrap();
+        let files = String::from_utf8_lossy(&show.stdout);
+        assert!(files.contains("a.txt"), "committed files: {files}");
+        assert!(!files.contains("b.txt"), "unstaged file leaked into the commit: {files}");
+        let (status, body) = http_get(&addr, "/api/git");
+        assert!(body.contains("b.txt"), "b.txt no longer dirty: {body}");
+
+        // 3. honest refusals
+        let (status, _) = http_post(
+            &addr,
+            "/api/git/commit",
+            &serde_json::json!({ "message": "   " }),
+        );
+        assert_eq!(status, 400, "empty message must refuse");
+        let (status, _) = http_post(
+            &addr,
+            "/api/git/stage",
+            &serde_json::json!({ "paths": [] }),
+        );
+        assert_eq!(status, 400, "empty paths must refuse");
+        let (status, _) = http_post(
+            &addr,
+            "/api/git/stage",
+            &serde_json::json!({ "paths": ["-rf"] }),
+        );
+        assert_eq!(status, 400, "option-looking pathspec must refuse");
+
+        // 4. outside a repository everything refuses
+        let td2 = tempfile::tempdir().unwrap();
+        let (mut daemon2, addr2) = spawn_daemon(td2.path());
+        let inner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for path in ["/api/git/stage", "/api/git/commit"] {
+                let (status, _) = http_post(&addr2, path, &serde_json::json!({ "paths": ["x"], "message": "m" }));
+                assert_eq!(status, 400, "{path} outside a repo");
+            }
+        }));
+        let _ = daemon2.kill();
+        let _ = daemon2.wait();
+        if let Err(panic) = inner {
+            std::panic::resume_unwind(panic);
+        }
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}

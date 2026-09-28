@@ -110,7 +110,10 @@ impl GitRepository {
                 continue;
             }
             entries.push(GitStatusEntry {
-                code: line[..2].trim().to_string(),
+                // RAW porcelain XY — X is the staged state, Y the unstaged
+                // one; trimming would erase the distinction the workbench
+                // staging UI partitions on.
+                code: line[..2].to_string(),
                 path: line[3..].trim().to_string(),
             });
         }
@@ -129,6 +132,48 @@ impl GitRepository {
             return Err(GitError::UnsafePath(path.to_string()));
         }
         run_git(&self.root, &["diff", "--", path])
+    }
+
+    /// Reject option-looking pathspecs (they would be parsed as flags even
+    /// after `--` is absent; we always pass `--` too, belt and braces).
+    fn checked_paths(paths: &[&str]) -> Result<(), GitError> {
+        for p in paths {
+            if p.starts_with('-') {
+                return Err(GitError::UnsafePath((*p).to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Stage pathspecs (`git add -- ...`).
+    pub fn stage(&self, paths: &[&str]) -> Result<(), GitError> {
+        Self::checked_paths(paths)?;
+        let mut args = vec!["add", "--"];
+        args.extend_from_slice(paths);
+        run_git(&self.root, &args).map(|_| ())
+    }
+
+    /// Unstage pathspecs (index back to HEAD; working tree untouched).
+    pub fn unstage(&self, paths: &[&str]) -> Result<(), GitError> {
+        Self::checked_paths(paths)?;
+        let mut args = vec!["restore", "--staged", "--"];
+        args.extend_from_slice(paths);
+        run_git(&self.root, &args).map(|_| ())
+    }
+
+    /// Commit the STAGED index (never touches the working tree — staging
+    /// is the caller's explicit act). Returns the new hash. Fails honestly
+    /// when nothing is staged or no author is configured.
+    pub fn commit(&self, message: &str) -> Result<String, GitError> {
+        let message = message.trim();
+        if message.is_empty() {
+            return Err(GitError::Git("commit message is empty".to_string()));
+        }
+        if !self.is_dirty()? {
+            return Err(GitError::Git("nothing to commit".to_string()));
+        }
+        run_git(&self.root, &["commit", "-m", message])?;
+        Ok(run_git(&self.root, &["rev-parse", "HEAD"])?.trim().to_string())
     }
 
     /// Stage all changes and commit. Returns the new commit hash.
