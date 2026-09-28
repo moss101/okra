@@ -7,12 +7,13 @@
 //! - `initialize` → negotiate protocolVersion (we support 1), advertise
 //!   agentCapabilities (loadSession=false v1) + agentInfo
 //! - `session/new` → a kernel-backed session in the daemon cwd
-//! - `session/prompt` → runs the turn INLINE on the reader thread (the
-//!   reference-agent pattern: session/update notifications stream while the
-//!   request is in flight; the reply carries the stopReason)
-//! - `session/cancel` → accepted and recorded; agent-core has no mid-turn
-//!   abort seam yet (demo turns complete in seconds), so the REAL stop
-//!   reason is always returned — never a fabricated `cancelled`
+//! - `session/prompt` → runs the turn on a worker thread (the reader keeps
+//!   consuming stdin so mid-turn `session/cancel` arrives immediately);
+//!   the reply carries the stopReason
+//! - `session/cancel` → flips the session's stop flag; the turn aborts at
+//!   the next step boundary as Cancelled(UserRequested) (the same seam the
+//!   web `stop` command uses) and the prompt reply reports "cancelled" —
+//!   honest, because the client asked for it
 //! - session/update variants emitted: agent_message_chunk, tool_call,
 //!   tool_call_update (status completed|failed)
 //!
@@ -67,7 +68,12 @@ struct AcpState {
     /// session/new allocations live for the daemon's lifetime; ACP session
     /// ids are opaque to the client
     sessions: Mutex<std::collections::HashMap<String, AcpSession>>,
-    cancel_seen: Mutex<std::collections::BTreeSet<String>>,
+    /// stop flag per RUNNING session — session/cancel flips it (the same
+    /// external-stop seam the web surface's stop command uses)
+    stop_flags: Mutex<std::collections::BTreeMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    /// sessions with a turn in flight; a second prompt on one is a client
+    /// bug and is refused honestly instead of interleaving turns
+    running: Mutex<std::collections::BTreeSet<String>>,
 }
 
 struct AcpSession {
@@ -183,21 +189,51 @@ pub fn serve_acp(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) -> !
                     outbound.error(&id, -32602, "prompt carries no text content");
                     continue;
                 }
-                state.cancel_seen.lock().unwrap().remove(&session_id);
-                let oc = Arc::clone(&outbound);
-                let sid = session_id.clone();
-                let mut notify = move |update: serde_json::Value| {
-                    oc.notification(
-                        "session/update",
-                        serde_json::json!({ "sessionId": sid, "update": update }),
-                    );
-                };
-                match acp_turn(&session_cwd, &sessions_dir, &kernel_id, &text, &mut notify) {
-                    Ok(stop_reason) => {
-                        outbound.result(&id, serde_json::json!({ "stopReason": stop_reason }))
-                    }
-                    Err(e) => outbound.error(&id, -32000, &format!("turn failed: {e}")),
+                if state.running.lock().unwrap().contains(&session_id) {
+                    outbound.error(&id, -32000, &format!("turn already running on session {session_id}"));
+                    continue;
                 }
+                let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                state
+                    .stop_flags
+                    .lock()
+                    .unwrap()
+                    .insert(session_id.clone(), Arc::clone(&stop_flag));
+                state.running.lock().unwrap().insert(session_id.clone());
+                // worker thread: the reader loop stays on stdin so a mid-turn
+                // session/cancel notification is seen while the turn runs
+                let oc = Arc::clone(&outbound);
+                let st = Arc::clone(&state);
+                let sid = session_id.clone();
+                let session_cwd_t = session_cwd.clone();
+                let sessions_dir_t = sessions_dir.clone();
+                let kernel_id_t = kernel_id.clone();
+                let text_t = text.clone();
+                std::thread::spawn(move || {
+                    let (oc_n, sid_n) = (Arc::clone(&oc), sid.clone());
+                    let mut notify = move |update: serde_json::Value| {
+                        oc_n.notification(
+                            "session/update",
+                            serde_json::json!({ "sessionId": sid_n, "update": update }),
+                        );
+                    };
+                    match acp_turn(
+                        &session_cwd_t,
+                        &sessions_dir_t,
+                        &kernel_id_t,
+                        &text_t,
+                        &stop_flag,
+                        &mut notify,
+                    ) {
+                        Ok(stop_reason) => oc.result(
+                            &id,
+                            serde_json::json!({ "stopReason": stop_reason }),
+                        ),
+                        Err(e) => oc.error(&id, -32000, &format!("turn failed: {e}")),
+                    }
+                    st.stop_flags.lock().unwrap().remove(&sid);
+                    st.running.lock().unwrap().remove(&sid);
+                });
             }
             other => outbound.error(&id, -32601, &format!("method not found: {other}")),
         }
@@ -209,11 +245,18 @@ fn handle_notification(state: &AcpState, method: &str, params: &serde_json::Valu
     if method == "session/cancel"
         && let Some(session_id) = params["sessionId"].as_str()
     {
-        // accepted and recorded; the running turn completes and returns
-        // its real stop reason (no mid-turn abort seam yet — the module
-        // doc records this v1 limitation)
-        state.cancel_seen.lock().unwrap().insert(session_id.to_string());
-        eprintln!("[serve-acp] session/cancel recorded: {session_id}");
+        let flag = state.stop_flags.lock().unwrap().get(session_id).cloned();
+        match flag {
+            Some(flag) => {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("[serve-acp] session/cancel delivered to running turn: {session_id}");
+            }
+            None => {
+                // cancel with no turn in flight: nothing to abort; logged
+                // so the wire shows it was seen, not dropped silently
+                eprintln!("[serve-acp] session/cancel ignored (no running turn): {session_id}");
+            }
+        }
     }
 }
 
@@ -234,12 +277,14 @@ fn tool_kind(name: &str) -> &'static str {
 
 /// One ACP turn: the same setup as the v4 seam (read_file/list_dir through
 /// the policy pipeline, kernel-backed session, demo planner) with LoopEvents
-/// mapped to ACP `session/update` notifications.
+/// mapped to ACP `session/update` notifications. `stop` is the surface-held
+/// flag session/cancel flips; the loop observes it at every step boundary.
 fn acp_turn(
     cwd: &std::path::Path,
     sessions_dir: &std::path::Path,
     kernel_id: &str,
     input_text: &str,
+    stop: &Arc<std::sync::atomic::AtomicBool>,
     notify: &mut dyn FnMut(serde_json::Value),
 ) -> Result<String, String> {
     let mut registry = Registry::new();
@@ -278,6 +323,7 @@ fn acp_turn(
     };
     let sampler = DemoPlanner::new(cwd.to_path_buf());
     let mut agent = Agent::new(config, Arc::new(sampler), Box::new(executor), kernel_session);
+    agent.set_stop_flag(Arc::clone(stop));
 
     let outcome = agent.run_turn(input_text, &mut |ev: LoopEvent| {
         match ev {
@@ -312,8 +358,8 @@ fn acp_turn(
     Ok(match outcome {
         Ok(TurnOutcome::Completed { .. }) | Ok(TurnOutcome::StationarityEnded) => "end_turn".to_string(),
         Ok(TurnOutcome::MaxTurnsReached { .. }) => "max_turn_requests".to_string(),
-        // internal mid-turn abort (sampler failure / budget exhaustion) —
-        // the turn really was cancelled, so this stop reason is honest
+        // the client's session/cancel (or a rare internal abort) — the turn
+        // really was cancelled, so this stop reason is honest
         Ok(TurnOutcome::Cancelled { .. }) => "cancelled".to_string(),
         Err(_) => return Err("turn errored".into()),
     })

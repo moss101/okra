@@ -13,13 +13,20 @@ use std::time::{Duration, Instant};
 
 #[allow(clippy::disallowed_methods)] // test harness: executes the compiled binary
 fn spawn_agent(cwd: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_okra"))
-        .args(["serve", "--acp", "--cwd", &cwd.to_string_lossy()])
+    spawn_agent_env(cwd, &[])
+}
+
+#[allow(clippy::disallowed_methods)] // test harness: executes the compiled binary
+fn spawn_agent_env(cwd: &Path, extra_env: &[(&str, &str)]) -> Child {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_okra"));
+    cmd.args(["serve", "--acp", "--cwd", &cwd.to_string_lossy()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn okra serve --acp")
+        .stderr(Stdio::piped());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    cmd.spawn().expect("spawn okra serve --acp")
 }
 
 struct AcpClient {
@@ -184,6 +191,68 @@ fn g4_acp_editor_seam_end_to_end() {
         client.send(serde_json::json!({
             "jsonrpc": "2.0", "method": "session/cancel", "params": { "sessionId": session_id }
         }));
+    }));
+    kill(agent);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// session/cancel must actually abort a RUNNING turn: the prompt runs on a
+/// worker thread (the reader keeps consuming stdin), the cancel flips the
+/// session's stop flag, and the prompt reply reports the honest stop reason.
+/// A follow-up prompt on the same session proves the standard repair path.
+#[test]
+#[allow(clippy::disallowed_methods)] // test harness: executes the compiled binary
+fn g4_acp_cancel_aborts_running_turn_and_session_recovers() {
+    let td = tempfile::tempdir().unwrap();
+    let workspace = td.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("notes.md"), "# cancel probe\n").unwrap();
+    // stretch every planner step so the turn is reliably mid-flight
+    let mut agent = spawn_agent_env(td.path(), &[("OKRA_DEMO_DELAY_MS", "1500")]);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut client = AcpClient {
+            stdin: agent.stdin.take().unwrap(),
+            reader: BufReader::new(agent.stdout.take().unwrap()),
+            next_id: 1,
+        };
+        client.request(
+            "initialize",
+            serde_json::json!({ "protocolVersion": 1, "clientInfo": { "name": "c", "version": "0" } }),
+        );
+        let new = client.request("session/new", serde_json::json!({ "cwd": workspace }));
+        let session_id = new["result"]["sessionId"].as_str().unwrap().to_string();
+
+        // prompt 1 goes out but we do NOT wait for its reply
+        client.send(serde_json::json!({
+            "jsonrpc": "2.0", "id": 10, "method": "session/prompt",
+            "params": { "sessionId": session_id, "prompt": [ { "type": "text", "text": "long task" } ] }
+        }));
+        std::thread::sleep(Duration::from_millis(500)); // turn is mid-sample now
+
+        // a second prompt on the same session while one runs: refused honestly
+        client.send(serde_json::json!({
+            "jsonrpc": "2.0", "id": 11, "method": "session/prompt",
+            "params": { "sessionId": session_id, "prompt": [ { "type": "text", "text": "interleave" } ] }
+        }));
+        let busy = client.wait_for_reply(11);
+        assert_eq!(busy["error"]["code"], -32000, "{busy}");
+
+        // the cancel lands while prompt 1's turn is still running
+        client.send(serde_json::json!({
+            "jsonrpc": "2.0", "method": "session/cancel", "params": { "sessionId": session_id }
+        }));
+        let cancelled = client.wait_for_reply(10);
+        assert!(cancelled["error"].is_null(), "{cancelled}");
+        assert_eq!(cancelled["result"]["stopReason"], "cancelled", "{cancelled}");
+
+        // the same session takes a new turn (standard repair path)
+        let after = client.request("session/prompt", serde_json::json!({
+            "sessionId": session_id,
+            "prompt": [ { "type": "text", "text": "summarize notes.md" } ]
+        }));
+        assert_eq!(after["result"]["stopReason"], "end_turn", "{after}");
     }));
     kill(agent);
     if let Err(panic) = result {

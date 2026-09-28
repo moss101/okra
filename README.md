@@ -83,9 +83,14 @@ M4  surfaces                  ◐ NDJSON two-surface + cross-surface steering,
                                   repair path).
                                   **ACP gateway live** (`okra serve --acp`:
                                   initialize/version negotiation, session/new,
-                                  session/prompt with streamed session/update,
-                                  honest stop reasons — scripted-editor e2e
-                                  green; a real Zed drive awaits a Zed install)
+                                  session/prompt on a worker thread with
+                                  streamed session/update, honest stop
+                                  reasons, and a REAL session/cancel —
+                                  mid-turn abort via the same stop-flag seam
+                                  as the web Stop button, session recovers
+                                  on the next prompt; scripted-editor e2e
+                                  green; a real editor drive awaits a
+                                  user-armed environment per N0007)
                                   + **leader/roster** (one leader per daemon,
                                   term-bumped claims, `roster/claim`).
 M5  differentiators ◐ (subagent kernel isolation)
