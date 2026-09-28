@@ -1195,6 +1195,64 @@ pub fn git_commit(cwd: &Path, message: &str) -> Result<serde_json::Value, (u16, 
     Ok(serde_json::json!({ "hash": hash, "branch": repo.head().map(|h| h.branch).unwrap_or_default() }))
 }
 
+/// GET /api/skills — the workspace's installed skills (`.okra/skills/*.md`)
+/// with their path-conditional activation patterns (disclosure layer 1).
+pub fn skills_listing(cwd: &Path) -> serde_json::Value {
+    let catalog = okra_memory::SkillCatalog::load_dir(&cwd.join(".okra").join("skills"));
+    let skills: Vec<serde_json::Value> = catalog
+        .skills
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "description": s.description,
+                "patterns": s.match_patterns,
+            })
+        })
+        .collect();
+    serde_json::json!({ "dir": ".okra/skills", "skills": skills })
+}
+
+/// GET /api/mcp — configured MCP servers across scopes (workspace
+/// `.okra/mcp.json` wins over user-level configs). Status is the sync
+/// domain's truth: enabled flag + source + scope; the launch summary is
+/// the command/url from the config.
+pub fn mcp_listing(cwd: &Path) -> serde_json::Value {
+    let home = okra_host::fsutil::home_dir().unwrap_or_else(|| cwd.to_path_buf());
+    let svc = okra_host::mcp_sync::McpSyncService::new(home);
+    let servers: Vec<serde_json::Value> = svc
+        .load(Some(cwd))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| {
+            let summary = r.config["command"]
+                .as_str()
+                .map(|c| {
+                    let args: Vec<&str> = r.config["args"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                        .unwrap_or_default();
+                    if args.is_empty() {
+                        c.to_string()
+                    } else {
+                        format!("{c} {}", args.join(" "))
+                    }
+                })
+                .or_else(|| r.config["url"].as_str().map(str::to_string))
+                .or_else(|| r.config["type"].as_str().map(str::to_string))
+                .unwrap_or_default();
+            serde_json::json!({
+                "name": r.name,
+                "enabled": r.enabled,
+                "source": r.source.as_str(),
+                "scope": if r.workspace_path.is_some() { "workspace" } else { "user" },
+                "summary": summary,
+            })
+        })
+        .collect();
+    serde_json::json!({ "servers": servers })
+}
+
 /// Read one session's durable log (the replay source of truth).
 pub fn session_events(
     sessions_dir: &Path,

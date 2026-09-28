@@ -550,7 +550,6 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
         }
     }
 
-
     // staging + commit (N0014): read-write git operations
     if method == "POST" && (path == "/api/git/stage" || path == "/api/git/unstage") {
         let mut body = vec![0u8; content_length];
@@ -602,6 +601,159 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
         };
     }
 
+    if path == "/api/skills" {
+        let body = serve::skills_listing(&state.cwd);
+        return write_http(
+            stream,
+            200,
+            "OK",
+            serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+        );
+    }
+    if path == "/api/mcp" {
+        let body = serve::mcp_listing(&state.cwd);
+        return write_http(
+            stream,
+            200,
+            "OK",
+            serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+        );
+    }
+
+    if path == "/api/files" || path.starts_with("/api/files?") {
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let rel = query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("path="))
+            .unwrap_or("");
+        return match serve::files_listing(&state.cwd, rel) {
+            Ok(body) => write_http(
+                stream,
+                200,
+                "OK",
+                serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+            ),
+            Err((code, msg)) => write_http(
+                stream,
+                code,
+                "error",
+                serde_json::to_vec(&serde_json::json!({ "error": msg }))
+                    .unwrap_or_default()
+                    .as_slice(),
+            ),
+        };
+    }
+    if path == "/api/file" || path.starts_with("/api/file?") {
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let rel = query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("path="))
+            .unwrap_or("");
+        return match serve::file_preview(&state.cwd, rel) {
+            Ok(body) => write_http(
+                stream,
+                200,
+                "OK",
+                serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+            ),
+            Err((code, msg)) => write_http(
+                stream,
+                code,
+                "error",
+                serde_json::to_vec(&serde_json::json!({ "error": msg }))
+                    .unwrap_or_default()
+                    .as_slice(),
+            ),
+        };
+    }
+
+    if path == "/api/git" {
+        return match serve::git_overview(&state.cwd) {
+            Ok(body) => write_http(
+                stream,
+                200,
+                "OK",
+                serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+            ),
+            Err((code, msg)) => write_http(
+                stream,
+                code,
+                "error",
+                serde_json::to_vec(&serde_json::json!({ "error": msg }))
+                    .unwrap_or_default()
+                    .as_slice(),
+            ),
+        };
+    }
+    if path == "/api/git/diff" || path.starts_with("/api/git/diff?") {
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let rel = query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("path="))
+            .unwrap_or("");
+        return match serve::git_diff(&state.cwd, rel) {
+            Ok(body) => write_http(
+                stream,
+                200,
+                "OK",
+                serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+            ),
+            Err((code, msg)) => write_http(
+                stream,
+                code,
+                "error",
+                serde_json::to_vec(&serde_json::json!({ "error": msg }))
+                    .unwrap_or_default()
+                    .as_slice(),
+            ),
+        };
+    }
+
+    if path == "/api/sessions" {
+        let sessions = state.sessions.lock().unwrap();
+        let list = serve::list_session_summaries(&state.sessions_dir, &sessions);
+        drop(sessions);
+        let body = serde_json::to_vec(&serde_json::json!({ "sessions": list }))
+            .unwrap_or_default();
+        return write_http(stream, 200, "OK", &body);
+    }
+
+    if let Some(rest) = path.strip_prefix("/api/sessions/") {
+        let session_id = rest.trim_end_matches("/rows").trim_start_matches('/');
+        if session_id.is_empty() {
+            let body =
+                serde_json::to_vec(&serde_json::json!({ "error": "session id required" }))
+                    .unwrap_or_default();
+            return write_http(stream, 400, "bad request", &body);
+        }
+        let kernel_name = format!("session-{session_id}");
+        match serve::session_events(&state.sessions_dir, &kernel_name)
+            .and_then(|events| serve::rows_from_kernel_events(&events))
+        {
+            Ok((rows, control)) => {
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "sessionId": session_id,
+                    "rows": rows,
+                    "control": control,
+                }))
+                .unwrap_or_default();
+                return write_http(stream, 200, "OK", &body);
+            }
+            Err(e) => {
+                // unknown session → 404; a log we cannot safely
+                // reconstruct → 422 (honest refusal, not silent data)
+                let (status, reason) = if e.contains("not found") || e.contains("No such") {
+                    (404, "not found")
+                } else {
+                    (422, "unreplayable")
+                };
+                let body =
+                    serde_json::to_vec(&serde_json::json!({ "error": e })).unwrap_or_default();
+                return write_http(stream, status, reason, &body);
+            }
+        }
+    }
+
     if method == "GET" {
         // static workbench assets (embedded; the daemon stays
         // dependency-free — no build step, no node_modules)
@@ -640,141 +792,7 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
         // GET /api/files?path=rel ("" = root) — dot entries (incl.
         // .okra-sessions) are never listed; symlinks are reported but never
         // followed; the resolved path must stay inside the workspace.
-        if path == "/api/files" || path.starts_with("/api/files?") {
-            let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
-            let rel = query
-                .split('&')
-                .find_map(|kv| kv.strip_prefix("path="))
-                .unwrap_or("");
-            return match serve::files_listing(&state.cwd, rel) {
-                Ok(body) => write_http(
-                    stream,
-                    200,
-                    "OK",
-                    serde_json::to_vec(&body).unwrap_or_default().as_slice(),
-                ),
-                Err((code, msg)) => write_http(
-                    stream,
-                    code,
-                    "error",
-                    serde_json::to_vec(&serde_json::json!({ "error": msg }))
-                        .unwrap_or_default()
-                        .as_slice(),
-                ),
-            };
-        }
-        if path == "/api/file" || path.starts_with("/api/file?") {
-            let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
-            let rel = query
-                .split('&')
-                .find_map(|kv| kv.strip_prefix("path="))
-                .unwrap_or("");
-            return match serve::file_preview(&state.cwd, rel) {
-                Ok(body) => write_http(
-                    stream,
-                    200,
-                    "OK",
-                    serde_json::to_vec(&body).unwrap_or_default().as_slice(),
-                ),
-                Err((code, msg)) => write_http(
-                    stream,
-                    code,
-                    "error",
-                    serde_json::to_vec(&serde_json::json!({ "error": msg }))
-                        .unwrap_or_default()
-                        .as_slice(),
-                ),
-            };
-        }
-
-        if path == "/api/git" {
-            return match serve::git_overview(&state.cwd) {
-                Ok(body) => write_http(
-                    stream,
-                    200,
-                    "OK",
-                    serde_json::to_vec(&body).unwrap_or_default().as_slice(),
-                ),
-                Err((code, msg)) => write_http(
-                    stream,
-                    code,
-                    "error",
-                    serde_json::to_vec(&serde_json::json!({ "error": msg }))
-                        .unwrap_or_default()
-                        .as_slice(),
-                ),
-            };
-        }
-        if path == "/api/git/diff" || path.starts_with("/api/git/diff?") {
-            let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
-            let rel = query
-                .split('&')
-                .find_map(|kv| kv.strip_prefix("path="))
-                .unwrap_or("");
-            return match serve::git_diff(&state.cwd, rel) {
-                Ok(body) => write_http(
-                    stream,
-                    200,
-                    "OK",
-                    serde_json::to_vec(&body).unwrap_or_default().as_slice(),
-                ),
-                Err((code, msg)) => write_http(
-                    stream,
-                    code,
-                    "error",
-                    serde_json::to_vec(&serde_json::json!({ "error": msg }))
-                        .unwrap_or_default()
-                        .as_slice(),
-                ),
-            };
-        }
-
-
-        if path == "/api/sessions" {
-            let sessions = state.sessions.lock().unwrap();
-            let list = serve::list_session_summaries(&state.sessions_dir, &sessions);
-            drop(sessions);
-            let body = serde_json::to_vec(&serde_json::json!({ "sessions": list }))
-                .unwrap_or_default();
-            return write_http(stream, 200, "OK", &body);
-        }
-
-        if let Some(rest) = path.strip_prefix("/api/sessions/") {
-            let session_id = rest.trim_end_matches("/rows").trim_start_matches('/');
-            if session_id.is_empty() {
-                let body =
-                    serde_json::to_vec(&serde_json::json!({ "error": "session id required" }))
-                        .unwrap_or_default();
-                return write_http(stream, 400, "bad request", &body);
-            }
-            let kernel_name = format!("session-{session_id}");
-            match serve::session_events(&state.sessions_dir, &kernel_name)
-                .and_then(|events| serve::rows_from_kernel_events(&events))
-            {
-                Ok((rows, control)) => {
-                    let body = serde_json::to_vec(&serde_json::json!({
-                        "sessionId": session_id,
-                        "rows": rows,
-                        "control": control,
-                    }))
-                    .unwrap_or_default();
-                    return write_http(stream, 200, "OK", &body);
-                }
-                Err(e) => {
-                    // unknown session → 404; a log we cannot safely
-                    // reconstruct → 422 (honest refusal, not silent data)
-                    let (status, reason) = if e.contains("not found") || e.contains("No such") {
-                        (404, "not found")
-                    } else {
-                        (422, "unreplayable")
-                    };
-                    let body =
-                        serde_json::to_vec(&serde_json::json!({ "error": e })).unwrap_or_default();
-                    return write_http(stream, status, reason, &body);
-                }
-            }
-        }
-    }
+}
 
     if method == "GET" && path == "/scenes" {
         let catalog = starter_scene_catalog();

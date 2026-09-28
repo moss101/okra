@@ -136,22 +136,84 @@ const gitState = {
   overview: null,   // {repository, branch, hash, changes[]}
 };
 
+const tools = {
+  active: false,
+  data: null,       // {skills: {dir, skills[]}, mcp: {servers[]}}
+};
+
 function switchTab(tab) {
   files.active = tab === 'files';
   gitState.active = tab === 'changes';
-  $('tab-tasks').classList.toggle('active', tab === 'tasks');
-  $('tab-files').classList.toggle('active', files.active);
-  $('tab-changes').classList.toggle('active', gitState.active);
+  tools.active = tab === 'tools';
   for (const [id, on] of [
-    ['tab-tasks', 'tasks'], ['tab-files', 'files'], ['tab-changes', 'changes'],
+    ['tab-tasks', 'tasks'], ['tab-files', 'files'],
+    ['tab-changes', 'changes'], ['tab-tools', 'tools'],
   ]) {
+    $(id).classList.toggle('active', tab === on);
     $(id).setAttribute('aria-selected', String(tab === on));
   }
-  $('task-list').hidden = files.active || gitState.active;
+  $('task-list').hidden = files.active || gitState.active || tools.active;
   $('file-tree').hidden = !files.active;
   $('changes-list').hidden = !gitState.active;
+  $('tools-list').hidden = !tools.active;
   if (files.active && !files.dirs['']) loadFiles('');
   if (gitState.active) loadGit();
+  if (tools.active) loadTools();
+}
+
+async function loadTools() {
+  try {
+    const [skills, mcp] = await Promise.all([
+      fetch('/api/skills').then((r) => r.json()),
+      fetch('/api/mcp').then((r) => r.json()),
+    ]);
+    tools.data = { skills, mcp };
+    renderTools();
+  } catch (_) { /* transient */ }
+}
+
+function renderTools() {
+  const host = $('tools-list');
+  host.textContent = '';
+  if (!tools.data) { host.appendChild(el('div', 'tree-empty', 'loading…')); return; }
+
+  const skills = (tools.data.skills && tools.data.skills.skills) || [];
+  host.appendChild(el('div', 'git-section', 'Skills · ' + (tools.data.skills.dir || '')));
+  if (!skills.length) {
+    host.appendChild(el('div', 'tree-empty',
+      'None installed — add *.md files with name/description/match frontmatter.'));
+  }
+  for (const sk of skills) {
+    const row = el('div', 'tool-entry');
+    const head = el('div', 'tool-entry-head');
+    head.appendChild(el('span', 'tool-entry-name', sk.name));
+    row.appendChild(head);
+    row.appendChild(el('div', 'tool-entry-desc', sk.description || ''));
+    if ((sk.patterns || []).length) {
+      const chips = el('div', 'pattern-chips');
+      for (const p of sk.patterns) chips.appendChild(el('span', 'pattern-chip', p));
+      row.appendChild(chips);
+    }
+    host.appendChild(row);
+  }
+
+  const servers = (tools.data.mcp && tools.data.mcp.servers) || [];
+  host.appendChild(el('div', 'git-section', 'MCP servers'));
+  if (!servers.length) {
+    host.appendChild(el('div', 'tree-empty',
+      'None configured — add servers to .okra/mcp.json.'));
+  }
+  for (const sv of servers) {
+    const row = el('div', 'tool-entry');
+    const head = el('div', 'tool-entry-head');
+    head.appendChild(el('span', 'mcp-dot' + (sv.enabled ? ' on' : ' off')));
+    head.appendChild(el('span', 'tool-entry-name', sv.name));
+    head.appendChild(el('span', 'mcp-scope', (sv.scope || '') + ' · ' + (sv.source || '')));
+    row.appendChild(head);
+    if (sv.summary) row.appendChild(el('div', 'tool-entry-desc mono', sv.summary));
+    if (!sv.enabled) row.appendChild(el('div', 'tool-entry-desc', 'disabled'));
+    host.appendChild(row);
+  }
 }
 
 async function loadGit() {
@@ -1407,6 +1469,7 @@ function init() {
   $('tab-tasks').addEventListener('click', () => switchTab('tasks'));
   $('tab-files').addEventListener('click', () => switchTab('files'));
   $('tab-changes').addEventListener('click', () => switchTab('changes'));
+  $('tab-tools').addEventListener('click', () => switchTab('tools'));
   $('commit-btn').addEventListener('click', commitStaged);
   $('commit-message').addEventListener('input', updateCommitButton);
   $('commit-message').addEventListener('keydown', (e) => {

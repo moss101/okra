@@ -29,6 +29,7 @@
       <button class="sidebar-tab active" id="tab-tasks" role="tab" aria-selected="true" type="button">Tasks</button>
       <button class="sidebar-tab" id="tab-files" role="tab" aria-selected="false" type="button">Files</button>
       <button class="sidebar-tab" id="tab-changes" role="tab" aria-selected="false" type="button">Changes</button>
+      <button class="sidebar-tab" id="tab-tools" role="tab" aria-selected="false" type="button">Tools</button>
     </div>
 
     <nav class="task-list" id="task-list" aria-label="Tasks">
@@ -38,6 +39,9 @@
       <!-- populated by app.js -->
     </nav>
     <nav class="file-tree" id="changes-list" aria-label="Changes" hidden>
+    </nav>
+    <nav class="file-tree" id="tools-list" aria-label="Tools" hidden>
+      <!-- populated by app.js -->
     </nav>
     <div class="commit-box" id="commit-box" hidden>
       <input type="text" id="commit-message" placeholder="Commit message…"

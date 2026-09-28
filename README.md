@@ -175,6 +175,13 @@ anchored so content never jumps when checkpoints refine). A 2k-row
 streaming task stays bounded and smooth; verified live at 127 rows with a
 24-node window and across replay.
 
+**Tools tab (N0015):** a fourth sidebar tab projects the installed
+skills (`.okra/skills/*.md` — name, description, path-conditional
+patterns) and the configured MCP servers (workspace + user scopes,
+enabled flag, source, launch summary) as read-only surfaces. All
+`/api/*` routes now live at the top level of the HTTP dispatch — the
+route-nesting trap that 404'd POSTs is structurally gone.
+
 **Staging + commit (N0014):** the Changes tab acts — staged/unstaged
 sections from the raw porcelain codes, per-file `+`/`−` stage toggles,
 and a commit box over `POST /api/git/stage|unstage|commit`. Commits are

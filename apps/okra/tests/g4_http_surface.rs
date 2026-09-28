@@ -1141,3 +1141,67 @@ fn g4_git_stage_and_commit_over_the_wire() {
         std::panic::resume_unwind(panic);
     }
 }
+
+/// N0015 — the Tools tab: workspace skills (`.okra/skills/*.md`, with their
+/// path-conditional patterns) and configured MCP servers (`.okra/mcp.json`,
+/// enabled + source + scope) projected read-only.
+#[test]
+fn g4_tools_surface_projects_skills_and_mcp() {
+    let td = tempfile::tempdir().unwrap();
+    // a real skill with frontmatter + a match pattern
+    let skills_dir = td.path().join(".okra").join("skills");
+    std::fs::create_dir_all(&skills_dir).unwrap();
+    std::fs::write(
+        skills_dir.join("SKILL-rust.md"),
+        "---\nname: rust-review\ndescription: Review Rust changes idiomatically\nmatch: src/**\n---\nBody instructions here.\n",
+    )
+    .unwrap();
+    // a workspace MCP server config
+    std::fs::create_dir_all(td.path().join(".okra")).unwrap();
+    // the okra source reads .okra/config.json with nested mcp.servers
+    std::fs::write(
+        td.path().join(".okra").join("config.json"),
+        r#"{ "mcp": { "servers": { "tester": { "command": "uvx", "args": ["mcp-tester"], "enable": false } } } }"#,
+    )
+    .unwrap();
+
+    let (mut daemon, addr) = spawn_daemon(td.path());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // 1. skills project with name/description/patterns
+        let (status, body) = http_get(&addr, "/api/skills");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("rust-review"), "{body}");
+        assert!(body.contains("Review Rust changes idiomatically"), "{body}");
+        assert!(body.contains("src/**"), "{body}");
+
+        // 2. mcp projects the server with enabled=false + scope + summary
+        let (status, body) = http_get(&addr, "/api/mcp");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("tester"), "{body}");
+        assert!(body.contains("\"enabled\":false"), "disabled flag lost: {body}");
+        assert!(body.contains("uvx mcp-tester"), "launch summary missing: {body}");
+        assert!(body.contains("\"scope\":\"workspace\""), "{body}");
+
+        // 3. an empty workspace projects honest empties
+        let td2 = tempfile::tempdir().unwrap();
+        let (mut daemon2, addr2) = spawn_daemon(td2.path());
+        let inner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (status, body) = http_get(&addr2, "/api/skills");
+            assert_eq!(status, 200);
+            assert!(body.contains("\"skills\":[]"), "{body}");
+            let (status, body) = http_get(&addr2, "/api/mcp");
+            assert_eq!(status, 200);
+            assert!(body.contains("\"servers\":[]"), "{body}");
+        }));
+        let _ = daemon2.kill();
+        let _ = daemon2.wait();
+        if let Err(panic) = inner {
+            std::panic::resume_unwind(panic);
+        }
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
