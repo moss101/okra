@@ -327,6 +327,46 @@ fn main() {
     }
 
 
+    // `okra pin-status [--pin PATH]`: operator view of the managed policy
+    // pin — which bytes are in force, from where, under which state.
+    if argv.first().map(String::as_str) == Some("pin-status") {
+        let mut pin_path: Option<PathBuf> = None;
+        let mut i = 1;
+        while i < argv.len() {
+            match argv[i].as_str() {
+                "--pin" => {
+                    i += 1;
+                    pin_path = Some(PathBuf::from(argv.get(i).cloned().unwrap_or_default()));
+                }
+                other => {
+                    eprintln!("error: unknown pin-status flag {other}");
+                    std::process::exit(2);
+                }
+            }
+            i += 1;
+        }
+        let default_path = okra_host::fsutil::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/"))
+            .join(".okra")
+            .join("managed-policy.json");
+        let path = pin_path.unwrap_or(default_path);
+        let pin = okra_host::load_managed_pin(&path);
+        let prov = pin.provenance.clone();
+        println!(
+            "{}",
+            serde_json::json!({
+                "state": pin.state,
+                "path": path.to_string_lossy(),
+                "sha256": prov.as_ref().map(|p| p.sha256.clone()),
+                "source": prov.as_ref().map(|p| p.source.clone()),
+                "sandboxCeiling": pin.sandbox_ceiling().map(|c| serde_json::to_value(c).unwrap_or_default()),
+                "approvalMustAsk": if pin.approval_must_ask() { Some(true) } else { None },
+                "diagnostics": pin.diagnostics,
+            })
+        );
+        std::process::exit(0);
+    }
+
     // `okra export-replay SESSION_ID [--cwd DIR] [--sessions DIR] -o OUT.html`:
     // render a kernel session log as a standalone mobile-friendly HTML replay
     if argv.first().map(String::as_str) == Some("export-replay") {
