@@ -77,8 +77,20 @@ M5  differentiators ◐ (subagent kernel isolation)
 M6  scale                      ◐ i18n slice: daemon-side en-US/zh-CN catalog
                                   domain (locale negotiation, fallback chain,
                                   interpolation; the UI catalog stays in the
-                                  reused TS UI)
+                                  reused TS UI); Windows bring-up armed —
+                                  `.github/workflows/windows.yml` +
+                                  `docs/m6-windows-port.md` inventory (runner
+                                  itself is a user decision)
 ```
+
+
+## G3 dogfooding week — started 2026-09-28
+
+Day 1: the harness (`scripts/dogfood-log.sh` + `docs/dogfood/day-01-2026-09-28.md`)
+was produced BY okra — `--provider openai` (glm-5.3-flash) driving
+write_file/list_dir/read_file through the real pipeline. Run 1 cancelled
+honestly on a gateway timeout; run 2 completed (16 steps, 15k tokens).
+Findings live in `docs/dogfood/`; week complete = 7 day entries.
 
 ## Real-Zed ACP drive (2026-09-27)
 

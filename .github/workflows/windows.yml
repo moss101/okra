@@ -1,0 +1,33 @@
+# M6 Windows bring-up CI (MASTER-PLAN §4 M6). Inactive until the repo has a
+# GitHub remote (none today — okra is a local workspace); the file is ready
+# so the port starts the moment a runner exists. Scope: compile + unit tests
+# first (crashes/concurrency/path semantics), integration tests gated behind
+# them passing; the nono sandbox and PTY domains are expected to need
+# per-platform shims (see docs/m6-windows-port.md).
+name: windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (workspace, no default-runners surprise)
+        run: cargo build --workspace
+      - name: Unit + convergence tests
+        run: cargo test --workspace --lib
+      - name: Integration tests (expected red on first bring-up; triage per docs/m6-windows-port.md)
+        run: cargo test --workspace
+        continue-on-error: true
+      - name: Clippy (windows lints; path-ban lessons already in clippy.toml)
+        run: cargo clippy --workspace --all-targets
+        continue-on-error: true
