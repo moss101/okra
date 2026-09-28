@@ -141,50 +141,7 @@ fn print_help() {
 }
 
 fn build_registry(cwd: &std::path::Path) -> Registry {
-    let mut registry = Registry::new();
-    let rf = okra_tools::builtins::read_file_tool(cwd.to_path_buf());
-    let entry = rf.entry();
-    registry
-        .register(okra_tools::ErasedTool::simple(
-            entry,
-            vec![okra_tools::ResourceAccess::read_file("*")],
-            move |args| rf.execute(args, None),
-        ))
-        .expect("read_file registers once");
-    let ld = okra_tools::builtins::list_dir_tool(cwd.to_path_buf());
-    let entry = ld.entry();
-    registry
-        .register(okra_tools::ErasedTool::simple(
-            entry,
-            vec![okra_tools::ResourceAccess::tree(
-                okra_tools::FileAccessOperation::Read,
-                "*",
-            )],
-            move |args| ld.execute(args),
-        ))
-        .expect("list_dir registers once");
-    let wf = okra_tools::builtins::ErasedWriteFile::new(cwd.to_path_buf());
-    let entry = wf.entry();
-    registry
-        .register(okra_tools::ErasedTool::simple(
-            entry,
-            vec![okra_tools::ResourceAccess::write_file("*")],
-            move |args| wf.execute(args),
-        ))
-        .expect("write_file registers once");
-    let ef = okra_tools::builtins::ErasedEditFile::new(cwd.to_path_buf());
-    let entry = ef.entry();
-    registry
-        .register(okra_tools::ErasedTool::simple(
-            entry,
-            vec![okra_tools::ResourceAccess::file(
-                okra_tools::FileAccessOperation::Readwrite,
-                "*",
-            )],
-            move |args| ef.execute(args),
-        ))
-        .expect("edit_file registers once");
-    registry
+    serve::build_registry(cwd)
 }
 
 fn main() {
@@ -370,12 +327,15 @@ fn main() {
     }
 
 
-    // `okra serve --tcp ADDR --cwd DIR`: G4 multi-surface daemon
+    // `okra serve --tcp ADDR --cwd DIR [--provider openai] [--model NAME]`:
+    // G4 multi-surface daemon + the workbench web UI at GET /
     if argv.first().map(String::as_str) == Some("serve")
         && argv.iter().any(|a| a == "--tcp")
     {
         let mut tcp_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let addr = String::from("127.0.0.1:0");
+        let mut provider: Option<String> = None;
+        let mut model: Option<String> = None;
         let mut i = 1;
         while i < argv.len() {
             match argv[i].as_str() {
@@ -384,10 +344,35 @@ fn main() {
                     i += 1;
                     tcp_cwd = PathBuf::from(argv.get(i).cloned().unwrap_or_default());
                 }
+                "--provider" => {
+                    i += 1;
+                    provider = Some(argv.get(i).cloned().unwrap_or_default());
+                }
+                "--model" => {
+                    i += 1;
+                    model = Some(argv.get(i).cloned().unwrap_or_default());
+                }
                 _ => {}
             }
             i += 1;
         }
+        if let Some(p) = &provider
+            && p != "openai" {
+                eprintln!("error: unknown provider {p} (supported: openai)");
+                std::process::exit(2);
+            }
+        let model_name = model.unwrap_or_else(|| "gpt-4o-mini".to_string());
+        let (factory, label) = match &provider {
+            Some(_) => {
+                let f = serve::openai_sampler_factory(model_name.clone())
+                    .unwrap_or_else(|e| {
+                        eprintln!("error: {e}");
+                        std::process::exit(2);
+                    });
+                (f, format!("openai/{model_name}"))
+            }
+            None => (serve::demo_sampler_factory(tcp_cwd.clone()), "demo".to_string()),
+        };
         // loopback-only posture
         let host_part = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(&addr).to_string();
         if !host_part.starts_with("127.0.0.1") && !host_part.starts_with("localhost") && !host_part.starts_with("[::1]") {
@@ -399,11 +384,14 @@ fn main() {
             std::process::exit(1);
         });
         let bound = listener.local_addr().unwrap();
-        eprintln!("[serve-tcp] multi-surface daemon on {bound} (loopback only)");
+        eprintln!("[serve-tcp] multi-surface daemon on {bound} (loopback only) sampler={label}");
+        eprintln!("[serve-tcp] workbench UI: http://{bound}/");
         let sessions_dir = tcp_cwd.join(".okra-sessions");
         let state = std::sync::Arc::new(serve_tcp::TcpServeState::new(
             tcp_cwd.clone(),
             sessions_dir,
+            factory,
+            label,
         ));
         serve_tcp::serve_tcp(state, listener);
     }
@@ -667,6 +655,7 @@ fn main() {
 
     // M3 strangler: fold the session into the SQLite task/session index
     // (derived, rebuildable from the kernel log — the durable truth).
+    // Per-session replace: other sessions' indexed rows survive.
     drop(agent); // release the write handle before reopening
     {
         let db_path = sessions_root.join("index.db");
@@ -678,7 +667,7 @@ fn main() {
             )
             && let Ok(events) = reader.read_all()
         {
-            let _ = db.rebuild_from_log(&events, &session_id, &args.cwd.to_string_lossy());
+            let _ = db.replace_session(&events, &session_id, &args.cwd.to_string_lossy());
         }
     }
 

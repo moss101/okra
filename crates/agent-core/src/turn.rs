@@ -139,7 +139,9 @@ pub enum CompletedStop {
     Refusal,
 }
 
-/// `CancellationCategory` (`types.rs:437-444`).
+/// `CancellationCategory` (`types.rs:437-444`). `UserRequested` extends the
+/// donor set: an explicit stop from a surface (a stopped turn is an
+/// interrupted turn and recovers through the same repair path as G1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CancellationCategory {
@@ -147,6 +149,7 @@ pub enum CancellationCategory {
     PermissionRejected,
     PermissionCancelled,
     MidTurnAbort,
+    UserRequested,
 }
 
 #[cfg(test)]

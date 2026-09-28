@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>okra — workbench</title>
+<link rel="stylesheet" href="/app.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='2' y='2' width='28' height='28' rx='8' fill='%2310b981'/%3E%3Ccircle cx='16' cy='16' r='6' fill='%230d1117'/%3E%3C/svg%3E">
+</head>
+<body>
+<div id="app" class="app">
+
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32" width="22" height="22"><rect x="2" y="2" width="28" height="28" rx="8" class="brand-bg"/><circle cx="16" cy="16" r="6" class="brand-hole"/></svg>
+      </span>
+      <span class="brand-name">okra</span>
+      <span class="brand-version" id="brand-version"></span>
+    </div>
+
+    <button class="new-task" id="new-task" type="button" title="New task (⌘N)">
+      <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 2v12M2 8h12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      New task
+    </button>
+
+    <nav class="task-list" id="task-list" aria-label="Tasks">
+      <!-- populated by app.js -->
+    </nav>
+
+    <div class="sidebar-footer">
+      <span class="conn-dot" id="conn-dot" aria-hidden="true"></span>
+      <span class="conn-label" id="conn-label">connecting</span>
+      <span class="footer-sampler" id="footer-sampler" title="model behind this daemon"></span>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="topbar-left">
+        <span class="topbar-title" id="topbar-title">okra</span>
+        <span class="phase-chip" id="phase-chip" data-phase="idle" hidden>
+          <span class="phase-dot" aria-hidden="true"></span>
+          <span id="phase-label">idle</span>
+        </span>
+      </div>
+      <div class="topbar-right">
+        <span class="topbar-cwd" id="topbar-cwd" title=""></span>
+        <button class="icon-btn" id="theme-toggle" type="button" title="Toggle theme" aria-label="Toggle theme">
+          <svg class="icon-sun" viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><circle cx="10" cy="10" r="4" fill="currentColor"/><path d="M10 1.5v2.2M10 16.3v2.2M1.5 10h2.2M16.3 10h2.2M3.9 3.9l1.6 1.6M14.5 14.5l1.6 1.6M16.1 3.9l-1.6 1.6M5.5 14.5l-1.6 1.6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+          <svg class="icon-moon" viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><path d="M16.5 12.3A7 7 0 0 1 7.7 3.5 7 7 0 1 0 16.5 12.3Z" fill="currentColor"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <section class="transcript" id="transcript" aria-live="polite">
+      <div class="empty-state" id="empty-state">
+        <div class="empty-mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" width="44" height="44"><rect x="2" y="2" width="28" height="28" rx="8" class="brand-bg"/><circle cx="16" cy="16" r="6" class="brand-hole"/></svg>
+        </div>
+        <h1 class="empty-title">What should we work on?</h1>
+        <p class="empty-sub">Describe a task — okra reads, writes and edits files in this workspace.</p>
+        <div class="scene-chips" id="scene-chips"></div>
+      </div>
+      <div class="rows" id="rows"></div>
+    </section>
+
+    <footer class="composer-wrap">
+      <div class="steer-note" id="steer-note" hidden>
+        <span class="steer-pulse" aria-hidden="true"></span>
+        Turn in progress — sending will steer the running task.
+      </div>
+      <div class="composer" id="composer">
+        <textarea id="composer-input" rows="1" placeholder="Describe a task…"
+          aria-label="Task input"></textarea>
+        <button class="send-btn" id="send-btn" type="button" disabled title="Send (Enter)">
+          <svg class="icon-send" viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path d="M2.5 8 13 3 9.5 13 7.5 8.8 2.5 8Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+          <svg class="icon-stop" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><rect x="3" y="3" width="10" height="10" rx="2" fill="currentColor"/></svg>
+        </button>
+      </div>
+      <div class="composer-hint">
+        <span><kbd>Enter</kbd> send</span>
+        <span class="hint-sep">·</span>
+        <span><kbd>Shift</kbd>+<kbd>Enter</kbd> newline</span>
+      </div>
+    </footer>
+  </main>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -70,3 +70,48 @@ fn read_access_works_while_writer_holds_session() {
     db.rebuild_from_log(&r.read_all().unwrap(), "p2", "/tmp/proj").unwrap();
     assert!(db.list_sessions().unwrap().is_empty() || db.list_sessions().unwrap().len() == 1);
 }
+
+#[test]
+fn replace_session_preserves_other_sessions_rows() {
+    // The web surface runs MANY sessions; folding session A must never
+    // erase session B's indexed rows (the old rebuild_from_log wiped the
+    // whole table).
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path().join("sessions");
+    let mut h1 = SessionHandle::create(&root, &header("s1")).unwrap();
+    SessionHandle::create(&root, &header("s2")).unwrap();
+    h1.append(vec![kernel::make_log_only_event(
+        "turn/start",
+        json!({ "turn": 1 }),
+        kernel::wall_clock,
+    )])
+    .unwrap();
+
+    let db = ProjectionDb::open(&root.join("index.db")).unwrap();
+    let log1 = h1.read_all().unwrap();
+    db.replace_session(&log1, "s1", "/tmp/proj").unwrap();
+
+    // fold s2 as well; then re-fold s1 (the every-turn path)
+    let r2 = SessionHandle::open(&root, "s2", SessionAccess::Read).unwrap();
+    let log2 = r2.read_all().unwrap();
+    db.replace_session(&log2, "s2", "/tmp/proj").unwrap();
+    db.replace_session(&log1, "s1", "/tmp/proj").unwrap();
+
+    let sessions = db.list_sessions().unwrap();
+    let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+    assert!(ids.contains(&"s1"), "{ids:?}");
+    assert!(ids.contains(&"s2"), "s2 rows were wiped by the s1 fold: {ids:?}");
+}
+
+#[test]
+fn session_title_survives_index_updates() {
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path().join("sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    let db = ProjectionDb::open(&root.join("index.db")).unwrap();
+    db.upsert_session("t1", "/tmp", "first user text", "active", 1.0, 3)
+        .unwrap();
+    let rows = db.list_sessions().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].title, "first user text");
+}

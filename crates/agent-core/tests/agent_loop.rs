@@ -345,3 +345,56 @@ fn steering_drains_at_step_boundary() {
         .iter()
         .any(|e| matches!(e, LoopEvent::SteeringInjected { text } if text.contains("mid-turn note"))));
 }
+
+#[test]
+fn user_stop_flag_cancels_turn_at_first_boundary() {
+    let td = tempfile::tempdir().unwrap();
+    std::fs::write(td.path().join("hello.txt"), "never read").unwrap();
+
+    // The model WOULD run two steps, but the stop flag is set before the
+    // turn starts — the loop must cancel at the first boundary with
+    // Cancelled(UserRequested) and execute NO tools.
+    let steps = vec![
+        ScriptedStep {
+            text: "reading".into(),
+            tool_calls: vec![ToolCall {
+                id: "call-1".into(),
+                name: "read_file".into(),
+                args_json: r#"{"path":"hello.txt"}"#.into(),
+            }],
+            ..Default::default()
+        },
+        ScriptedStep { text: "done".into(), ..Default::default() },
+    ];
+    let mut agent = build_agent(td.path(), steps, true);
+    let stop = agent.stop_flag();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let mut events = Vec::new();
+    let outcome = agent.run_turn("read hello.txt", &mut collect(&mut events)).unwrap();
+    match &outcome {
+        TurnOutcome::Cancelled { category } => {
+            assert_eq!(*category, Some(core::turn::CancellationCategory::UserRequested));
+        }
+        other => panic!("expected Cancelled(UserRequested), got {other:?}"),
+    }
+    assert!(!events.iter().any(|e| matches!(e, LoopEvent::ToolCallStarted { .. })));
+}
+
+#[test]
+fn request_stop_from_another_flag_clone_is_observed() {
+    // The serve seam: the surface holds a clone of the flag (installed with
+    // set_stop_flag) and flips it while the turn runs on another thread.
+    let td = tempfile::tempdir().unwrap();
+    let mut agent = build_agent(td.path(), vec![
+        ScriptedStep { text: "long work".into(), ..Default::default() },
+    ], true);
+    let external = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    agent.set_stop_flag(std::sync::Arc::clone(&external));
+    external.store(true, std::sync::atomic::Ordering::Relaxed);
+    let outcome = agent.run_turn("go", &mut |_| {}).unwrap();
+    assert!(matches!(
+        outcome,
+        TurnOutcome::Cancelled { category: Some(core::turn::CancellationCategory::UserRequested) }
+    ));
+}

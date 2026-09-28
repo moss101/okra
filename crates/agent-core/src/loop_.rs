@@ -7,6 +7,7 @@
 //! aborts the process at a phase boundary for the crash-recovery harness
 //! (§3 #63).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 
@@ -357,6 +358,10 @@ pub struct Agent<S: Sampler + ?Sized> {
     steering: SteeringInbox,
     machine: TurnMachine,
     turn_counter: u64,
+    /// Set from any surface thread via [`Agent::request_stop`]; observed at
+    /// every step boundary. A stopped turn is Cancelled(UserRequested) and
+    /// recovers through the standard repair path on the next turn.
+    stop: Arc<AtomicBool>,
 }
 
 impl<S: Sampler + ?Sized> Agent<S> {
@@ -374,11 +379,30 @@ impl<S: Sampler + ?Sized> Agent<S> {
             steering: SteeringInbox::new(),
             machine: TurnMachine::new(),
             turn_counter: 0,
+            stop: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn steering_sender(&self) -> std::sync::mpsc::Sender<crate::steering::Tagged> {
         self.steering.sender()
+    }
+
+    /// Surface-facing stop: flips the flag the turn loop checks at each
+    /// step boundary (never blocks; safe from any thread).
+    pub fn request_stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// The shared stop flag, so a surface can request a stop before/while
+    /// `run_turn` owns the agent on another thread.
+    pub fn stop_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop)
+    }
+
+    /// Install an externally-held stop flag (the surface keeps a clone and
+    /// flips it while this agent is mid-turn on another thread).
+    pub fn set_stop_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.stop = flag;
     }
 
     /// Hook (#45) telemetry from the executor: (events fired, failures).
@@ -547,6 +571,12 @@ impl<S: Sampler + ?Sized> Agent<S> {
         self.steering.set_turn_running(true);
 
         let outcome = loop {
+            // ---- user stop (surface-requested) ----
+            if self.stop.load(Ordering::Relaxed) {
+                break TurnOutcome::Cancelled {
+                    category: Some(CancellationCategory::UserRequested),
+                };
+            }
             // ---- max turns (honest, reported) ----
             if max_turns.tripped(steps) {
                 break TurnOutcome::MaxTurnsReached { limit: max_turns.limit };

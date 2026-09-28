@@ -15,16 +15,92 @@
 //! disk; this projection is the live view over it.
 
 use std::io::{BufRead, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use okra_agent_core::loop_::{Agent, LoopEvent};
-use okra_agent_core::turn::TurnOutcome;
+use okra_agent_core::turn::{CancellationCategory, TurnOutcome};
 use okra_kernel as kernel;
+use okra_policy::ToolApprovalCeiling;
 use okra_policy::approval::{ApprovalPolicy, ApprovalService};
+use okra_providers::Sampler;
 use okra_tools::Registry;
 
 use crate::demo_sampler::DemoPlanner;
+
+/// Builds a fresh sampler per turn (samplers may carry per-turn state —
+/// e.g. the demo planner's step counter — so they are never shared).
+pub type SamplerFactory = Arc<dyn Fn() -> Arc<dyn Sampler> + Send + Sync>;
+
+/// The offline demo planner behind the factory seam (default when no
+/// `--provider` is given; usable with no network).
+pub fn demo_sampler_factory(cwd: PathBuf) -> SamplerFactory {
+    Arc::new(move || Arc::new(DemoPlanner::new(cwd.clone())))
+}
+
+/// The real network provider behind the factory seam (`--provider openai`).
+pub fn openai_sampler_factory(model: String) -> Result<SamplerFactory, String> {
+    // fail fast at startup when no credential is present
+    okra_providers::OpenAiProvider::from_env(model.clone())
+        .ok_or_else(|| "set OKRA_API_KEY (or OPENAI_API_KEY) to use --provider openai".to_string())?;
+    Ok(Arc::new(move || {
+        Arc::new(
+            okra_providers::OpenAiProvider::from_env(model.clone())
+                .expect("key existed at startup"),
+        )
+    }))
+}
+
+/// The serve tool plane: the same four-tool registry the CLI runs
+/// (read_file/list_dir/write_file/edit_file) — the web surface drives the
+/// real toolchain, not a read-only subset.
+pub fn build_registry(cwd: &Path) -> Registry {
+    let mut registry = Registry::new();
+    let rf = okra_tools::builtins::read_file_tool(cwd.to_path_buf());
+    let entry = rf.entry();
+    registry
+        .register(okra_tools::ErasedTool::simple(
+            entry,
+            vec![okra_tools::ResourceAccess::read_file("*")],
+            move |args| rf.execute(args, None),
+        ))
+        .expect("read_file registers once");
+    let ld = okra_tools::builtins::list_dir_tool(cwd.to_path_buf());
+    let entry = ld.entry();
+    registry
+        .register(okra_tools::ErasedTool::simple(
+            entry,
+            vec![okra_tools::ResourceAccess::tree(
+                okra_tools::FileAccessOperation::Read,
+                "*",
+            )],
+            move |args| ld.execute(args),
+        ))
+        .expect("list_dir registers once");
+    let wf = okra_tools::builtins::ErasedWriteFile::new(cwd.to_path_buf());
+    let entry = wf.entry();
+    registry
+        .register(okra_tools::ErasedTool::simple(
+            entry,
+            vec![okra_tools::ResourceAccess::write_file("*")],
+            move |args| wf.execute(args),
+        ))
+        .expect("write_file registers once");
+    let ef = okra_tools::builtins::ErasedEditFile::new(cwd.to_path_buf());
+    let entry = ef.entry();
+    registry
+        .register(okra_tools::ErasedTool::simple(
+            entry,
+            vec![okra_tools::ResourceAccess::file(
+                okra_tools::FileAccessOperation::Readwrite,
+                "*",
+            )],
+            move |args| ef.execute(args),
+        ))
+        .expect("edit_file registers once");
+    registry
+}
 
 /// One live session projection.
 pub struct SessionProjection {
@@ -34,6 +110,8 @@ pub struct SessionProjection {
     seq: u64,
     revision: u64,
     next_row_id: u64,
+    /// First user text of the session (the task title the UI shows).
+    title: Option<String>,
 }
 
 impl SessionProjection {
@@ -54,7 +132,20 @@ impl SessionProjection {
             seq: 0,
             revision: 0,
             next_row_id: 1,
+            title: None,
         }
+    }
+
+    /// The session title (first user text, truncated) — set once.
+    pub fn set_title_if_empty(&mut self, text: &str) {
+        if self.title.is_none() {
+            let t: String = text.chars().take(80).collect();
+            self.title = Some(t);
+        }
+    }
+
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
     }
 
     fn alloc_row_id(&mut self) -> u64 {
@@ -171,11 +262,13 @@ pub fn projection_notification(
     })
 }
 
-/// Run one full turn against the demo planner, streaming row updates into
-/// the projection and notifying the attached surface after each change.
-/// `steering` (G4): when present, drained at every projection update —
-/// a steered message becomes a user row on the SAME live session, from
-/// whichever surface submitted it.
+/// Run one full turn against the state's sampler factory, streaming row
+/// updates into the projection and notifying the attached surface after
+/// each change. `steering` (G4): when present, drained at every projection
+/// update — a steered message becomes a user row on the SAME live session,
+/// from whichever surface submitted it. `stop` (G4): a surface can flip
+/// this flag mid-turn; the turn cancels at the next step boundary
+/// (Cancelled(UserRequested)) and recovers through the standard path.
 #[allow(clippy::too_many_arguments)]
 pub fn run_turn_streaming(
     notify: &mut dyn FnMut(&str, serde_json::Value),
@@ -186,11 +279,14 @@ pub fn run_turn_streaming(
     input_text: String,
     turn_row_lock: Arc<Mutex<SessionProjection>>,
     steering: Option<Arc<Mutex<std::collections::VecDeque<String>>>>,
+    stop: Arc<AtomicBool>,
+    sampler_factory: &SamplerFactory,
 ) -> Result<TurnOutcome, String> {
     let steering_rx = steering;
     // 1. turnHeader (running) + userInput rows
     let (assistant_row_slot, turn_id) = {
         let mut p = turn_row_lock.lock().unwrap();
+        p.set_title_if_empty(&input_text);
         let turn_id = uuid_v4();
         let (header_id, header_row, _) = p.base_row(&turn_id);
         let header = {
@@ -222,31 +318,14 @@ pub fn run_turn_streaming(
         (Arc::new(Mutex::new(None::<u64>)), turn_id)
     };
 
-    // 2. build the agent (demo planner + read_file/list_dir through policy)
-    let mut registry = Registry::new();
-    let rf = okra_tools::builtins::read_file_tool(cwd.clone());
-    let entry = rf.entry();
-    registry
-        .register(okra_tools::ErasedTool::simple(
-            entry,
-            vec![okra_tools::ResourceAccess::read_file("*")],
-            move |args| rf.execute(args, None),
-        ))
-        .map_err(|e| format!("register read_file: {e}"))?;
-    let ld = okra_tools::builtins::list_dir_tool(cwd.clone());
-    let entry = ld.entry();
-    registry
-        .register(okra_tools::ErasedTool::simple(
-            entry,
-            vec![okra_tools::ResourceAccess::tree(
-                okra_tools::FileAccessOperation::Read,
-                "*",
-            )],
-            move |args| ld.execute(args),
-        ))
-        .map_err(|e| format!("register list_dir: {e}"))?;
-    let approvals = ApprovalService::new(ApprovalPolicy::Never);
-    let executor = okra_agent_core::loop_::PolicyToolExecutor::new(registry, approvals);
+    // 2. build the agent (full CLI tool plane + policy ceiling, sampler
+    // from the state's factory — real provider when `--provider` was given)
+    let registry = build_registry(&cwd);
+    let approvals = ApprovalService::new(ApprovalPolicy::Ask);
+    let mut executor = okra_agent_core::loop_::PolicyToolExecutor::new(registry, approvals);
+    // Serve turns are unattended web turns, same ceiling as headless CLI
+    // runs (arg-hash grants still record every approval).
+    executor.ceiling = ToolApprovalCeiling::UnattendedAllowed;
 
     let header = kernel::SessionHeader {
         version: kernel::SESSION_FORMAT_VERSION,
@@ -263,9 +342,10 @@ pub fn run_turn_streaming(
         Err(e) => return Err(format!("open kernel session: {e}")),
     };
 
-    let config = okra_agent_core::loop_::AgentConfig { max_steps: 8, unattended: true, ..Default::default() };
-    let sampler = DemoPlanner::new(cwd.clone());
-    let mut agent = Agent::new(config, Arc::new(sampler), Box::new(executor), kernel_session);
+    let config = okra_agent_core::loop_::AgentConfig { max_steps: 32, unattended: true, ..Default::default() };
+    let sampler = (sampler_factory)();
+    let mut agent = Agent::new(config, sampler, Box::new(executor), kernel_session);
+    agent.set_stop_flag(stop);
 
     // 3. drive the turn, streaming LoopEvents into rows
     let topic_for_events = topic.clone();
@@ -346,13 +426,20 @@ pub fn run_turn_streaming(
         );
     });
 
-    // 4. finalize rows + control
+    // 4. finalize rows + control (honest states: a user stop is an
+    // interrupted turn, not an error)
     {
         let mut p = turn_row_lock.lock().unwrap();
-        let assistant_state = match &outcome {
-            Ok(TurnOutcome::Completed { stop: okra_agent_core::turn::CompletedStop::MaxTokens, .. }) => "interrupted",
-            Ok(TurnOutcome::Completed { .. }) => "complete",
-            _ => "failed",
+        let (assistant_state, header_state) = match &outcome {
+            Ok(TurnOutcome::Completed { stop: okra_agent_core::turn::CompletedStop::MaxTokens, .. })
+                | Ok(TurnOutcome::Cancelled { category: Some(CancellationCategory::UserRequested) }) => {
+                    ("interrupted", "completedInterrupted")
+                }
+            Ok(TurnOutcome::Completed { .. }) => ("complete", "completedSuccess"),
+            Ok(TurnOutcome::Cancelled { .. }) | Err(_) => ("failed", "failed"),
+            Ok(TurnOutcome::MaxTurnsReached { .. }) | Ok(TurnOutcome::StationarityEnded) => {
+                ("interrupted", "completedInterrupted")
+            }
         };
         if let Some(row_id) = *assistant_slot.lock().unwrap()
             && let Some(row) = p.rows.iter_mut().find(|r| r["rowId"].as_u64() == Some(row_id)) {
@@ -362,18 +449,17 @@ pub fn run_turn_streaming(
         if let Some(row) = p.rows.iter_mut().find(|r| {
             r["kind"] == "turnHeader" && r["state"] == "running"
         }) {
-            row["state"] = serde_json::json!(match &outcome {
-                Ok(TurnOutcome::Completed { .. }) => "completedSuccess",
-                Ok(TurnOutcome::StationarityEnded) => "completedInterrupted",
-                _ => "failed",
-            });
+            row["state"] = serde_json::json!(header_state);
             row["endedAt"] = serde_json::json!(now_ms());
         }
         let (phase, ended) = match &outcome {
-            Ok(TurnOutcome::Completed { .. }) | Ok(TurnOutcome::StationarityEnded) => {
-                ("completedSuccess", true)
-            }
-            Ok(TurnOutcome::MaxTurnsReached { .. }) => ("completedInterrupted", true),
+            Ok(TurnOutcome::Completed { stop: okra_agent_core::turn::CompletedStop::MaxTokens, .. })
+                | Ok(TurnOutcome::MaxTurnsReached { .. })
+                | Ok(TurnOutcome::StationarityEnded)
+                | Ok(TurnOutcome::Cancelled { category: Some(CancellationCategory::UserRequested) }) => {
+                    ("completedInterrupted", true)
+                }
+            Ok(TurnOutcome::Completed { .. }) => ("completedSuccess", true),
             _ => ("error", false),
         };
         p.control["phase"] = serde_json::json!(phase);
@@ -386,7 +472,253 @@ pub fn run_turn_streaming(
             projection_notification(&topic, &p)["params"].clone(),
         );
     }
+
+    // 5. M3 strangler: fold this session into the SQLite task/session index.
+    // Per-session replace — other sessions' indexed rows survive.
+    {
+        let title = turn_row_lock
+            .lock()
+            .ok()
+            .and_then(|p| p.title().map(str::to_string));
+        if let Ok(db) = kernel::ProjectionDb::open(&sessions_dir.join("index.db"))
+            && let Ok(reader) = kernel::SessionHandle::open(
+                &sessions_dir,
+                &format!("session-{session_id}"),
+                kernel::SessionAccess::Read,
+            )
+            && let Ok(events) = reader.read_all()
+        {
+            let workspace = cwd.to_string_lossy().into_owned();
+            let _ = db.replace_session(&events, &session_id, &workspace);
+            if let Some(t) = title {
+                let created = events.first().map(|e| e.time).unwrap_or_else(now_ms);
+                let _ = db.upsert_session(
+                    &session_id,
+                    &workspace,
+                    &t,
+                    "active",
+                    created,
+                    events.len() as u64,
+                );
+            }
+        }
+    }
     outcome
+}
+
+/// Fold the kernel log of one (non-live) session into projection rows the
+/// UI can render — the replay path that makes sessions survive page
+/// reloads and daemon restarts. Event vocabulary (loop_.rs): turn/start,
+/// user/message, assistant/message, tool/call, tool/result, turn/end.
+/// Tool outputs are NOT reconstructed: `tool/result` events log callId +
+/// error flag only (the content stays in the model-visible log contract),
+/// so replayed tool cards show status without body.
+pub fn rows_from_kernel_events(
+    events: &[kernel::SessionEvent],
+) -> Result<(Vec<serde_json::Value>, serde_json::Value), String> {
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    let mut next_row_id: u64 = 1;
+    // kernel turn number -> open turnHeader rowId
+    let mut header_by_turn: std::collections::HashMap<u64, u64> = Default::default();
+    // last seen turn/start number (rows carry it as their turnId)
+    let mut current_turn: u64 = 0;
+    // tool callId -> toolCall rowId
+    let mut tool_row_by_call: std::collections::HashMap<String, u64> = Default::default();
+
+    let header_state_of = |kind: &str| match kind {
+        "completed" => "completedSuccess",
+        "cancelled" | "max_turns" | "stationarity" => "completedInterrupted",
+        _ => "failed",
+    };
+
+    for ev in events {
+        let data = &ev.data;
+        match ev.event_type.as_str() {
+            "turn/start" => {
+                let turn = data["turn"].as_u64().unwrap_or(0);
+                current_turn = turn;
+                let row_id = next_row_id;
+                next_row_id += 1;
+                rows.push(serde_json::json!({
+                    "rowId": row_id,
+                    "turnId": format!("t{turn}"),
+                    "createdAt": ev.time,
+                    "createdAtSeq": ev.seq,
+                    "kind": "turnHeader",
+                    "origin": "userInput",
+                    "state": "running",
+                    "startedAt": ev.time,
+                }));
+                header_by_turn.insert(turn, row_id);
+            }
+            "user/message" => {
+                let text = data["text"].as_str().unwrap_or_default();
+                let steered = data["origin"].as_str() == Some("steering");
+                let row_id = next_row_id;
+                next_row_id += 1;
+                rows.push(serde_json::json!({
+                    "rowId": row_id,
+                    "turnId": format!("t{current_turn}"),
+                    "createdAt": ev.time,
+                    "createdAtSeq": ev.seq,
+                    "kind": "userInput",
+                    "text": if steered { format!("[steered] {text}") } else { text.to_string() },
+                    "origin": "realUser",
+                }));
+            }
+            "assistant/message" => {
+                let row_id = next_row_id;
+                next_row_id += 1;
+                rows.push(serde_json::json!({
+                    "rowId": row_id,
+                    "turnId": format!("t{current_turn}"),
+                    "createdAt": ev.time,
+                    "createdAtSeq": ev.seq,
+                    "kind": "assistantText",
+                    "text": data["text"].as_str().unwrap_or_default(),
+                    "state": "complete",
+                }));
+            }
+            "tool/call" => {
+                let call_id = data["callId"].as_str().unwrap_or_default().to_string();
+                let row_id = next_row_id;
+                next_row_id += 1;
+                rows.push(serde_json::json!({
+                    "rowId": row_id,
+                    "turnId": format!("t{current_turn}"),
+                    "createdAt": ev.time,
+                    "createdAtSeq": ev.seq,
+                    "kind": "toolCall",
+                    "toolCallId": call_id,
+                    "toolName": data["tool"].as_str().unwrap_or_default(),
+                    "status": "success",
+                    "inputText": "",
+                    "startedAt": ev.time,
+                    "endedAt": ev.time,
+                }));
+                tool_row_by_call.insert(call_id, row_id);
+            }
+            "tool/result" => {
+                let call_id = data["callId"].as_str().unwrap_or_default();
+                if let Some(row_id) = tool_row_by_call.get(call_id)
+                    && let Some(row) = rows.iter_mut().find(|r| r["rowId"].as_u64() == Some(*row_id))
+                    && data["isError"] == serde_json::Value::Bool(true)
+                {
+                    row["status"] = serde_json::json!("error");
+                    row["error"] = serde_json::json!({"code": "tool_failed", "message": "tool result logged as error"});
+                }
+            }
+            "turn/end" => {
+                let turn = data["turn"].as_u64().unwrap_or(0);
+                let kind = data["kind"].as_str().unwrap_or_default().to_string();
+                if let Some(row_id) = header_by_turn.get(&turn)
+                    && let Some(row) = rows.iter_mut().find(|r| r["rowId"].as_u64() == Some(*row_id))
+                {
+                    row["state"] = serde_json::json!(header_state_of(&kind));
+                    row["endedAt"] = serde_json::json!(ev.time);
+                }
+            }
+            other => {
+                // vocabulary-growth rule: unknown events are skippable only
+                // when marked ignorable; otherwise refuse the replay
+                if ev.ignorable != Some(true) {
+                    return Err(format!(
+                        "cannot replay: unrecognized non-ignorable event `{other}` at seq {}",
+                        ev.seq
+                    ));
+                }
+            }
+        }
+    }
+
+    let control = serde_json::json!({
+        "phase": "replayed",
+        "sessionEnded": true,
+        "canStop": false,
+        "stopState": "idle",
+        "stopTargetKind": "unknown",
+        "activeWorks": [],
+        "lastError": null,
+        "apiRetry": null,
+    });
+    Ok((rows, control))
+}
+
+/// First user text of a session log (the UI title).
+pub fn session_title_from_log(sessions_dir: &Path, session_id: &str) -> Option<String> {
+    let reader = kernel::SessionHandle::open(
+        sessions_dir,
+        &format!("session-{session_id}"),
+        kernel::SessionAccess::Read,
+    )
+    .ok()?;
+    let events = reader.read_all().ok()?;
+    events
+        .iter()
+        .find(|e| e.event_type == "user/message" && e.data["origin"].as_str() != Some("steering"))
+        .map(|e| {
+            e.data["text"]
+                .as_str()
+                .unwrap_or_default()
+                .chars()
+                .take(80)
+                .collect::<String>()
+        })
+}
+
+/// Read one session's durable log (the replay source of truth).
+pub fn session_events(
+    sessions_dir: &Path,
+    kernel_name: &str,
+) -> Result<Vec<kernel::SessionEvent>, String> {
+    let reader = kernel::SessionHandle::open(sessions_dir, kernel_name, kernel::SessionAccess::Read)
+        .map_err(|e| e.to_string())?;
+    reader.read_all().map_err(|e| e.to_string())
+}
+
+/// GET /api/sessions: the index (SQLite projection) merged with live
+/// in-memory sessions that have no indexed row yet.
+pub fn list_session_summaries(
+    sessions_dir: &Path,
+    live: &std::collections::BTreeMap<String, Arc<Mutex<SessionProjection>>>,
+) -> Vec<serde_json::Value> {
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = Default::default();
+    if let Ok(db) = kernel::ProjectionDb::open(&sessions_dir.join("index.db"))
+        && let Ok(rows) = db.list_sessions()
+    {
+        for r in rows {
+            seen.insert(r.id.clone());
+            out.push(serde_json::json!({
+                "id": r.id,
+                "title": if r.title.is_empty() {
+                    session_title_from_log(sessions_dir, &r.id).unwrap_or_default()
+                } else {
+                    r.title
+                },
+                "status": r.status,
+                "eventCount": r.event_count,
+                "workspace": r.workspace,
+                "live": false,
+            }));
+        }
+    }
+    for (id, proj) in live {
+        if seen.contains(id) {
+            continue;
+        }
+        let p = proj.lock().unwrap();
+        out.push(serde_json::json!({
+            "id": id,
+            "title": p.title().unwrap_or(id),
+            "status": p.control["phase"].as_str().unwrap_or("unknown"),
+            "eventCount": p.rows.len(),
+            "workspace": "",
+            "live": true,
+        }));
+    }
+    // newest first by id is meaningless; keep insertion order (index order)
+    out
 }
 
 /// `okra serve --stdio --cwd <dir>`: JSON-RPC loop over stdin/stdout.
@@ -514,6 +846,8 @@ pub fn serve_stdio(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) ->
                             outbound.notification(m, p)
                         };
                         let err_topic = topic.clone();
+                        let factory = demo_sampler_factory(cwd.clone());
+                        let stop = Arc::new(AtomicBool::new(false));
                         if let Err(e) = run_turn_streaming(
                             &mut notify,
                             topic,
@@ -523,6 +857,8 @@ pub fn serve_stdio(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) ->
                             text,
                             projection,
                             None,
+                            stop,
+                            &factory,
                         ) {
                             outbound.notification(
                                 "v4/error",
@@ -531,13 +867,16 @@ pub fn serve_stdio(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) ->
                         }
                     }
                     "stop" => {
-                        // G0: turns are short demo turns; stop is accepted as a no-op
+                        // stdio bridge turns run synchronously on this loop,
+                        // so a stop can only ever arrive while idle — accept
+                        // it honestly (no live turn to cancel)
                         outbound.result(
                             id,
                             serde_json::json!({
                                 "commandId": command_id,
                                 "status": "accepted",
                                 "revisionAtDecision": 0,
+                                "result": { "type": "stopIdle" },
                             }),
                         );
                     }

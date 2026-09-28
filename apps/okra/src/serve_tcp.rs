@@ -7,11 +7,13 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::serve::{starter_scene_catalog, run_turn_streaming, uuid_v4, SessionProjection};
+use crate::serve::{
+    self, starter_scene_catalog, run_turn_streaming, uuid_v4, SamplerFactory, SessionProjection,
+};
 
 pub struct SurfaceWriter {
     inner: Arc<Mutex<TcpStream>>,
@@ -57,11 +59,24 @@ pub struct TcpServeState {
     /// of spawning a second parallel turn thread on the same projection
     /// (two writers raced rows/revision and interleaved control frames).
     pub running_turns: Mutex<std::collections::BTreeSet<String>>,
+    /// Live stop flags keyed by session: the `stop` command flips the flag
+    /// the turn thread installed; cancelled at the next step boundary.
+    pub stop_flags: Mutex<BTreeMap<String, Arc<AtomicBool>>>,
+    /// Per-turn sampler source (`--provider openai` → real network model;
+    /// default → offline demo planner).
+    pub sampler_factory: SamplerFactory,
+    /// Human-readable sampler label for /health and the workbench top bar.
+    pub sampler_label: String,
     next_static: std::sync::atomic::AtomicU64,
 }
 
 impl TcpServeState {
-    pub fn new(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) -> Self {
+    pub fn new(
+        cwd: std::path::PathBuf,
+        sessions_dir: std::path::PathBuf,
+        sampler_factory: SamplerFactory,
+        sampler_label: String,
+    ) -> Self {
         let home = okra_host::fsutil::home_dir().unwrap_or_else(|| cwd.clone());
         let config = okra_host::client_info::client_config(
             &home,
@@ -92,6 +107,9 @@ impl TcpServeState {
             surfaces: Mutex::new(okra_host::surfaces::SurfaceRegistry::new()),
             bus: Mutex::new(okra_host::broadcast::BroadcastBus::new(256)),
             running_turns: Mutex::new(std::collections::BTreeSet::new()),
+            stop_flags: Mutex::new(BTreeMap::new()),
+            sampler_factory,
+            sampler_label,
             next_static: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -389,18 +407,84 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
         return Ok(());
     }
 
-    if method == "GET" && (path == "/" || path == "/index.html") {
-        let page = browser_demo_page();
-        let body = page.as_bytes();
-        let head = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        let mut w = stream;
-        w.write_all(head.as_bytes())?;
-        w.write_all(body)?;
-        w.flush()?;
-        return Ok(());
+    if method == "GET" {
+        // static workbench assets (embedded; the daemon stays
+        // dependency-free — no build step, no node_modules)
+        match path.as_str() {
+            "/" | "/index.html" => {
+                return write_http_content(
+                    stream,
+                    200,
+                    "OK",
+                    "text/html; charset=utf-8",
+                    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../ui/index.html")),
+                );
+            }
+            "/app.css" => {
+                return write_http_content(
+                    stream,
+                    200,
+                    "OK",
+                    "text/css; charset=utf-8",
+                    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../ui/app.css")),
+                );
+            }
+            "/app.js" => {
+                return write_http_content(
+                    stream,
+                    200,
+                    "OK",
+                    "text/javascript; charset=utf-8",
+                    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../ui/app.js")),
+                );
+            }
+            _ => {}
+        }
+
+        if path == "/api/sessions" {
+            let sessions = state.sessions.lock().unwrap();
+            let list = serve::list_session_summaries(&state.sessions_dir, &sessions);
+            drop(sessions);
+            let body = serde_json::to_vec(&serde_json::json!({ "sessions": list }))
+                .unwrap_or_default();
+            return write_http(stream, 200, "OK", &body);
+        }
+
+        if let Some(rest) = path.strip_prefix("/api/sessions/") {
+            let session_id = rest.trim_end_matches("/rows").trim_start_matches('/');
+            if session_id.is_empty() {
+                let body =
+                    serde_json::to_vec(&serde_json::json!({ "error": "session id required" }))
+                        .unwrap_or_default();
+                return write_http(stream, 400, "bad request", &body);
+            }
+            let kernel_name = format!("session-{session_id}");
+            match serve::session_events(&state.sessions_dir, &kernel_name)
+                .and_then(|events| serve::rows_from_kernel_events(&events))
+            {
+                Ok((rows, control)) => {
+                    let body = serde_json::to_vec(&serde_json::json!({
+                        "sessionId": session_id,
+                        "rows": rows,
+                        "control": control,
+                    }))
+                    .unwrap_or_default();
+                    return write_http(stream, 200, "OK", &body);
+                }
+                Err(e) => {
+                    // unknown session → 404; a log we cannot safely
+                    // reconstruct → 422 (honest refusal, not silent data)
+                    let (status, reason) = if e.contains("not found") || e.contains("No such") {
+                        (404, "not found")
+                    } else {
+                        (422, "unreplayable")
+                    };
+                    let body =
+                        serde_json::to_vec(&serde_json::json!({ "error": e })).unwrap_or_default();
+                    return write_http(stream, status, reason, &body);
+                }
+            }
+        }
     }
 
     if method == "GET" && path == "/scenes" {
@@ -411,7 +495,14 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
     }
 
     if method == "GET" && path == "/health" {
-        let body = serde_json::to_vec(&serde_json::json!({"ok": true, "daemon": "okra"})).unwrap_or_default();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "ok": true,
+            "daemon": "okra",
+            "version": env!("CARGO_PKG_VERSION"),
+            "cwd": state.cwd.to_string_lossy(),
+            "sampler": state.sampler_label,
+        }))
+        .unwrap_or_default();
         write_http(stream, 200, "OK", &body)?;
         return Ok(());
     }
@@ -471,203 +562,21 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
     write_http(stream, 404, "not found", b"{\"error\":\"unknown path\"}")
 }
 
-/// The browser demo surface: one static page that subscribes to the SSE
-/// stream, renders every projection row, and drives turns + steering with
-/// fetch. Kept dependency-free so the daemon serves it from one string.
-/// NOTE: embedded in `r#"…"#` — the body must not contain the `"#` pair.
-fn browser_demo_page() -> String {
-    let page = r#"<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>okra surface</title>
-<style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
-  body { font-family: ui-monospace, Menlo, Consolas, monospace; background: #14161a; color: #d6dae0; margin: 0; padding: 1.1rem; max-width: 46rem; margin-inline: auto; }
-  h1 { font-size: 1.05rem; margin: 0 0 .35rem; }
-  .sub { color: #8a919c; font-size: .78rem; margin-bottom: 1rem; }
-  .dot { display: inline-block; width: .6rem; height: .6rem; border-radius: 50%; background: #b3413c; margin-right: .35rem; vertical-align: 1px; }
-  .dot.on { background: #4fae54; }
-  .panel { border: 1px solid #2a2e35; border-radius: 8px; padding: .75rem .85rem; margin-bottom: .85rem; background: #191c21; }
-  label { font-size: .7rem; color: #8a919c; display: block; margin-bottom: .25rem; text-transform: uppercase; letter-spacing: .05em; }
-  .mt { margin-top: .6rem; }
-  textarea, input[type=text] { width: 100%; background: #101216; color: #e8eaee; border: 1px solid #2a2e35; border-radius: 6px; padding: .45rem; font: inherit; }
-  button { background: #2f6feb; border: 0; color: white; border-radius: 6px; padding: .45rem .9rem; font: inherit; cursor: pointer; margin-top: .45rem; }
-  button.alt { background: #3a3f47; }
-  .chips span { display: inline-block; border: 1px solid #2a2e35; border-radius: 999px; padding: .15rem .6rem; margin: .2rem .25rem 0 0; font-size: .72rem; color: #a9b1ba; }
-  .row { border-left: 3px solid #2a2e35; padding: .35rem .6rem; margin: .4rem 0; border-radius: 4px; background: #101216; white-space: pre-wrap; word-break: break-word; font-size: .8rem; }
-  .row.userInput { border-left-color: #2f6feb; }
-  .row.assistantText { border-left-color: #4fae54; }
-  .row.toolCall { border-left-color: #b58a3c; }
-  .row.turnHeader { border-left-color: #5a616c; color: #9aa2ad; }
-  .badge { font-size: .62rem; text-transform: uppercase; letter-spacing: .05em; color: #8a919c; display: block; margin-bottom: .15rem; }
-  #steerstate { color: #8a919c; font-size: .75rem; margin-left: .5rem; }
-  .foot { color: #5a616c; font-size: .7rem; margin-top: 1.2rem; }
-</style>
-</head>
-<body>
-<h1>okra surface</h1>
-<div class="sub">
-  <span class="dot" id="conn"></span><span id="connlabel">connecting</span>
-  · <span id="daemon">daemon: ?</span>
-  · frames <span id="frames">0</span>
-  · phase <span id="phase">-</span>
-</div>
-<div class="panel">
-  <label>session</label>
-  <input type="text" id="session" value="">
-  <label class="mt">prompt</label>
-  <textarea id="prompt" rows="2" placeholder="summarize notes.md"></textarea>
-  <button id="send">send turn</button>
-  <span id="sendstate"></span>
-</div>
-<div class="panel">
-  <label>steer (queued onto the live turn; runs as its own turn when idle)</label>
-  <input type="text" id="steer" placeholder="focus on the tools section">
-  <button class="alt" id="steerbtn">steer</button>
-  <span id="steerstate"></span>
-</div>
-<div class="panel">
-  <label>starter scenes · GET /scenes</label>
-  <div class="chips" id="scenes">loading…</div>
-</div>
-<div id="transcript"></div>
-<div class="foot">GET /sse/&lt;session&gt; streams every projection frame; POST /command and POST /steer drive the same v4 seam the NDJSON and Electron surfaces use.</div>
-<script>
-'use strict';
-var sessionEl = document.getElementById('session');
-sessionEl.value = 'browser-' + Math.random().toString(36).slice(2, 6);
-var frames = 0;
-var es = null;
-
-function esc(s) {
-  return String(s).replace(/[&<>]/g, function (c) {
-    return { '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c];
-  });
-}
-function post(path, body, onreply) {
-  fetch(path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  })
-    .then(function (r) { return r.json(); })
-    .then(onreply)
-    .catch(function (e) { note('steerstate', 'error: ' + e); });
-}
-function note(id, t) { document.getElementById(id).textContent = t; }
-function resultKind(r) {
-  return r && r.result && r.result.type ? r.result.type : (r && r.status);
-}
-function send() {
-  var text = document.getElementById('prompt').value.trim();
-  if (!text) { return; }
-  post('/command', {
-    commandId: 'browser-' + Date.now(),
-    type: 'sendText',
-    sessionId: sessionEl.value,
-    payload: { text: text }
-  }, function (r) { note('sendstate', '→ ' + resultKind(r)); });
-}
-function steer() {
-  var text = document.getElementById('steer').value.trim();
-  if (!text) { return; }
-  post('/steer', { sessionId: sessionEl.value, text: text }, function (r) {
-    note('steerstate', '→ ' + (r && r.steered ? 'steered' : 'rejected'));
-  });
-}
-document.getElementById('send').addEventListener('click', send);
-document.getElementById('steerbtn').addEventListener('click', steer);
-document.getElementById('prompt').addEventListener('keydown', function (e) {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
-});
-document.getElementById('steer').addEventListener('keydown', function (e) {
-  if (e.key === 'Enter') { e.preventDefault(); steer(); }
-});
-sessionEl.addEventListener('change', function () { connect(); });
-
-fetch('/health').then(function (r) { return r.json(); }).then(function (h) {
-  document.getElementById('daemon').textContent = 'daemon: ' + h.daemon + ' (ok=' + h.ok + ')';
-});
-fetch('/scenes').then(function (r) { return r.json(); }).then(function (c) {
-  var host = document.getElementById('scenes');
-  host.textContent = '';
-  var data = (c && c.data) || [];
-  if (!data.length) { host.textContent = 'none'; return; }
-  data.forEach(function (s) {
-    var opts = [];
-    Object.keys(s.options || {}).forEach(function (k) {
-      (s.options[k].items || []).forEach(function (it) {
-        var names = it.contents || {};
-        opts.push(names.en || Object.keys(names).map(function (t) { return names[t]; })[0] || it.id);
-      });
-    });
-    var el = document.createElement('span');
-    el.textContent = s.namespace + ':' + s.scene + (opts.length ? ' [' + opts.join(' / ') + ']' : '');
-    host.appendChild(el);
-  });
-});
-
-function rowHead(r) {
-  if (r.kind === 'toolCall') { return 'tool ' + r.toolName + ' · ' + r.status; }
-  if (r.kind === 'turnHeader') { return 'turn · ' + r.state; }
-  if (r.kind === 'assistantText') { return 'assistant · ' + (r.state || ''); }
-  if (r.kind === 'userInput') { return 'user'; }
-  return r.kind;
-}
-function rowBody(r) {
-  if (r.kind === 'toolCall') {
-    var out = r.output && r.output.text ? String(r.output.text) : '';
-    if (out.length > 400) { out = out.slice(0, 400) + '…'; }
-    return out || (r.error && r.error.message) || '';
-  }
-  return r.text || '';
-}
-function render(params) {
-  var t = document.getElementById('transcript');
-  t.textContent = '';
-  (params.rows || []).forEach(function (r) {
-    var div = document.createElement('div');
-    div.className = 'row ' + r.kind;
-    var b = document.createElement('span');
-    b.className = 'badge';
-    b.textContent = rowHead(r);
-    div.appendChild(b);
-    div.appendChild(document.createTextNode(rowBody(r)));
-    t.appendChild(div);
-  });
-}
-function connect() {
-  if (es) { es.close(); }
-  es = new EventSource('/sse/' + encodeURIComponent(sessionEl.value));
-  es.onopen = function () {
-    document.getElementById('conn').className = 'dot on';
-    document.getElementById('connlabel').textContent = 'connected (sse)';
-  };
-  es.onerror = function () {
-    document.getElementById('conn').className = 'dot';
-    document.getElementById('connlabel').textContent = 'reconnecting';
-  };
-  es.onmessage = function (e) {
-    frames += 1;
-    document.getElementById('frames').textContent = String(frames);
-    var msg;
-    try { msg = JSON.parse(e.data); } catch (_) { return; }
-    if (!msg.params) { return; }
-    if (msg.params.control) {
-      document.getElementById('phase').textContent = msg.params.control.phase || '-';
-    }
-    render(msg.params);
-  };
-}
-connect();
-</script>
-</body>
-</html>
-"#;
-    page.trim_end().to_string()
+/// Static-body HTTP writer for the embedded workbench assets.
+fn write_http_content(
+    mut stream: TcpStream,
+    status: u16,
+    reason: &str,
+    content_type: &str,
+    body: &str,
+) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body.as_bytes())?;
+    stream.flush()
 }
 
 fn write_http(mut stream: TcpStream, status: u16, reason: &str, body: &[u8]) -> std::io::Result<()> {
@@ -686,6 +595,28 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
     let cmd_type = envelope["type"].as_str().unwrap_or_default().to_string();
     let session_id = envelope["sessionId"].as_str().map(str::to_string)
         .unwrap_or_else(|| format!("tcp-{}", uuid_v4()));
+
+    // ---- stop: flip the session's live stop flag (no-op when idle) ----
+    if cmd_type == "stop" {
+        let stopped = state
+            .stop_flags
+            .lock()
+            .unwrap()
+            .get(&session_id)
+            .map(|f| {
+                f.store(true, Ordering::Relaxed);
+                true
+            })
+            .unwrap_or(false);
+        eprintln!("[serve-tcp] stop: session={session_id} live={stopped}");
+        return serde_json::json!({
+            "commandId": command_id,
+            "status": "accepted",
+            "revisionAtDecision": 0,
+            "result": { "type": if stopped { "stopAccepted" } else { "stopIdle" } }
+        });
+    }
+
     let text = envelope["payload"]["text"].as_str().unwrap_or_default().to_string();
     if cmd_type != "createSession" && cmd_type != "sendText" {
         return serde_json::json!({"commandId":command_id,"status":"rejected","reasonCode":"g4.unsupported","revisionAtDecision":0});
@@ -730,12 +661,21 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
         "commandId":command_id,"status":"accepted","revisionAtDecision":0,"result":result
     });
     eprintln!("[serve-tcp] command accepted: session={session_id} cmd={command_id} type={cmd_type}");
+    // install this turn's stop flag before the thread starts so an early
+    // `stop` command can never race the flag into existence
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    state
+        .stop_flags
+        .lock()
+        .unwrap()
+        .insert(session_id.clone(), Arc::clone(&stop_flag));
     // spawn the turn: projections broadcast to ALL surfaces (NDJSON + SSE)
     let state2 = Arc::clone(state);
     let turn_session = session_id.clone();
     let turn_topic = format!("conversation/{session_id}");
     let turn_cwd = state.cwd.clone();
     let turn_sdir = state.sessions_dir.clone();
+    let factory = Arc::clone(&state.sampler_factory);
     std::thread::spawn(move || {
         let mut current_input = text;
         loop {
@@ -751,6 +691,7 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
                 &mut notify, turn_topic.clone(), turn_session.clone(),
                 turn_cwd.clone(), turn_sdir.clone(), current_input,
                 projection, Some(Arc::clone(&steer_queue)),
+                Arc::clone(&stop_flag), &factory,
             );
             let queued: Vec<String> = {
                 let mut q = steer_queue.lock().unwrap(); q.drain(..).collect()
@@ -763,6 +704,7 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
         // `[steered]` row), so no text is lost and only one turn thread per
         // session ever exists.
         state2.running_turns.lock().unwrap().remove(&turn_session);
+        state2.stop_flags.lock().unwrap().remove(&turn_session);
     });
     accepted
 }

@@ -424,49 +424,190 @@ fn g4_steer_endpoint_queues_text() {
     }
 }
 
-/// G4 breadth — the served page is a real steering surface: subscribes via
-/// EventSource, renders projections, and posts commands/steers. When node
-/// is available the inline script is also syntax-checked (the original demo
-/// page carried a SyntaxError — a newline inside a string literal — that
-/// only a real parse catches).
+/// G4 breadth — the served page is the real workbench shell: three-region
+/// layout (sidebar / transcript / composer), the design-token stylesheet,
+/// and the app script (separate files; the daemon embeds them at compile
+/// time). When node is available the script is also syntax-checked.
 #[test]
-fn g4_demo_page_is_a_steering_surface() {
+fn g4_workbench_assets_are_served() {
     let td = tempfile::tempdir().unwrap();
     let (mut daemon, addr) = spawn_daemon(td.path());
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // 1. the shell: workbench layout + the v4 seam vocabulary
         let (status, page) = http_get(&addr, "/");
         assert_eq!(status, 200);
         for marker in [
-            "EventSource(",
-            "post('/command'",
-            "post('/steer'",
-            "id=\"prompt\"",
-            "id=\"steer\"",
-            "id=\"session\"",
-            "onmessage",
-            "/scenes",
+            "id=\"app\"",
+            "id=\"task-list\"",
+            "id=\"composer-input\"",
+            "id=\"send-btn\"",
+            "/app.css",
+            "/app.js",
         ] {
             assert!(page.contains(marker), "page missing `{marker}`");
         }
 
-        // syntax-check the inline script with node, when node exists
-        let script = page
-            .split("<script>")
-            .nth(1)
-            .and_then(|s| s.split("</script>").next())
-            .expect("page has an inline script");
-        let js = tempfile::Builder::new().suffix(".js").tempfile().unwrap();
-        std::fs::write(js.path(), script).unwrap();
-        match Command::new("node").arg("--check").arg(js.path()).output() {
+        // 2. the stylesheet (paired light/dark tokens, ChatGPT2 authority)
+        let (status, css) = http_get(&addr, "/app.css");
+        assert_eq!(status, 200);
+        assert!(css.contains("data-theme=\"dark\""), "no dark theme tokens");
+        assert!(css.contains("data-theme=\"light\""), "no light theme tokens");
+        assert!(css.contains("--corner-radius-scale"), "no radius scale");
+        assert!(css.contains("cubic-bezier(0.4, 0, 0.2, 1)"), "no motion easing token");
+
+        // 3. the app script parses (strip HTTP headers before node --check)
+        let (status, js) = http_get(&addr, "/app.js");
+        assert_eq!(status, 200);
+        for marker in ["EventSource(", "/api/sessions", "'/command'", "renderMarkdown", "'stop'"] {
+            assert!(js.contains(marker), "app.js missing `{marker}`");
+        }
+        let js_body = js
+            .split_once("\n\n")
+            .map(|(_, body)| body)
+            .expect("app.js body after headers");
+        let js_file = tempfile::Builder::new().suffix(".js").tempfile().unwrap();
+        std::fs::write(js_file.path(), js_body).unwrap();
+        match Command::new("node").arg("--check").arg(js_file.path()).output() {
             Ok(out) => {
                 assert!(
                     out.status.success(),
-                    "demo page script does not parse: {}",
+                    "app.js does not parse: {}",
                     String::from_utf8_lossy(&out.stderr)
                 );
             }
             Err(_) => eprintln!("node not available; skipped script syntax check"),
         }
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// G4 breadth — the task index + replay: after a turn, GET /api/sessions
+/// lists the task (with its first user text as the title) and
+/// GET /api/sessions/<id>/rows replays the transcript from the durable
+/// kernel log. TWO sessions must BOTH survive the index fold (the old
+/// whole-table wipe erased every earlier web session).
+#[test]
+fn g4_sessions_index_and_replay() {
+    let td = tempfile::tempdir().unwrap();
+    std::fs::write(td.path().join("notes.md"), "# notes\nindex breadth\n").unwrap();
+    let (mut daemon, addr) = spawn_daemon(td.path());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for (sid, prompt) in [
+            ("idx-session-a", "summarize notes.md"),
+            ("idx-session-b", "list the workspace"),
+        ] {
+            // subscribe BEFORE the command (frames broadcast from turn start)
+            let sse_frames = std::sync::Arc::new(mutex_vec());
+            let writer = std::sync::Arc::clone(&sse_frames);
+            let a = addr.to_string();
+            let sid_owned = sid.to_string();
+            let t = std::thread::spawn(move || {
+                sse_collect(&a, &sid_owned, &writer, &|f| {
+                    f.iter().any(|f| f["params"]["control"]["phase"] == "completedSuccess")
+                })
+            });
+            std::thread::sleep(Duration::from_millis(300));
+
+            let (status, reply) = http_post_command(&addr, &serde_json::json!({
+                "commandId": format!("idx-{sid}"),
+                "type": "sendText",
+                "sessionId": sid,
+                "payload": { "text": prompt }
+            }));
+            assert_eq!(status, 200, "{reply}");
+            // wait for that session's turn to complete before the next
+            let got = wait_for(&sse_frames, &|f| {
+                f.iter().any(|f| f["params"]["control"]["phase"] == "completedSuccess")
+            });
+            assert!(got, "session {sid} never completed");
+            let _ = t.join();
+        }
+
+        // 1. the task index lists BOTH sessions with real titles
+        let (status, body) = http_get(&addr, "/api/sessions");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("idx-session-a"), "{body}");
+        assert!(body.contains("idx-session-b"), "{body}");
+        assert!(body.contains("summarize notes.md"), "title missing: {body}");
+
+        // 2. replay rebuilds rows from the kernel log
+        let (status, rows) = http_get(&addr, "/api/sessions/idx-session-a/rows");
+        assert_eq!(status, 200, "{rows}");
+        assert!(rows.contains("userInput"), "{rows}");
+        assert!(rows.contains("assistantText"), "{rows}");
+        assert!(rows.contains("turnHeader"), "{rows}");
+
+        // 3. replaying an unknown session is an honest error, not a 200
+        let (status, _) = http_get(&addr, "/api/sessions/never-existed/rows");
+        assert_eq!(status, 404);
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// G4 breadth — stop: the `stop` command flips the live turn's stop flag;
+/// the turn cancels at the next step boundary and reports an honest
+/// interrupted phase (never an error).
+#[test]
+fn g4_stop_command_cancels_a_live_turn() {
+    let td = tempfile::tempdir().unwrap();
+    std::fs::write(td.path().join("notes.md"), "# notes\nstop breadth\n").unwrap();
+    let (mut daemon, addr) = spawn_daemon_env(td.path(), &[("OKRA_DEMO_DELAY_MS", "1500")]);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let frames = std::sync::Arc::new(mutex_vec());
+        let writer_frames = std::sync::Arc::clone(&frames);
+        let addr_owned = addr.to_string();
+        let sse_thread = std::thread::spawn(move || {
+            sse_collect(&addr_owned, "stop-session", &writer_frames, &|f| {
+                f.iter().any(|f| f["params"]["control"]["phase"] == "completedInterrupted")
+            })
+        });
+        std::thread::sleep(Duration::from_millis(300));
+
+        // 1. start a slow turn
+        let (status, reply) = http_post_command(&addr, &serde_json::json!({
+            "commandId": "stop-1",
+            "type": "sendText",
+            "sessionId": "stop-session",
+            "payload": { "text": "summarize notes.md" }
+        }));
+        assert_eq!(status, 200, "{reply}");
+
+        // 2. wait until it is actually running, then stop it
+        let running = wait_for(&frames, &|f| {
+            f.iter().any(|f| f["params"]["control"]["phase"] == "running")
+        });
+        assert!(running, "turn never reported running; frames: {frames:?}");
+        let (status, reply) = http_post_command(&addr, &serde_json::json!({
+            "commandId": "stop-2",
+            "type": "stop",
+            "sessionId": "stop-session"
+        }));
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(reply["result"]["type"], "stopAccepted", "{reply}");
+
+        // 3. the turn ends interrupted — at the next step boundary
+        let stopped = wait_for(&frames, &|f| {
+            f.iter().any(|f| f["params"]["control"]["phase"] == "completedInterrupted")
+        });
+        assert!(stopped, "turn never reported interrupted; frames: {frames:?}");
+        let _ = sse_thread.join();
+
+        // 4. stopping an IDLE session is accepted as a no-op
+        let (status, reply) = http_post_command(&addr, &serde_json::json!({
+            "commandId": "stop-3",
+            "type": "stop",
+            "sessionId": "idle-session"
+        }));
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(reply["result"]["type"], "stopIdle", "{reply}");
     }));
     let _ = daemon.kill();
     let _ = daemon.wait();

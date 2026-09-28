@@ -59,13 +59,28 @@ M3  host services + alpha       ◐ strangler: SQLite session/task index
 M4  surfaces                  ◐ NDJSON two-surface + cross-surface steering,
                                   TUI render; **G4 breadth closed (2026-09-27):
                                   hands-on browser drive** — the served page
-                                  (GET /) sends a turn and steers it MID-TURN
+                                  sends a turn and steers it MID-TURN
                                   from a real browser engine over SSE
                                   (steeringQueued semantics + POST /steer; a
                                   concurrent sendText can no longer spawn a
                                   second parallel turn thread), while an
                                   NDJSON surface attached to the same daemon
                                   receives the identical projection frames.
+                                  **Workbench web shell (2026-09-28, N0008):
+                                  `okra serve --tcp` now serves a real task
+                                  workbench at `/` (ui/ — tasks sidebar,
+                                  streaming transcript with tool cards,
+                                  send/stop composer, steering, paired
+                                  light/dark design tokens), drives the REAL
+                                  pipeline (`--provider openai --model`, full
+                                  read/list/write/edit tool plane), lists
+                                  tasks from the SQLite index
+                                  (`GET /api/sessions`), replays any task
+                                  from the kernel log after reload/restart,
+                                  and cancels a live turn from the Stop
+                                  button (CancellationCategory::UserRequested
+                                  — honest interrupted phase, standard
+                                  repair path).
                                   **ACP gateway live** (`okra serve --acp`:
                                   initialize/version negotiation, session/new,
                                   session/prompt with streamed session/update,
@@ -107,6 +122,22 @@ Zed's Agent Panel rendered the user row, the read_file/list_dir tool
 cards, and the assistant markdown. Wire logs + full-turn screenshots
 captured.
 
+## Workbench web shell (2026-09-28)
+
+`okra serve --tcp` serves a real task workbench at `http://127.0.0.1:<port>/`
+(decision N0008): tasks sidebar + streaming transcript + send/stop composer,
+paired light/dark design tokens (ChatGPT2 docs/07 token architecture), tool
+cards with status/duration, steered-message chips, turn dividers, in-app
+turn-complete toasts. It drives the full pipeline — `--provider openai
+--model NAME` for a real network model, the same four-tool registry as the
+CLI — and survives reloads: tasks list from the SQLite index
+(`/api/sessions`), transcripts replay from the kernel log
+(`/api/sessions/<id>/rows`). Stop is a first-class seam
+(`CancellationCategory::UserRequested`, checked at every step boundary;
+interrupted turns recover through the standard repair path). The UI is
+embedded in the binary at compile time (`ui/`, dependency-free — no build
+step, no node_modules).
+
 ## G0 demo (2026-09-26)
 
 The ZCode Dev Electron app, launched with `ZCODE_OKRA_DAEMON=<okra binary>
@@ -143,6 +174,8 @@ crates/
   tui/         minimal scrollback writer (ratatui pager: M4)
 apps/
   okra/        headless CLI: okra --json "prompt" (NDJSON event stream)
+ui/            workbench web shell served by `okra serve --tcp` at /
+               (vanilla HTML/CSS/JS, embedded at compile time — N0008)
 ```
 
 ## Build
