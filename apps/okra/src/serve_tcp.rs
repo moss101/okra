@@ -507,6 +507,36 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
         return Ok(());
     }
 
+    // `GET /replay/<session-id>`: the M6 mobile replay artifact over the
+    // existing HTTP surface — a standalone phone-friendly transcript, no
+    // JavaScript or external assets. Loopback bind keeps it local; phone
+    // delivery needs an operator-provided tunnel (documented posture).
+    if method == "GET" && path.starts_with("/replay/") {
+        let session_id = path.trim_start_matches("/replay/").to_string();
+        if session_id.is_empty() || session_id.contains("..") || session_id.contains('/') {
+            write_http(stream, 400, "bad request", br#"{"error":"invalid session id"}"#)?;
+            return Ok(());
+        }
+        match okra_host::export_session_replay(&state.sessions_dir, &session_id) {
+            Ok(html) => {
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                    html.len()
+                );
+                let mut w = stream;
+                w.write_all(head.as_bytes())?;
+                w.write_all(html.as_bytes())?;
+                w.flush()?;
+                return Ok(());
+            }
+            Err(e) => {
+                let body = serde_json::json!({ "error": e.0 }).to_string();
+                write_http(stream, 404, "not found", body.as_bytes())?;
+                return Ok(());
+            }
+        }
+    }
+
     if method == "GET" && path.starts_with("/sse/") {
         let session_id = path.trim_start_matches("/sse/").to_string();
         // ensure steering queue exists so POST /command + v4/steer can reach it
