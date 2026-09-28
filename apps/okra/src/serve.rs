@@ -510,9 +510,9 @@ pub fn run_turn_streaming(
 /// UI can render — the replay path that makes sessions survive page
 /// reloads and daemon restarts. Event vocabulary (loop_.rs): turn/start,
 /// user/message, assistant/message, tool/call, tool/result, turn/end.
-/// Tool outputs are NOT reconstructed: `tool/result` events log callId +
-/// error flag only (the content stays in the model-visible log contract),
-/// so replayed tool cards show status without body.
+/// `tool/result` carries the full output text (loop_.rs logs it because
+/// it is model-visible); rows without it (logs from before the field
+/// landed) fall back to status-only tool cards.
 pub fn rows_from_kernel_events(
     events: &[kernel::SessionEvent],
 ) -> Result<(Vec<serde_json::Value>, serde_json::Value), String> {
@@ -602,10 +602,26 @@ pub fn rows_from_kernel_events(
                 let call_id = data["callId"].as_str().unwrap_or_default();
                 if let Some(row_id) = tool_row_by_call.get(call_id)
                     && let Some(row) = rows.iter_mut().find(|r| r["rowId"].as_u64() == Some(*row_id))
-                    && data["isError"] == serde_json::Value::Bool(true)
                 {
-                    row["status"] = serde_json::json!("error");
-                    row["error"] = serde_json::json!({"code": "tool_failed", "message": "tool result logged as error"});
+                    // latest result wins, mirroring the live path: status
+                    // and error flip per result event
+                    let is_error = data["isError"] == serde_json::Value::Bool(true);
+                    row["status"] = serde_json::json!(if is_error { "error" } else { "success" });
+                    // `output` landed after the first release (older logs
+                    // carry callId+isError only) — attach it when present
+                    if let Some(text) = data["output"].as_str() {
+                        row["output"] = serde_json::json!({ "text": text });
+                    }
+                    if is_error {
+                        let message = data["output"]
+                            .as_str()
+                            .unwrap_or("tool result logged as error");
+                        row["error"] = serde_json::json!({"code": "tool_failed", "message": message});
+                    } else {
+                        if let Some(obj) = row.as_object_mut() {
+                            obj.remove("error");
+                        }
+                    }
                 }
             }
             "turn/end" => {
@@ -950,4 +966,63 @@ pub fn starter_scene_catalog() -> okra_host::client_scenes::ClientSceneCatalog {
         updated_at: None,
     });
     catalog
+}
+
+#[cfg(test)]
+mod replay_fold_tests {
+    use super::{rows_from_kernel_events, };
+    use okra_kernel as kernel;
+
+    fn ev(seq: u64, ty: &str, data: serde_json::Value) -> kernel::SessionEvent {
+        let mut e = kernel::make_event(ty, data, || 1_789_510_400_123.0);
+        e.seq = seq;
+        e
+    }
+
+    #[test]
+    fn tool_result_output_attaches_to_its_call_row() {
+        let events = vec![
+            ev(0, "tool/call", serde_json::json!({"callId": "c1", "tool": "read_file"})),
+            ev(1, "tool/result", serde_json::json!({
+                "callId": "c1", "isError": false,
+                "output": "file contents here"
+            })),
+        ];
+        let (rows, _) = rows_from_kernel_events(&events).unwrap();
+        let row = rows.iter().find(|r| r["kind"] == "toolCall").unwrap();
+        assert_eq!(row["output"]["text"], "file contents here");
+        assert_eq!(row["status"], "success");
+    }
+
+    #[test]
+    fn tool_result_error_message_comes_from_output() {
+        let events = vec![
+            ev(0, "tool/call", serde_json::json!({"callId": "c1", "tool": "write_file"})),
+            ev(1, "tool/result", serde_json::json!({
+                "callId": "c1", "isError": true,
+                "output": "executor error: permission denied"
+            })),
+        ];
+        let (rows, _) = rows_from_kernel_events(&events).unwrap();
+        let row = rows.iter().find(|r| r["kind"] == "toolCall").unwrap();
+        assert_eq!(row["status"], "error");
+        assert_eq!(row["error"]["message"], "executor error: permission denied");
+        assert_eq!(row["output"]["text"], "executor error: permission denied");
+    }
+
+    #[test]
+    fn pre_output_logs_replay_as_status_only_cards() {
+        // a log written before `output` landed: callId + isError only
+        let events = vec![
+            ev(0, "tool/call", serde_json::json!({"callId": "old", "tool": "list_dir"})),
+            ev(1, "tool/result", serde_json::json!({"callId": "old", "isError": true})),
+            ev(2, "tool/result", serde_json::json!({"callId": "old", "isError": false})),
+        ];
+        let (rows, _) = rows_from_kernel_events(&events).unwrap();
+        let row = rows.iter().find(|r| r["kind"] == "toolCall").unwrap();
+        assert!(row.get("output").is_none(), "no invented output: {row}");
+        // last result wins: the successful one clears the error status
+        assert_eq!(row["status"], "success");
+        assert!(row.get("error").is_none());
+    }
 }

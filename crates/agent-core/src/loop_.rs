@@ -791,7 +791,11 @@ impl<S: Sampler + ?Sized> Agent<S> {
                     }));
                 }
                 // tool/result is a SURFACE event (model-visible means
-                // logged) — it carries a surfaceOp; tool/call stays log-only
+                // logged) — it carries a surfaceOp; tool/call stays log-only.
+                // The FULL output text is logged: it is model-visible content
+                // (the next request carries it), so the log is the transcript
+                // of record; the 400-char cut belongs to the live stream
+                // view, never to the durable event.
                 self.log(results.iter().map(|r| {
                     let ContentBlock::ToolResponse { result } = &r.content[0] else {
                         unreachable!("just built")
@@ -801,6 +805,7 @@ impl<S: Sampler + ?Sized> Agent<S> {
                         serde_json::json!({
                             "callId": result.call_id,
                             "isError": result.is_error,
+                            "output": result.content,
                             "origin": OriginTag::ToolContext,
                         }),
                         clock,

@@ -154,6 +154,15 @@ fn m0_gate_read_file_turn_through_daemon() {
     assert!(events_log.iter().any(|e| e.event_type == "tool/call"));
     assert!(events_log.iter().any(|e| e.event_type == "tool/result"));
 
+    // model-visible means logged: the tool OUTPUT text is in the durable
+    // event too (not just the 400-char live stream view)
+    assert!(events_log
+        .iter()
+        .any(|e| e.event_type == "tool/result"
+            && e.data["output"]
+                .as_str()
+                .is_some_and(|o| o.contains("okra reads files"))));
+
     // model-visible means logged: the assistant text is in the log
     assert!(events_log
         .iter()

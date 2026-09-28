@@ -74,11 +74,21 @@ pub fn render_rows(events: &[kernel::SessionEvent]) -> Vec<ReplayRow> {
                     body: tool.to_string(),
                 });
             }
-            "tool/result" => rows.push(ReplayRow {
-                role: "tool",
-                label: "tool result".into(),
-                body: text_of(&ev.data),
-            }),
+            "tool/result" => {
+                // real logs carry `output` (loop_.rs logs the model-visible
+                // text); the `text` fallback covers pre-field logs/fixtures
+                let body = ev
+                    .data
+                    .get("output")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| text_of(&ev.data));
+                rows.push(ReplayRow {
+                    role: "tool",
+                    label: "tool result".into(),
+                    body,
+                });
+            }
             other => rows.push(ReplayRow {
                 role: "system",
                 label: other.to_string(),
@@ -174,6 +184,27 @@ mod tests {
         assert_eq!(rows[1].body, "read_file");
         assert_eq!(rows[2].body, "file body");
         assert_eq!(rows[3].role, "assistant");
+    }
+
+    #[test]
+    fn tool_result_prefers_output_over_legacy_text() {
+        let with_output = render_rows(&[ev(
+            "tool/result",
+            serde_json::json!({"callId": "c1", "isError": false, "output": "the REAL body"}),
+        )]);
+        assert_eq!(with_output[0].body, "the REAL body");
+        // legacy `text` (pre-field logs/fixtures) still renders
+        let legacy = render_rows(&[ev(
+            "tool/result",
+            serde_json::json!({"callId": "c1", "text": "legacy body"}),
+        )]);
+        assert_eq!(legacy[0].body, "legacy body");
+        // neither → empty body, not a panic
+        let bare = render_rows(&[ev(
+            "tool/result",
+            serde_json::json!({"callId": "c1", "isError": true}),
+        )]);
+        assert_eq!(bare[0].body, "");
     }
 
     #[test]
