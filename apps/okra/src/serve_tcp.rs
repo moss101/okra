@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use okra_host::terminal::TerminalSession;
+
 use crate::serve::{
     self, starter_scene_catalog, run_turn_streaming, uuid_v4, SamplerFactory,
     SessionProjection, SurfaceApprovalChannel,
@@ -66,6 +68,10 @@ pub struct TcpServeState {
     /// Live approval bridges keyed by session: `resolveApproval` answers
     /// the ask the workbench UI is showing.
     pub approval_bridges: Mutex<BTreeMap<String, Arc<SurfaceApprovalChannel>>>,
+    /// Workbench terminals (N0012): PTY sessions keyed by id; each has an
+    /// output-pump thread appending to a bounded scrollback the SSE
+    /// endpoint streams incrementally.
+    pub terminals: Mutex<BTreeMap<String, Arc<TermEntry>>>,
     /// Per-turn sampler source (`--provider openai` → real network model;
     /// default → offline demo planner).
     pub sampler_factory: SamplerFactory,
@@ -113,6 +119,7 @@ impl TcpServeState {
             running_turns: Mutex::new(std::collections::BTreeSet::new()),
             stop_flags: Mutex::new(BTreeMap::new()),
             approval_bridges: Mutex::new(BTreeMap::new()),
+            terminals: Mutex::new(BTreeMap::new()),
             sampler_factory,
             sampler_label,
             next_static: std::sync::atomic::AtomicU64::new(0),
@@ -412,6 +419,138 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
         return Ok(());
     }
 
+    // ---- workbench terminals (N0012) ----
+    // POST /api/term/open  {program?}      -> {id}
+    // GET  /api/term                       -> {ids}
+    // GET  /api/term/<id>/sse              -> incremental output stream
+    // POST /api/term/<id>/keys  {data}     -> write as if typed
+    // POST /api/term/<id>/resize {rows,cols}
+    // POST /api/term/<id>/close
+    if method == "POST" && path == "/api/term/open" {
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body)?;
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        let program = parsed["program"].as_str().map(str::to_string);
+        return match term_open(state, program) {
+            Ok(id) => write_http(
+                stream,
+                200,
+                "OK",
+                serde_json::to_vec(&serde_json::json!({ "id": id }))
+                    .unwrap_or_default()
+                    .as_slice(),
+            ),
+            Err(e) => write_http(
+                stream,
+                500,
+                "error",
+                serde_json::to_vec(&serde_json::json!({ "error": e }))
+                    .unwrap_or_default()
+                    .as_slice(),
+            ),
+        };
+    }
+
+    if method == "GET" && path == "/api/term" {
+        let ids: Vec<String> = state.terminals.lock().unwrap().keys().cloned().collect();
+        return write_http(
+            stream,
+            200,
+            "OK",
+            serde_json::to_vec(&serde_json::json!({ "ids": ids }))
+                .unwrap_or_default()
+                .as_slice(),
+        );
+    }
+
+    if let Some(rest) = path.strip_prefix("/api/term/") {
+        let (id, action) = match rest.split_once('/') {
+            Some((id, action)) => (id.to_string(), action.to_string()),
+            None => (rest.to_string(), String::new()),
+        };
+        let entry = state.terminals.lock().unwrap().get(&id).map(Arc::clone);
+
+        if method == "GET" && action == "sse" {
+            let Some(entry) = entry else {
+                return write_http(stream, 404, "not found", b"{\"error\":\"no such terminal\"}");
+            };
+            return term_sse(stream, entry);
+        }
+
+        if method == "POST" {
+            let mut body = vec![0u8; content_length];
+            if content_length > 0 {
+                reader.read_exact(&mut body)?;
+            }
+            let parsed: serde_json::Value =
+                serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+            let Some(entry) = entry else {
+                return write_http(stream, 404, "not found", b"{\"error\":\"no such terminal\"}");
+            };
+            match action.as_str() {
+                "keys" => {
+                    let data = parsed["data"].as_str().unwrap_or_default();
+                    let n = entry
+                        .session
+                        .lock()
+                        .unwrap()
+                        .write(data.as_bytes())
+                        .map_err(|e| e.to_string());
+                    return match n {
+                        Ok(n) => write_http(
+                            stream,
+                            200,
+                            "OK",
+                            serde_json::to_vec(&serde_json::json!({ "written": n }))
+                                .unwrap_or_default()
+                                .as_slice(),
+                        ),
+                        Err(e) => write_http(
+                            stream,
+                            500,
+                            "error",
+                            serde_json::to_vec(&serde_json::json!({ "error": e }))
+                                .unwrap_or_default()
+                                .as_slice(),
+                        ),
+                    };
+                }
+                "resize" => {
+                    let rows = parsed["rows"].as_u64().unwrap_or(24) as u16;
+                    let cols = parsed["cols"].as_u64().unwrap_or(80) as u16;
+                    let r = entry
+                        .session
+                        .lock()
+                        .unwrap()
+                        .resize(okra_host::terminal::TerminalSize { rows, cols })
+                        .map_err(|e| e.to_string());
+                    let (status, body) = match r {
+                        Ok(()) => (200, serde_json::json!({ "resized": true })),
+                        Err(e) => (500, serde_json::json!({ "error": e })),
+                    };
+                    return write_http(
+                        stream,
+                        status,
+                        if status == 200 { "OK" } else { "error" },
+                        serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+                    );
+                }
+                "close" => {
+                    entry.closed.store(true, Ordering::Relaxed);
+                    state.terminals.lock().unwrap().remove(&id);
+                    return write_http(
+                        stream,
+                        200,
+                        "OK",
+                        b"{\"closed\":true}"[..].into(),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+
     if method == "GET" {
         // static workbench assets (embedded; the daemon stays
         // dependency-free — no build step, no node_modules)
@@ -497,7 +636,6 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
             };
         }
 
-        // ---- git surfaces: branch + working-tree changes + per-file diff ----
         if path == "/api/git" {
             return match serve::git_overview(&state.cwd) {
                 Ok(body) => write_http(
@@ -716,6 +854,186 @@ fn write_http(mut stream: TcpStream, status: u16, reason: &str, body: &[u8]) -> 
     stream.write_all(head.as_bytes())?;
     stream.write_all(body)?;
     stream.flush()
+}
+
+/// One workbench terminal: the PTY session (write/resize) plus the
+/// bounded scrollback its pump thread feeds.
+pub struct TermEntry {
+    pub session: Arc<Mutex<TerminalSession>>,
+    pub scroll: Arc<Mutex<TermScroll>>,
+    pub closed: Arc<AtomicBool>,
+}
+
+/// Bounded scrollback: `buf` holds the bytes from absolute offset `base`
+/// to `written`; readers that lag past `base` get a reset+snapshot.
+#[derive(Default)]
+pub struct TermScroll {
+    pub buf: Vec<u8>,
+    pub base: u64,
+    pub written: u64,
+}
+
+impl TermScroll {
+    const CAP: usize = 256 * 1024;
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+        self.written += bytes.len() as u64;
+        if self.buf.len() > Self::CAP {
+            let drop = self.buf.len() - Self::CAP;
+            self.buf.drain(..drop);
+            self.base += drop as u64;
+        }
+    }
+
+    /// New bytes since `last`, or ALL of it when the reader lagged past
+    /// the retained window (reset=true).
+    fn since(&self, last: u64) -> Result<(Vec<u8>, bool), u64> {
+        if last < self.base {
+            return Err(self.written);
+        }
+        if self.written > last {
+            let from = (last - self.base) as usize;
+            return Ok((self.buf[from..].to_vec(), false));
+        }
+        Ok((Vec::new(), false))
+    }
+}
+
+/// The terminal output stream: incremental base64 chunks from the
+/// scrollback (reset+snapshot when a reader lags past the retained
+/// window). Client disconnects are detected by the 250ms read-timeout
+/// peek, exactly like the v4 SSE surface.
+fn term_sse(
+    stream: TcpStream,
+    entry: Arc<TermEntry>,
+) -> std::io::Result<()> {
+    use base64::Engine as _;
+    let mut writer = stream.try_clone()?;
+    writer.write_all(b"HTTP/1.1 200 OK\r\n")?;
+    writer.write_all(b"Content-Type: text/event-stream\r\n")?;
+    writer.write_all(b"Cache-Control: no-cache\r\n")?;
+    writer.write_all(b"Connection: keep-alive\r\n\r\n")?;
+    writer.write_all(b": connected\n\n")?;
+    writer.flush()?;
+
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let _ = reader.get_ref().set_read_timeout(Some(Duration::from_millis(250)));
+    let mut last: u64 = 0;
+    let mut first = true;
+    let mut scratch = [0u8; 256];
+    loop {
+        // client-gone check (nonblocking peek through the timeout)
+        match reader.read(&mut scratch) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // normal idle tick — fall through to the send pass
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Ok(()),
+        }
+
+        let send = |w: &mut std::net::TcpStream, frame: serde_json::Value| -> std::io::Result<()> {
+            let mut line = b"data: ".to_vec();
+            line.extend_from_slice(serde_json::to_vec(&frame).unwrap_or_default().as_slice());
+            line.extend_from_slice(b"\n\n");
+            w.write_all(&line)?;
+            w.flush()
+        };
+
+        let snap = {
+            let scroll = entry.scroll.lock().unwrap();
+            if first || last < scroll.base {
+                // (re)start from the retained window
+                last = scroll.base;
+                Some((scroll.buf.clone(), true))
+            } else {
+                scroll.since(last).ok()
+            }
+        };
+        if let Some((bytes, reset)) = snap
+            && (!bytes.is_empty() || reset)
+        {
+                if reset && !first {
+                    send(
+                        &mut writer,
+                        serde_json::json!({ "type": "reset" }),
+                    )?;
+                }
+                first = false;
+                last += bytes.len() as u64;
+                send(
+                    &mut writer,
+                    serde_json::json!({
+                        "type": "out",
+                        "b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    }),
+                )?;
+        }
+        if entry.closed.load(Ordering::Relaxed) {
+            // one final drain, then tell the client the PTY is gone
+            std::thread::sleep(Duration::from_millis(150));
+            let tail = {
+                let scroll = entry.scroll.lock().unwrap();
+                scroll.since(last).ok()
+            };
+            if let Some((bytes, _)) = tail && !bytes.is_empty() {
+                send(
+                    &mut writer,
+                    serde_json::json!({
+                        "type": "out",
+                        "b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    }),
+                )?;
+            }
+            send(&mut writer, serde_json::json!({ "type": "exit" }))?;
+            // the stream ends client-side; the session stays open for
+            // reattach until /close prunes it
+            return Ok(());
+        }
+    }
+}
+
+/// Open a terminal in the workspace: interactive shell by default.
+fn term_open(state: &Arc<TcpServeState>, program: Option<String>) -> Result<String, String> {
+    let mut ids = state.terminals.lock().unwrap();
+    let id = format!("t{}", ids.len() + 1);
+    let shell = program.unwrap_or_else(|| {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+    });
+    let (session, mut reader) =
+        TerminalSession::spawn_split(&shell, &[], &state.cwd, Default::default())?;
+    let entry = Arc::new(TermEntry {
+        session: Arc::new(Mutex::new(session)),
+        scroll: Arc::new(Mutex::new(TermScroll::default())),
+        closed: Arc::new(AtomicBool::new(false)),
+    });
+    ids.insert(id.clone(), Arc::clone(&entry));
+    drop(ids);
+
+    // output pump: owns the split reader, feeds the scrollback
+    let scroll = Arc::clone(&entry.scroll);
+    let closed = Arc::clone(&entry.closed);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break, // EOF: child exited
+                Ok(n) => scroll.lock().unwrap().push(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+            if closed.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        closed.store(true, Ordering::Relaxed);
+    });
+    Ok(id)
 }
 
 /// Shared v4 command acceptance for both the NDJSON and HTTP surfaces.

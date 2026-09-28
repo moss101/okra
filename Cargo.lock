@@ -1397,6 +1397,7 @@ dependencies = [
 name = "okra"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "ed25519-dalek",
  "okra-agent-core",
  "okra-compaction",

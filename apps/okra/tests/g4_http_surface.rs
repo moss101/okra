@@ -118,9 +118,14 @@ fn http_post(addr: &str, path: &str, body_json: &serde_json::Value) -> (u16, ser
 
 /// Open an SSE connection and collect `data:` frames until `deadline`.
 fn sse_collect(addr: &str, session: &str, frames: &Mutex<Vec<serde_json::Value>>, stop: &dyn Fn(&[serde_json::Value]) -> bool) {
+    sse_collect_path(addr, &format!("/sse/{session}"), frames, stop);
+}
+
+/// Collect `data:` frames from ANY SSE path until `stop` holds.
+fn sse_collect_path(addr: &str, sse_path: &str, frames: &Mutex<Vec<serde_json::Value>>, stop: &dyn Fn(&[serde_json::Value]) -> bool) {
     let mut stream = TcpStream::connect(addr).unwrap();
     stream.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
-    let request = format!("GET /sse/{session} HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n");
+    let request = format!("GET {sse_path} HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n");
     stream.write_all(request.as_bytes()).unwrap();
 
     // headers first
@@ -857,6 +862,105 @@ fn g4_git_surfaces_report_branch_status_and_diff() {
         if let Err(panic) = inner {
             std::panic::resume_unwind(panic);
         }
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// N0012 — workbench terminals: the PTY surface over SSE + keystroke POST.
+/// A real shell runs in a real PTY; keys typed over HTTP execute and the
+/// output streams back; resize/close work; unknown ids are 404.
+#[test]
+fn g4_terminals_run_a_real_pty_over_http() {
+    let td = tempfile::tempdir().unwrap();
+    let (mut daemon, addr) = spawn_daemon(td.path());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // 1. no terminals yet
+        let (status, body) = http_get(&addr, "/api/term");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"ids\":[]"), "{body}");
+
+        // 2. open one (interactive shell)
+        let (status, reply) = http_post(&addr, "/api/term/open", &serde_json::json!({}));
+        assert_eq!(status, 200, "{reply}");
+        let id = reply["id"].as_str().expect("terminal id").to_string();
+        assert!(!id.is_empty());
+
+        // 3. keys to unknown terminal → 404
+        let (status, _) = http_post(
+            &addr,
+            "/api/term/nope/keys",
+            &serde_json::json!({ "data": "x" }),
+        );
+        assert_eq!(status, 404);
+
+        // 4. subscribe to the output stream, then type a command
+        let frames = std::sync::Arc::new(mutex_vec());
+        let writer = std::sync::Arc::clone(&frames);
+        let a = addr.to_string();
+        let path = format!("/api/term/{id}/sse");
+        let t = std::thread::spawn(move || sse_collect_path(&a, &path, &writer, &|f| {
+            f.iter().any(|f| {
+                f["type"] == "out"
+                    && f["b64"].as_str().map(|b| {
+                        use base64::Engine as _;
+                        String::from_utf8_lossy(
+                            &base64::engine::general_purpose::STANDARD
+                                .decode(b)
+                                .unwrap_or_default(),
+                        )
+                        .contains("okra-term-marker")
+                    })
+                    .unwrap_or(false)
+            })
+        }));
+        std::thread::sleep(Duration::from_millis(300));
+        let (status, reply) = http_post(
+            &addr,
+            &format!("/api/term/{id}/keys"),
+            &serde_json::json!({ "data": "echo okra-term-marker\r" }),
+        );
+        assert_eq!(status, 200, "{reply}");
+
+        // 5. the marker echoes back through the PTY
+        let got = wait_for(&frames, &|f| {
+            f.iter().any(|f| {
+                f["type"] == "out"
+                    && f["b64"].as_str().map(|b| {
+                        use base64::Engine as _;
+                        String::from_utf8_lossy(
+                            &base64::engine::general_purpose::STANDARD
+                                .decode(b)
+                                .unwrap_or_default(),
+                        )
+                        .contains("okra-term-marker")
+                    })
+                    .unwrap_or(false)
+            })
+        });
+        assert!(got, "PTY output never streamed the marker; frames: {frames:?}");
+        let _ = t.join();
+
+        // 6. resize is accepted
+        let (status, reply) = http_post(
+            &addr,
+            &format!("/api/term/{id}/resize"),
+            &serde_json::json!({ "rows": 30, "cols": 100 }),
+        );
+        assert_eq!(status, 200, "{reply}");
+
+        // 7. the shell banner/prompt streamed BEFORE any keys (real PTY)
+        let any_output = frames.lock().unwrap().iter().any(|f| f["type"] == "out");
+        assert!(any_output, "no output streamed at all");
+
+        // 8. close
+        let (status, body) = http_post(&addr, &format!("/api/term/{id}/close"), &serde_json::json!({}));
+        assert_eq!(status, 200, "{body}");
+        let (status, body) = http_get(&addr, "/api/term");
+        assert!(body.contains("\"ids\":[]"), "terminal not pruned: {body}");
     }));
     let _ = daemon.kill();
     let _ = daemon.wait();

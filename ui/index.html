@@ -78,6 +78,20 @@
       <div class="rows" id="rows"></div>
     </section>
 
+    <section class="term-pane collapsed" id="term-pane">
+      <header class="term-head">
+        <button class="term-toggle" id="term-toggle" type="button" title="Toggle terminal">
+          <svg viewBox="0 0 12 12" width="10" height="10" class="twisty" aria-hidden="true"><path d="M4 2l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          Terminal
+        </button>
+        <span class="term-tab" id="term-id"></span>
+        <span class="term-hint">click the pane, then type · ⌃C works</span>
+        <button class="icon-btn" id="term-clear" type="button" title="Clear scrollback">clear</button>
+        <button class="icon-btn" id="term-new" type="button" title="New terminal">＋</button>
+      </header>
+      <pre class="term-screen" id="term-screen" tabindex="0" spellcheck="false"></pre>
+    </section>
+
     <footer class="composer-wrap">
       <div class="steer-note" id="steer-note" hidden>
         <span class="steer-pulse" aria-hidden="true"></span>

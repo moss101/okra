@@ -23,6 +23,7 @@ okra-host = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+base64 = "0.23"
 
 [dev-dependencies]
 sha2 = { workspace = true }

@@ -30,13 +30,16 @@ pub struct TerminalSession {
 }
 
 impl TerminalSession {
-    /// Spawn `program` attached to a fresh PTY in `cwd`.
-    pub fn spawn(
+    /// Spawn `program` attached to a fresh PTY in `cwd`. The reader is
+    /// split out (returned alongside) so an output-pump thread can own it
+    /// while the session keeps writer/resize — a blocking read never holds
+    /// the session lock.
+    pub fn spawn_split(
         program: &str,
         args: &[String],
         cwd: &std::path::Path,
         size: TerminalSize,
-    ) -> Result<TerminalSession, String> {
+    ) -> Result<(TerminalSession, Box<dyn Read + Send>), String> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -63,12 +66,27 @@ impl TerminalSession {
             .master
             .take_writer()
             .map_err(|e| format!("pty writer: {e}"))?;
-        Ok(TerminalSession {
+        let session = TerminalSession {
             writer,
-            reader,
+            reader: Box::new(std::io::empty()),
             master: pair.master,
             child: Mutex::new(child),
-        })
+        };
+        Ok((session, Box::new(reader)))
+    }
+
+    /// Spawn `program` attached to a fresh PTY in `cwd` (reader kept on
+    /// the session — `read`/`read_to_end` style callers).
+    pub fn spawn(
+        program: &str,
+        args: &[String],
+        cwd: &std::path::Path,
+        size: TerminalSize,
+    ) -> Result<TerminalSession, String> {
+        let (mut session, reader) = Self::spawn_split(program, args, cwd, size)?;
+        // original contract: the session owns its reader (read/read_to_end)
+        session.reader = reader;
+        Ok(session)
     }
 
     /// Write to the terminal's input (as if typed).

@@ -1070,6 +1070,167 @@ function loadScenes() {
   }).catch(() => { /* scenes are decorative */ });
 }
 
+/* ---------- terminal pane (plain PTY emulator) ----------
+ *
+ * Streams the daemon's PTY output over SSE and renders it with a small
+ * stateful processor: ANSI escape sequences are stripped, \r rewrites the
+ * line from its start (prompts/progress), \b steps back, \n feeds.
+ * Full emulator semantics (curses apps, alt-screen) are out of scope —
+ * this is the dogfood loop: ls, git status, cat, echo, ctrl-C.
+ */
+
+const term = {
+  open: false,          // pane expanded
+  id: null,             // active terminal id
+  es: null,             // EventSource
+  lines: [''],          // processed display lines
+  cursor: 0,            // column in the current line
+  esc: null,            // partial escape-sequence state
+  decoder: new TextDecoder(),
+  attached: false,
+};
+
+function termToggle() {
+  term.open = !term.open;
+  $('term-pane').classList.toggle('collapsed', !term.open);
+  if (term.open) {
+    termEnsure();
+    $('term-screen').focus();
+  }
+}
+
+async function termEnsure() {
+  if (term.attached && term.id) return;
+  // reattach to an existing session if the page reloaded
+  try {
+    const list = await fetch('/api/term').then((r) => r.json());
+    const id = (list.ids && list.ids[0]) || await termOpenNew();
+    termAttach(id);
+  } catch (_) { /* daemon offline */ }
+}
+
+async function termOpenNew() {
+  const r = await post('/api/term/open', {});
+  return r.id;
+}
+
+async function termNew() {
+  try {
+    const id = await termOpenNew();
+    // switch the pane to the new session (simple: reset the view)
+    if (term.es) term.es.close();
+    term.attached = false;
+    term.lines = [''];
+    term.cursor = 0;
+    term.esc = null;
+    termAttach(id);
+  } catch (e) { toast('error', 'Terminal', String(e)); }
+}
+
+function termAttach(id) {
+  term.id = id;
+  term.attached = true;
+  $('term-id').textContent = id;
+  if (term.es) term.es.close();
+  const es = new EventSource('/api/term/' + encodeURIComponent(id) + '/sse');
+  term.es = es;
+  es.onmessage = (e) => {
+    let msg;
+    try { msg = JSON.parse(e.data); } catch (_) { return; }
+    if (msg.type === 'out') {
+      const bytes = Uint8Array.from(atob(msg.b64), (c) => c.charCodeAt(0));
+      termFeed(term.decoder.decode(bytes, { stream: true }));
+    } else if (msg.type === 'reset') {
+      term.lines = [''];
+      term.cursor = 0;
+      term.esc = null;
+    } else if (msg.type === 'exit') {
+      termWrite('\n[process exited]\n');
+    }
+    termRender();
+  };
+}
+
+/* feed decoded characters through the tiny processor */
+function termFeed(text) {
+  for (const ch of text) {
+    if (term.esc !== null) {
+      // ESC [ -> params (0x30-0x3F, incl. '?' for bracketed paste) ->
+      // final byte 0x40-0x7E; any other char after ESC is a 2-char escape
+      if (term.esc === 'intro') {
+        term.esc = ch === '[' ? 'csi' : null;
+      } else if (ch >= '@' && ch <= '~') {
+        term.esc = null;
+      }
+      continue;
+    }
+    if (ch === '\x1b') { term.esc = 'intro'; continue; }
+    if (ch === '\r') { term.cursor = 0; continue; }
+    if (ch === '\n') { term.lines.push(''); term.cursor = 0; continue; }
+    if (ch === '\b') { term.cursor = Math.max(0, term.cursor - 1); continue; }
+    if (ch === '\t') {
+      const line = term.lines[term.lines.length - 1];
+      const pad = 8 - (term.cursor % 8);
+      term.lines[term.lines.length - 1] = line + ' '.repeat(pad);
+      term.cursor += pad;
+      continue;
+    }
+    const line = term.lines[term.lines.length - 1];
+    // overwrite at the cursor (\r rewrites), pad if the cursor is past the end
+    const base = line.slice(0, term.cursor);
+    const rest = line.slice(term.cursor + ch.length);
+    term.lines[term.lines.length - 1] = base + ch + rest;
+    term.cursor += ch.length;
+    // keep the display bounded
+    if (term.lines.length > 3000) {
+      term.lines.splice(0, 1000);
+    }
+  }
+}
+
+function termWrite(extra) {
+  term.lines.push(...extra.split('\n'));
+}
+
+function termRender() {
+  const screen = $('term-screen');
+  if (!term.open) return;
+  const text = term.lines.join('\n');
+  const pinned = screen.scrollHeight - screen.scrollTop - screen.clientHeight < 40;
+  screen.textContent = text;
+  if (pinned) screen.scrollTop = screen.scrollHeight;
+}
+
+function termSend(data) {
+  if (!term.id) return;
+  // keystroke ORDER matters: chain one in-flight POST at a time (parallel
+  // fetches race across connections and scramble the input)
+  term.pending = (term.pending || Promise.resolve())
+    .then(() => post('/api/term/' + encodeURIComponent(term.id) + '/keys', { data }))
+    .catch(() => { /* transient */ });
+}
+
+/* keyboard mapping: printable chars, Enter, Backspace, Tab, ^C/^D/^L, arrows */
+function termKeyHandler(e) {
+  if (!term.open || !term.id) return;
+  let data = null;
+  if (e.key === 'Enter') data = '\r';
+  else if (e.key === 'Backspace') data = '\x7f';
+  else if (e.key === 'Tab') data = '\t';
+  else if (e.key === 'ArrowUp') data = '\x1b[A';
+  else if (e.key === 'ArrowDown') data = '\x1b[B';
+  else if (e.key === 'ArrowRight') data = '\x1b[C';
+  else if (e.key === 'ArrowLeft') data = '\x1b[D';
+  else if (e.ctrlKey && e.key === 'c') data = '\x03';
+  else if (e.ctrlKey && e.key === 'd') data = '\x04';
+  else if (e.ctrlKey && e.key === 'l') data = '\x0c';
+  else if (e.key.length === 1 && !e.metaKey && !e.ctrlKey) data = e.key;
+  if (data !== null) {
+    e.preventDefault();
+    termSend(data);
+  }
+}
+
 /* ---------- wire-up ---------- */
 
 function init() {
@@ -1090,6 +1251,20 @@ function init() {
 
   $('send-btn').addEventListener('click', () => {
     if (turnActive()) stop(); else send();
+  });
+
+  $('term-toggle').addEventListener('click', termToggle);
+  $('term-new').addEventListener('click', termNew);
+  $('term-clear').addEventListener('click', () => {
+    term.lines = [''];
+    term.cursor = 0;
+    termRender();
+  });
+  const screen = $('term-screen');
+  screen.addEventListener('keydown', termKeyHandler);
+  screen.addEventListener('paste', (e) => {
+    const text = e.clipboardData && e.clipboardData.getData('text');
+    if (text) { e.preventDefault(); termSend(text); }
   });
 
   $('tab-tasks').addEventListener('click', () => switchTab('tasks'));

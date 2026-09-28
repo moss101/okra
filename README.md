@@ -175,6 +175,14 @@ anchored so content never jumps when checkpoints refine). A 2k-row
 streaming task stays bounded and smooth; verified live at 127 rows with a
 24-node window and across replay.
 
+**Terminal pane (N0012):** a collapsible PTY pane below the transcript —
+a real interactive shell in the workspace, streamed over
+`GET /api/term/<id>/sse` with keystrokes typed through
+`POST /api/term/<id>/keys` (serialized client-side; ^C, arrows and paste
+work). The renderer is a small ANSI/CSI-stripping text processor — the
+dogfood loop (ls, git status, echo, ^C), not a full curses emulator.
+Sessions persist across reloads; `/close` prunes.
+
 **Changes tab (N0010):** the third sidebar tab answers "what did the
 agent change?" — branch + working-tree status with code badges, and a
 per-file unified diff in the preview drawer (`/api/git`, `/api/git/diff`;
