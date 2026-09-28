@@ -327,6 +327,62 @@ fn main() {
     }
 
 
+    // `okra export-replay SESSION_ID [--cwd DIR] [--sessions DIR] -o OUT.html`:
+    // render a kernel session log as a standalone mobile-friendly HTML replay
+    if argv.first().map(String::as_str) == Some("export-replay") {
+        let mut cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut sessions_dir: Option<PathBuf> = None;
+        let mut out: Option<PathBuf> = None;
+        let mut session_id: Option<String> = None;
+        let mut i = 1;
+        while i < argv.len() {
+            match argv[i].as_str() {
+                "--cwd" => {
+                    i += 1;
+                    cwd = PathBuf::from(argv.get(i).cloned().unwrap_or_default());
+                }
+                "--sessions" => {
+                    i += 1;
+                    sessions_dir = Some(PathBuf::from(argv.get(i).cloned().unwrap_or_default()));
+                }
+                "-o" | "--output" => {
+                    i += 1;
+                    out = Some(PathBuf::from(argv.get(i).cloned().unwrap_or_default()));
+                }
+                other if session_id.is_none() && !other.starts_with('-') => {
+                    session_id = Some(other.to_string());
+                }
+                other => {
+                    eprintln!("error: unknown export-replay flag {other}");
+                    std::process::exit(2);
+                }
+            }
+            i += 1;
+        }
+        let Some(session_id) = session_id else {
+            eprintln!("error: usage: okra export-replay <session-id> [-o OUT.html] [--cwd DIR] [--sessions DIR]");
+            std::process::exit(2);
+        };
+        let sessions_dir =
+            sessions_dir.unwrap_or_else(|| cwd.join(".okra-sessions"));
+        let html = okra_host::export_session_replay(&sessions_dir, &session_id)
+            .unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            });
+        match out {
+            Some(path) => {
+                std::fs::write(&path, &html).unwrap_or_else(|e| {
+                    eprintln!("error: write {}: {e}", path.display());
+                    std::process::exit(1);
+                });
+                println!("wrote {} ({} bytes)", path.display(), html.len());
+            }
+            None => print!("{html}"),
+        }
+        std::process::exit(0);
+    }
+
     // `okra serve --tcp ADDR --cwd DIR [--provider openai] [--model NAME]`:
     // G4 multi-surface daemon + the workbench web UI at GET /
     if argv.first().map(String::as_str) == Some("serve")
