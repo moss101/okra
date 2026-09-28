@@ -113,6 +113,11 @@ pub struct PinProvenance {
     pub path: PathBuf,
     pub sha256: String,
     pub source: String,
+    /// None for unsigned (flat) pins; Some(true) once the embedded Ed25519
+    /// signature verified against the embedded public key.
+    pub signature_verified: Option<bool>,
+    /// Hex public key of the signer (signed envelopes only).
+    pub signer: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -171,6 +176,8 @@ fn fail_closed(path: &Path, raw: Option<&[u8]>, reason: String) -> ManagedPin {
             path: path.to_path_buf(),
             sha256,
             source: "fail-closed".into(),
+            signature_verified: None,
+            signer: None,
         }),
         diagnostics: vec![reason],
     }
@@ -181,6 +188,19 @@ fn fail_closed(path: &Path, raw: Option<&[u8]>, reason: String) -> ManagedPin {
 /// FailClosed with the file's hash recorded (so admins can see exactly
 /// which broken bytes caused the lockdown).
 pub fn load_managed_pin(path: &Path) -> ManagedPin {
+    load_managed_pin_verified(path, None)
+}
+
+/// Load with optional signer trust: when `trusted_signers` is provisioned,
+/// a SIGNED envelope whose signer is not on the list fails closed (an
+/// embedded-valid signature from an unapproved key is still a lockdown —
+/// trust is an admin decision, not a crypto outcome). Unsigned flat pins
+/// enforce as before; a signed envelope verifies its Ed25519 signature
+/// (over sha256 of the payload text) against the embedded public key.
+pub fn load_managed_pin_verified(
+    path: &Path,
+    trusted_signers: Option<&[String]>,
+) -> ManagedPin {
     let raw = match std::fs::read(path) {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -197,6 +217,79 @@ pub fn load_managed_pin(path: &Path) -> ManagedPin {
         Ok(t) => t,
         Err(_) => return fail_closed(path, Some(&raw), "pin is not valid UTF-8".into()),
     };
+    let doc: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => return fail_closed(path, Some(&raw), format!("pin is not valid JSON: {e}")),
+    };
+
+    // Signed-envelope shape: { "payload": "<policy JSON text>",
+    //                          "signer": "<64-hex pubkey>",
+    //                          "signature": "<128-hex ed25519 over sha256(payload)>" }
+    let envelope_payload = doc.get("payload").and_then(Value::as_str);
+    let envelope_signer = doc.get("signer").and_then(Value::as_str);
+    let envelope_sig = doc.get("signature").and_then(Value::as_str);
+    if let (Some(payload_text), Some(signer), Some(sig_hex)) =
+        (envelope_payload, envelope_signer, envelope_sig)
+    {
+        let mut h = Sha256::new();
+        h.update(payload_text.as_bytes());
+        let digest = h.finalize();
+
+        let pk_bytes = decode_32_hex(signer);
+        let sig_bytes = decode_64_hex(sig_hex);
+        let verified = match (pk_bytes, sig_bytes) {
+            (Some(pk), Some(sig)) => {
+                use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+                VerifyingKey::from_bytes(&pk)
+                    .and_then(|vk| vk.verify(&digest, &Signature::from_bytes(&sig)))
+                    .is_ok()
+            }
+            _ => false,
+        };
+        let file_hash = {
+            let mut h = Sha256::new();
+            h.update(&raw);
+            format!("{:x}", h.finalize())
+        };
+        if !verified {
+            return fail_closed(
+                path,
+                Some(&raw),
+                "pin signature invalid: payload does not verify against the embedded key".into(),
+            )
+            .with_file_hash(file_hash);
+        }
+        if let Some(trusted) = trusted_signers
+            && !trusted.iter().any(|t| t.eq_ignore_ascii_case(signer))
+        {
+            return fail_closed(
+                path,
+                Some(&raw),
+                format!("pin signer not trusted: {signer}"),
+            )
+            .with_file_hash(file_hash);
+        }
+        return match ManagedPolicy::from_json_str(payload_text) {
+            Ok(policy) => {
+                let source = policy.source.clone();
+                ManagedPin {
+                    state: PinState::Enforced,
+                    policy: Some(policy),
+                    provenance: Some(PinProvenance {
+                        path: path.to_path_buf(),
+                        sha256: file_hash,
+                        source,
+                        signature_verified: Some(true),
+                        signer: Some(signer.to_string()),
+                    }),
+                    diagnostics: Vec::new(),
+                }
+            }
+            Err(reason) => fail_closed(path, Some(&raw), reason),
+        };
+    }
+
+    // Unsigned flat document (the original shape).
     match ManagedPolicy::from_json_str(&text) {
         Ok(policy) => {
             let mut h = Sha256::new();
@@ -210,11 +303,42 @@ pub fn load_managed_pin(path: &Path) -> ManagedPin {
                     path: path.to_path_buf(),
                     sha256,
                     source,
+                    signature_verified: None,
+                    signer: None,
                 }),
                 diagnostics: Vec::new(),
             }
         }
         Err(reason) => fail_closed(path, Some(&raw), reason),
+    }
+}
+
+fn decode_32_hex(s: &str) -> Option<[u8; 32]> {
+    let bytes = decode_hex(s)?;
+    bytes.try_into().ok()
+}
+
+fn decode_64_hex(s: &str) -> Option<[u8; 64]> {
+    let bytes = decode_hex(s)?;
+    bytes.try_into().ok()
+}
+
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+impl ManagedPin {
+    fn with_file_hash(mut self, file_hash: String) -> Self {
+        if let Some(p) = self.provenance.as_mut() {
+            p.sha256 = file_hash;
+        }
+        self
     }
 }
 
@@ -321,6 +445,62 @@ mod tests {
         std::fs::write(&bytes, [0xff, 0xfe, 0x00]).unwrap();
         let pin = load_managed_pin(&bytes);
         assert!(matches!(pin.state, PinState::FailClosed { .. }));
+    }
+
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn signed_envelope(seed: [u8; 32], policy_json: &str) -> (String, String) {
+        let key = SigningKey::from_bytes(&seed);
+        use sha2::Digest as _;
+        let mut h = Sha256::new();
+        h.update(policy_json.as_bytes());
+        let sig = key.sign(&h.finalize());
+        let doc = serde_json::json!({
+            "payload": policy_json,
+            "signer": hex_encode(&key.verifying_key().to_bytes()),
+            "signature": hex_encode(&sig.to_bytes()),
+        });
+        (serde_json::to_string(&doc).unwrap(), hex_encode(&key.verifying_key().to_bytes()))
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn signed_envelope_verifies_and_trust_list_gates() {
+        let td = tempfile::tempdir().unwrap();
+        let policy_json = r#"{ "source": "org-it", "sandboxCeiling": "read-only" }"#;
+        let (doc, signer) = signed_envelope([7u8; 32], policy_json);
+        let path = write_pin(td.path(), &doc);
+
+        // no trust list: valid signature enforces, marked verified
+        let pin = load_managed_pin_verified(&path, None);
+        assert_eq!(pin.state, PinState::Enforced);
+        let prov = pin.provenance.unwrap();
+        assert_eq!(prov.signature_verified, Some(true));
+        assert_eq!(prov.signer.as_deref(), Some(signer.as_str()));
+
+        // tampered payload → signature invalid → fail closed
+        let tampered = doc.replace("read-only", "danger-full-access");
+        let tampered_path = td.path().join("tampered.json");
+        std::fs::write(&tampered_path, &tampered).unwrap();
+        let pin = load_managed_pin_verified(&tampered_path, None);
+        assert!(matches!(pin.state, PinState::FailClosed { .. }), "{:?}", pin.state);
+        assert!(
+            pin.diagnostics.iter().any(|d| d.contains("signature invalid")),
+            "{:?}",
+            pin.diagnostics
+        );
+
+        // trust list: signer on it → enforce; signer off it → fail closed
+        let (doc2, signer2) = signed_envelope([9u8; 32], policy_json);
+        let path3 = write_pin(td.path(), &doc2);
+        let pin = load_managed_pin_verified(&path3, Some(std::slice::from_ref(&signer2)));
+        assert_eq!(pin.state, PinState::Enforced);
+        let pin = load_managed_pin_verified(&path3, Some(&["deadbeef".to_string()]));
+        assert!(matches!(pin.state, PinState::FailClosed { .. }));
+        assert!(pin.diagnostics.iter().any(|d| d.contains("not trusted")));
     }
 
     #[test]

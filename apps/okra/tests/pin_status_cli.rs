@@ -2,6 +2,10 @@
 //! deploy → verify fingerprint → trust. All three pin states must report
 //! honestly through the real binary.
 
+// Test harness: executes the compiled binary as the system under test (the
+// no-raw-spawn ban targets production paths).
+#![allow(clippy::disallowed_methods)]
+
 use std::process::Command;
 
 fn run(bin: &str, pin: Option<&std::path::Path>) -> (String, String) {
