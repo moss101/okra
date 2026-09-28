@@ -615,3 +615,166 @@ fn g4_stop_command_cancels_a_live_turn() {
         std::panic::resume_unwind(panic);
     }
 }
+
+/// G4 breadth — approvals: the served surface ASKS for side-effecting tools
+/// (write_file) and the turn PAUSES until the workbench resolves the ask.
+/// Allow → the file is written and the audit pair replays; Deny → the tool
+/// is denied honestly and nothing is written.
+#[test]
+fn g4_approvals_pause_turn_until_resolved() {
+    let td = tempfile::tempdir().unwrap();
+    let (mut daemon, addr) = spawn_daemon(td.path());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let run_one = |session: &str, prompt: &str, allow: bool| {
+            let frames = std::sync::Arc::new(mutex_vec());
+            let writer = std::sync::Arc::clone(&frames);
+            let a = addr.to_string();
+            let sid = session.to_string();
+            let t = std::thread::spawn(move || {
+                sse_collect(&a, &sid, &writer, &|f| {
+                    f.iter().any(|f| {
+                        f["params"]["control"]["phase"] == "completedSuccess"
+                            || f["params"]["control"]["phase"] == "completedInterrupted"
+                    })
+                })
+            });
+            std::thread::sleep(Duration::from_millis(300));
+            let (status, reply) = http_post_command(&addr, &serde_json::json!({
+                "commandId": format!("apr-{session}"),
+                "type": "sendText",
+                "sessionId": session,
+                "payload": { "text": prompt }
+            }));
+            assert_eq!(status, 200, "{reply}");
+
+            // wait for the ask to reach the surface
+            let mut approval_id = String::new();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                assert!(
+                    Instant::now() < deadline,
+                    "turn never paused on an approval; frames: {frames:?}"
+                );
+                let pending = frames.lock().unwrap().iter().rev().find_map(|f| {
+                    f["params"]["control"]["awaitingApproval"]
+                        .as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|p| p["approvalId"].as_str().map(str::to_string))
+                });
+                if let Some(id) = pending {
+                    approval_id = id;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            assert!(!approval_id.is_empty());
+
+            // resolve from the "workbench"
+            let (status, reply) = http_post_command(&addr, &serde_json::json!({
+                "commandId": format!("apr-resolve-{session}"),
+                "type": "resolveApproval",
+                "sessionId": session,
+                "payload": {
+                    "approvalId": approval_id,
+                    "decision": if allow { "allow" } else { "deny" }
+                }
+            }));
+            assert_eq!(status, 200, "{reply}");
+            assert_eq!(reply["result"]["resolved"], true, "{reply}");
+
+            // the turn finishes
+            let got = wait_for(&frames, &|f| {
+                f.iter().any(|f| {
+                    f["params"]["control"]["phase"] == "completedSuccess"
+                        || f["params"]["control"]["phase"] == "completedInterrupted"
+                })
+            });
+            assert!(got, "turn never finished after the resolution");
+            let _ = t.join();
+            approval_id
+        };
+
+        // 1. ALLOW: the write lands, the audit pair replays
+        run_one("apr-allow", "create approved.md", true);
+        assert!(td.path().join("approved.md").is_file(), "approved write never landed");
+        let (status, rows) = http_get(&addr, "/api/sessions/apr-allow/rows");
+        assert_eq!(status, 200);
+        assert!(rows.contains("approval"), "no approval row in replay: {rows}");
+        assert!(rows.contains("allowed"), "approval row not marked allowed: {rows}");
+
+        // 2. DENY: honest denial, nothing written
+        run_one("apr-deny", "create denied.md", false);
+        assert!(
+            !td.path().join("denied.md").exists(),
+            "denied write must not land"
+        );
+        let (status, rows) = http_get(&addr, "/api/sessions/apr-deny/rows");
+        assert_eq!(status, 200);
+        assert!(rows.contains("denied"), "denial not in replay: {rows}");
+        assert!(
+            rows.contains("approval denied"),
+            "tool error not surfaced: {rows}"
+        );
+
+        // 3. resolving an unknown approval id is rejected, not silently ok
+        let (status, _) = http_post_command(&addr, &serde_json::json!({
+            "commandId": "apr-bogus",
+            "type": "resolveApproval",
+            "sessionId": "apr-allow",
+            "payload": { "approvalId": "apr-nope", "decision": "allow" }
+        }));
+        assert_eq!(status, 400);
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// G4 breadth — file surfaces: the workspace-confined tree + safe-read
+/// preview the Files tab renders. Dot entries never surface; `..` and
+/// escapes are refused.
+#[test]
+fn g4_files_api_lists_and_previews_safely() {
+    let td = tempfile::tempdir().unwrap();
+    std::fs::write(td.path().join("notes.md"), "# notes\nfile surfaces\n").unwrap();
+    std::fs::create_dir_all(td.path().join("sub")).unwrap();
+    std::fs::write(td.path().join("sub").join("deep.txt"), "deep content").unwrap();
+    std::fs::create_dir_all(td.path().join(".okra-sessions")).unwrap();
+    std::fs::write(td.path().join(".okra-sessions").join("index.db"), "secret").unwrap();
+    let (mut daemon, addr) = spawn_daemon(td.path());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // 1. root listing: files visible, dot entries never
+        let (status, body) = http_get(&addr, "/api/files");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("notes.md"), "{body}");
+        assert!(body.contains("sub"), "{body}");
+        assert!(!body.contains("okra-sessions"), "dot dir leaked: {body}");
+
+        // 2. nested listing
+        let (status, body) = http_get(&addr, "/api/files?path=sub");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("deep.txt"), "{body}");
+
+        // 3. preview reads the content
+        let (status, body) = http_get(&addr, "/api/file?path=notes.md");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("file surfaces"), "{body}");
+
+        // 4. traversal refused
+        let (status, _) = http_get(&addr, "/api/files?path=..");
+        assert_eq!(status, 400);
+        let (status, _) = http_get(&addr, "/api/file?path=..%2F..%2Fetc%2Fpasswd");
+        assert_ne!(status, 200, "traversal escaped the workspace");
+
+        // 5. missing file → honest 404
+        let (status, _) = http_get(&addr, "/api/file?path=nope.txt");
+        assert_eq!(status, 404);
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}

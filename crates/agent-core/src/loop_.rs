@@ -65,7 +65,10 @@ pub enum LoopEvent {
     TurnStarted { turn: u64 },
     Phase { phase: String },
     TextDelta { text: String },
-    ToolCallStarted { id: String, name: String },
+    /// Raw call arguments as sampled — surfaces use them for tool-card
+    /// context; the approval card shows the APPROVED (normalized,
+    /// post-hooks) bytes from the approval request instead.
+    ToolCallStarted { id: String, name: String, args_json: String },
     ToolCallProgress { id: String, text: String },
     ToolCallFinished { id: String, name: String, is_error: bool, output: String },
     SteeringInjected { text: String },
@@ -99,6 +102,13 @@ pub trait ToolExecutor: Send {
     fn execution_counts(&self) -> Vec<(String, u64)> {
         Vec::new()
     }
+
+    /// The approval audit pair (asked/decided) accumulated so far — the
+    /// loop drains it into the kernel log (log-only, ignorable) so
+    /// approval cards survive replay.
+    fn drain_approval_audit(&mut self) -> Vec<okra_policy::ApprovalAuditEvent> {
+        Vec::new()
+    }
 }
 
 /// Tool-plane wiring: registry dispatch + approval service + grants +
@@ -114,6 +124,9 @@ pub struct PolicyToolExecutor {
     /// Automation self-mutation guard (#40): how THIS turn was dispatched.
     /// Ordinary for interactive turns; set before running automation turns.
     pub turn_dispatch: TurnDispatch,
+    /// The audit pair (asked/decided) from every `decide`, drained by the
+    /// loop into the kernel log (log-only, ignorable).
+    approval_audit: std::sync::Arc<std::sync::Mutex<Vec<okra_policy::ApprovalAuditEvent>>>,
     executions: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
@@ -126,6 +139,7 @@ impl PolicyToolExecutor {
             lattice: PermissionLattice::new(),
             ceiling: ToolApprovalCeiling::GrantsAllowed,
             turn_dispatch: TurnDispatch::Ordinary,
+            approval_audit: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             executions: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -146,6 +160,10 @@ impl ToolExecutor for PolicyToolExecutor {
             .iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect()
+    }
+
+    fn drain_approval_audit(&mut self) -> Vec<okra_policy::ApprovalAuditEvent> {
+        std::mem::take(&mut *self.approval_audit.lock().unwrap())
     }
 
     fn execute(
@@ -221,9 +239,10 @@ impl ToolExecutor for PolicyToolExecutor {
                 // honour yolo; the arg-hash grant still records the decision
                 // so the audit trail stays complete.
             } else {
-                let (outcome, _audit) = self
+                let (outcome, audit) = self
                     .approvals
                     .decide(&call.name, &call.id, &args_json);
+                self.approval_audit.lock().unwrap().extend(audit);
                 if !outcome.grants() {
                     events(LoopEvent::ToolCallFinished {
                         id: call.id.clone(),
@@ -273,9 +292,10 @@ impl ToolExecutor for PolicyToolExecutor {
         let stream = match self.registry.dispatch(&call.name, &approved.args(), &[]) {
             Ok(stream) => stream,
             Err(okra_tools::RegistryError::HookAsk { .. }) => {
-                let (outcome, _audit) = self
+                let (outcome, audit) = self
                     .approvals
                     .decide(&call.name, &call.id, &args_json);
+                self.approval_audit.lock().unwrap().extend(audit);
                 if !outcome.grants() {
                     let reason = format!("hook asked; {}", outcome.denial_reason());
                     events(LoopEvent::ToolCallFinished {
@@ -755,7 +775,11 @@ impl<S: Sampler + ?Sized> Agent<S> {
                 for call in &calls {
                     Self::emit(
                         &mut out,
-                        LoopEvent::ToolCallStarted { id: call.id.clone(), name: call.name.clone() },
+                        LoopEvent::ToolCallStarted {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            args_json: call.args_json.clone(),
+                        },
                     );
                     self.log(vec![kernel::make_log_only_event(
                         "tool/call",
@@ -813,6 +837,37 @@ impl<S: Sampler + ?Sized> Agent<S> {
                 })
                 .collect())?;
                 fault_inject_at_boundary("tool_result_logged");
+
+                // approval audit pair → kernel log (log-only, ignorable):
+                // approval cards survive replay
+                for audit in self.executor.drain_approval_audit() {
+                    let (ty, data): (&str, serde_json::Value) = match &audit {
+                        okra_policy::ApprovalAuditEvent::Asked {
+                            id,
+                            tool_name,
+                            call_id,
+                            args_json,
+                        } => (
+                            "approval/asked",
+                            serde_json::json!({
+                                "approvalId": id,
+                                "toolName": tool_name,
+                                "callId": call_id,
+                                "args": args_json.chars().take(400).collect::<String>(),
+                            }),
+                        ),
+                        okra_policy::ApprovalAuditEvent::Decided { id, outcome } => (
+                            "approval/decided",
+                            serde_json::json!({
+                                "approvalId": id,
+                                "outcome": serde_json::to_value(outcome).unwrap_or_default(),
+                            }),
+                        ),
+                    };
+                    let mut ev = kernel::make_log_only_event(ty, data, clock);
+                    ev.ignorable = Some(true);
+                    self.log(vec![ev])?;
+                }
 
                 self.phase_transition(TurnPhase::AggregatingResults, &mut out)?;
                 history.extend(results);

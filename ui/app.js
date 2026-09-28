@@ -115,11 +115,127 @@ function fmtDuration(ms) {
 const PHASE_LABEL = {
   draft: 'ready',
   running: 'working…',
+  awaitingApproval: 'needs approval',
   completedSuccess: 'completed',
   completedInterrupted: 'interrupted',
   error: 'error',
   replayed: 'history',
 };
+
+/* ---------- files tab + preview drawer ---------- */
+
+const files = {
+  active: false,
+  dirs: {},     // relPath -> entries|null (null = not loaded)
+  open: {},     // relPath -> bool (expanded)
+  preview: null,
+};
+
+function switchTab(tab) {
+  files.active = tab === 'files';
+  $('tab-tasks').classList.toggle('active', !files.active);
+  $('tab-files').classList.toggle('active', files.active);
+  $('tab-tasks').setAttribute('aria-selected', String(!files.active));
+  $('tab-files').setAttribute('aria-selected', String(files.active));
+  $('task-list').hidden = files.active;
+  $('file-tree').hidden = !files.active;
+  if (files.active && !files.dirs['']) loadFiles('');
+}
+
+async function loadFiles(rel) {
+  try {
+    const data = await fetch('/api/files?path=' + encodeURIComponent(rel)).then((r) => r.json());
+    if (data.error) { toast('error', 'Files', data.error); return; }
+    files.dirs[rel] = data.entries || [];
+    renderFileTree();
+  } catch (_) { /* transient */ }
+}
+
+function fileIconSvg(isDir, name) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 16 16');
+  svg.setAttribute('width', '13');
+  svg.setAttribute('height', '13');
+  svg.setAttribute('class', 'f-icon');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('fill', 'none');
+  path.setAttribute('stroke', 'currentColor');
+  path.setAttribute('stroke-width', '1.4');
+  path.setAttribute('stroke-linejoin', 'round');
+  path.setAttribute('d', isDir ? 'M2 4h4l1.5 2H14v7H2V4Z'
+    : (name.endsWith('.md') ? 'M4 2h5l3 3v9H4V2Zm5 0v3h3M6 9h4M6 11h4'
+      : 'M4 2h5l3 3v9H4V2Zm5 0v3h3'));
+  svg.appendChild(path);
+  return svg;
+}
+
+function renderFileTree() {
+  const host = $('file-tree');
+  host.textContent = '';
+  const renderLevel = (rel, container) => {
+    const entries = files.dirs[rel];
+    if (!entries) {
+      container.appendChild(el('div', 'tree-empty', 'loading…'));
+      return;
+    }
+    if (!entries.length && rel === '') {
+      container.appendChild(el('div', 'tree-empty', 'No files in this workspace.'));
+      return;
+    }
+    for (const e of entries) {
+      const childRel = rel ? rel + '/' + e.name : e.name;
+      const row = el('button', 'tree-row' + (e.link ? ' link' : ''));
+      row.type = 'button';
+      if (e.dir) {
+        const tw = el('span', 'twisty');
+        tw.innerHTML = '<svg viewBox="0 0 12 12" width="11" height="11"><path d="M4 2l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+        row.appendChild(tw);
+        row.classList.toggle('open', Boolean(files.open[childRel]));
+      } else {
+        row.appendChild(el('span', 'twisty'));
+      }
+      row.appendChild(fileIconSvg(e.dir, e.name));
+      row.appendChild(el('span', 'f-name', e.name));
+      row.addEventListener('click', () => {
+        if (!e.dir) { openPreview(childRel); return; }
+        files.open[childRel] = !files.open[childRel];
+        if (files.open[childRel] && !files.dirs[childRel]) loadFiles(childRel);
+        else renderFileTree();
+      });
+      container.appendChild(row);
+      if (e.dir && files.open[childRel]) {
+        const kids = el('div', 'tree-children');
+        container.appendChild(kids);
+        if (files.dirs[childRel]) renderLevel(childRel, kids);
+        else loadFiles(childRel);
+      }
+    }
+  };
+  renderLevel('', host);
+}
+
+async function openPreview(rel) {
+  try {
+    const data = await fetch('/api/file?path=' + encodeURIComponent(rel)).then((r) => r.json());
+    if (data.error) { toast('error', 'Preview', data.error); return; }
+    files.preview = data;
+    $('preview-path').textContent = data.path;
+    $('preview-meta').textContent =
+      data.size + ' bytes' + (data.truncated ? ' · truncated to the first 256 KB' : '')
+      + (data.binary ? ' · binary content shown lossy' : '');
+    $('preview-body').textContent = data.binary
+      ? '(binary file — content not shown)'
+      : data.content;
+    $('preview-drawer').hidden = false;
+    $('preview-backdrop').hidden = false;
+  } catch (_) { /* transient */ }
+}
+
+function closePreview() {
+  files.preview = null;
+  $('preview-drawer').hidden = true;
+  $('preview-backdrop').hidden = true;
+}
 
 /* ---------- state ---------- */
 
@@ -352,6 +468,8 @@ function renderRows() {
   if (showEmpty) { host.textContent = ''; refreshComposerMode(); return; }
 
   host.textContent = '';
+  const approvalRowIds = new Set(
+    state.rows.filter((r) => r.kind === 'approval').map((r) => r.approvalId));
   for (const r of state.rows) {
     const div = el('div', 'row row-' + r.kind);
     switch (r.kind) {
@@ -384,9 +502,27 @@ function renderRows() {
         div.appendChild(renderToolCard(r));
         break;
       }
+      case 'approval': {
+        div.appendChild(renderApprovalCard(r));
+        break;
+      }
       default:
         div.textContent = JSON.stringify(r);
     }
+    host.appendChild(div);
+  }
+
+  // LIVE pending approvals: the kernel row only exists post-decision, so
+  // asks still awaiting an answer render straight from control
+  for (const a of state.control.awaitingApproval || []) {
+    if (approvalRowIds.has(a.approvalId)) continue;
+    const div = el('div', 'row row-approval');
+    div.appendChild(renderApprovalCard({
+      approvalId: a.approvalId,
+      toolName: a.toolName,
+      args: a.args,
+      state: 'pending',
+    }));
     host.appendChild(div);
   }
 
@@ -407,6 +543,19 @@ function renderToolCard(r) {
   head.appendChild(glyph);
 
   head.appendChild(el('span', 'tool-name', r.toolName || 'tool'));
+
+  // file tools carry their target — click opens the preview drawer
+  const targetPath = r.input && typeof r.input.path === 'string' ? r.input.path : null;
+  if (targetPath) {
+    const chip = el('span', 'tool-path', targetPath);
+    chip.title = 'Preview ' + targetPath;
+    chip.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openPreview(targetPath);
+    });
+    head.appendChild(chip);
+  }
+
   head.appendChild(el('span', 'tool-status ' + (r.status || ''), running ? 'running…' : (r.status || '')));
 
   const dur = running ? null : fmtDuration((r.endedAt || 0) - (r.startedAt || 0));
@@ -435,18 +584,93 @@ function renderToolCard(r) {
   return card;
 }
 
+/* ---------- approval cards ---------- */
+
+function pendingApprovalIds() {
+  return new Set((state.control.awaitingApproval || []).map((a) => a.approvalId));
+}
+
+function renderApprovalCard(r) {
+  const pending = pendingApprovalIds().has(r.approvalId) || r.state === 'pending';
+  const card = el('div', 'approval-card' + (pending ? ' pending' : ''));
+
+  const head = el('div', 'approval-head');
+  const glyph = el('span', 'approval-glyph');
+  glyph.innerHTML = '<svg viewBox="0 0 16 16" width="13" height="13"><path d="M8 5.5v3.4M8 11.2v.4M8 2.2 14.5 13H1.5L8 2.2Z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  head.appendChild(glyph);
+  head.appendChild(el('span', 'approval-title',
+    'okra wants to use ' + (r.toolName || 'a tool')));
+  card.appendChild(head);
+
+  // the approved bytes, inline (the proposed action)
+  const args = el('div', 'approval-args');
+  args.textContent = prettyArgs(r.args || r.argsJson || '');
+  card.appendChild(args);
+
+  const actions = el('div', 'approval-actions');
+  if (pending) {
+    const allow = el('button', 'approval-btn allow', 'Allow once');
+    allow.type = 'button';
+    allow.addEventListener('click', () => resolveApproval(r.approvalId, true));
+    const deny = el('button', 'approval-btn deny', 'Deny');
+    deny.type = 'button';
+    deny.addEventListener('click', () => resolveApproval(r.approvalId, false));
+    actions.appendChild(allow);
+    actions.appendChild(deny);
+  } else {
+    const st = r.state === 'allowed' ? 'allowed'
+      : r.state === 'cancelled' ? 'cancelled' : 'denied';
+    const label = st === 'allowed' ? 'Allowed'
+      : st === 'cancelled' ? 'Cancelled (stopped)' : 'Denied';
+    actions.appendChild(el('span', 'approval-state ' + st, label));
+  }
+  card.appendChild(actions);
+  return card;
+}
+
+function prettyArgs(argsJson) {
+  try {
+    const v = typeof argsJson === 'string' ? JSON.parse(argsJson) : argsJson;
+    if (v && typeof v === 'object') {
+      return Object.entries(v)
+        .map(([k, val]) => k + ': ' + (typeof val === 'string' ? val : JSON.stringify(val)))
+        .join('\n');
+    }
+    return String(argsJson);
+  } catch (_) {
+    return String(argsJson);
+  }
+}
+
+async function resolveApproval(approvalId, allow) {
+  try {
+    await post('/command', {
+      commandId: 'web-apr-' + Date.now(),
+      type: 'resolveApproval',
+      sessionId: state.activeId,
+      payload: { approvalId, decision: allow ? 'allow' : 'deny' },
+    });
+  } catch (e) {
+    toast('error', 'Could not resolve approval', String(e));
+  }
+}
+
 /* ---------- composer state ---------- */
 
 function phase() {
   return state.control.phase || 'draft';
 }
 
+function turnActive() {
+  return phase() === 'running' || phase() === 'awaitingApproval';
+}
+
 function refreshComposerMode() {
-  const running = phase() === 'running';
+  const running = turnActive();
   const btn = $('send-btn');
-  const input = $('composer-input');
   btn.classList.toggle('stop', running);
-  btn.title = running ? 'Stop (Esc)' : 'Send (Enter)';
+  btn.title = phase() === 'awaitingApproval' ? 'Stop (cancels the pending approval)'
+    : running ? 'Stop (Esc)' : 'Send (Enter)';
   $('steer-note').hidden = !running;
   $('phase-chip').hidden = state.pendingNewTask || !state.activeId;
   $('phase-chip').dataset.phase = phase();
@@ -456,9 +680,9 @@ function refreshComposerMode() {
 
 function updateSendDisabled() {
   const hasText = $('composer-input').value.trim().length > 0;
-  const running = phase() === 'running';
-  // while running the button is STOP (enabled when a task is active);
-  // otherwise it sends (enabled when there is text)
+  const running = turnActive();
+  // while a turn is live (running or awaiting approval) the button is STOP
+  // (enabled when a task is active); otherwise it sends (enabled on text)
   $('send-btn').disabled = running ? !state.activeId : !hasText;
 }
 
@@ -544,15 +768,23 @@ function init() {
   const input = $('composer-input');
   input.addEventListener('input', () => { autosize(); updateSendDisabled(); });
   input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (phase() !== 'running') send(); }
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!turnActive()) send(); }
   });
 
   $('send-btn').addEventListener('click', () => {
-    if (phase() === 'running') stop(); else send();
+    if (turnActive()) stop(); else send();
   });
 
+  $('tab-tasks').addEventListener('click', () => switchTab('tasks'));
+  $('tab-files').addEventListener('click', () => switchTab('files'));
+  $('preview-close').addEventListener('click', closePreview);
+  $('preview-backdrop').addEventListener('click', closePreview);
+
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && phase() === 'running') stop();
+    if (e.key === 'Escape') {
+      if (files.preview) { closePreview(); return; }
+      if (turnActive()) stop();
+    }
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'n') { e.preventDefault(); newTask(); }
   });
 

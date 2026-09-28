@@ -25,7 +25,15 @@
       New task
     </button>
 
+    <div class="sidebar-tabs" role="tablist">
+      <button class="sidebar-tab active" id="tab-tasks" role="tab" aria-selected="true" type="button">Tasks</button>
+      <button class="sidebar-tab" id="tab-files" role="tab" aria-selected="false" type="button">Files</button>
+    </div>
+
     <nav class="task-list" id="task-list" aria-label="Tasks">
+      <!-- populated by app.js -->
+    </nav>
+    <nav class="file-tree" id="file-tree" aria-label="Files" hidden>
       <!-- populated by app.js -->
     </nav>
 
@@ -87,6 +95,18 @@
     </footer>
   </main>
 </div>
+
+<div class="preview-backdrop" id="preview-backdrop" hidden></div>
+<aside class="preview-drawer" id="preview-drawer" hidden aria-label="File preview">
+  <header class="preview-head">
+    <span class="preview-path" id="preview-path"></span>
+    <button class="icon-btn" id="preview-close" type="button" title="Close (Esc)" aria-label="Close preview">
+      <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+    </button>
+  </header>
+  <div class="preview-meta" id="preview-meta"></div>
+  <pre class="preview-body" id="preview-body"></pre>
+</aside>
 
 <div class="toasts" id="toasts" aria-live="polite"></div>
 <script src="/app.js"></script>

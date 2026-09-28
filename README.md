@@ -146,20 +146,30 @@ captured.
 ## Workbench web shell (2026-09-28)
 
 `okra serve --tcp` serves a real task workbench at `http://127.0.0.1:<port>/`
-(decision N0008): tasks sidebar + streaming transcript + send/stop composer,
-paired light/dark design tokens (ChatGPT2 docs/07 token architecture), tool
-cards with status/duration/**and real output bodies** (tool outputs are
-logged — model-visible means logged — and replayed; pre-output logs fall
-back to status-only cards), steered-message chips, turn dividers, in-app
-turn-complete toasts. It drives the full pipeline — `--provider openai
---model NAME` for a real network model, the same four-tool registry as the
-CLI — and survives reloads: tasks list from the SQLite index
-(`/api/sessions`), transcripts replay from the kernel log
+(decisions N0008 + N0009): tasks sidebar + streaming transcript + send/stop
+composer, paired light/dark design tokens (ChatGPT2 docs/07 token
+architecture), tool cards with status/duration/**and real output bodies**
+(tool outputs are logged — model-visible means logged — and replayed;
+pre-output logs fall back to status-only cards), steered-message chips,
+turn dividers, in-app turn-complete toasts. It drives the full pipeline —
+`--provider openai --model NAME` for a real network model, the same
+four-tool registry as the CLI — and survives reloads: tasks list from the
+SQLite index (`/api/sessions`), transcripts replay from the kernel log
 (`/api/sessions/<id>/rows`). Stop is a first-class seam
 (`CancellationCategory::UserRequested`, checked at every step boundary;
 interrupted turns recover through the standard repair path). The UI is
 embedded in the binary at compile time (`ui/`, dependency-free — no build
 step, no node_modules).
+
+**Attended approvals (N0009):** the workbench ASKS — side-effecting tools
+pause the turn on an inline approval card (approved bytes shown, Allow
+once / Deny), resolved over the same v4 seam (`resolveApproval` command);
+stopping cancels a pending ask; the audit pair (`approval/asked` +
+`approval/decided`) lands in the kernel log and replays. Read-only tools
+never prompt; the stdio G0 bridge stays unattended. **File surfaces:** a
+Files tab (workspace-confined tree — dot entries and symlink-following
+excluded) and a safe-read preview drawer (`/api/file`, O_NOFOLLOW, 256 KB
+cap); file tool cards link straight to the preview.
 
 ## G0 demo (2026-09-26)
 

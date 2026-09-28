@@ -337,7 +337,7 @@ fn acp_turn(
                 "sessionUpdate": "agent_message_chunk",
                 "content": { "type": "text", "text": text }
             })),
-            LoopEvent::ToolCallStarted { id, name } => notify(serde_json::json!({
+            LoopEvent::ToolCallStarted { id, name, .. } => notify(serde_json::json!({
                 "sessionUpdate": "tool_call",
                 "toolCallId": id,
                 "title": name,

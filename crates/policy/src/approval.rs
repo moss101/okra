@@ -84,8 +84,18 @@ pub struct ApprovalService {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ApprovalAuditEvent {
-    Asked { id: ApprovalRequestId, tool_name: String, call_id: String },
-    Decided { id: ApprovalRequestId, outcome: ApprovalOutcome },
+    Asked {
+        id: ApprovalRequestId,
+        tool_name: String,
+        call_id: String,
+        /// The approved bytes the user was shown (surfaces replay the
+        /// proposed action from this).
+        args_json: String,
+    },
+    Decided {
+        id: ApprovalRequestId,
+        outcome: ApprovalOutcome,
+    },
 }
 
 impl ApprovalService {
@@ -130,6 +140,7 @@ impl ApprovalService {
             id: id.clone(),
             tool_name: tool_name.to_string(),
             call_id: call_id.to_string(),
+            args_json: args_json.to_string(),
         };
         let outcome = match self.policy {
             ApprovalPolicy::Never => {

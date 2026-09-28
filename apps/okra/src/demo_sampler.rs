@@ -27,6 +27,37 @@ impl DemoPlanner {
         DemoPlanner { turn: Mutex::new(0), cwd, delay_ms }
     }
 
+    /// "create <file>" / "write <file>" style prompts → the target file
+    /// name (offline-approvable: write_file is side-effecting, so the turn
+    /// pauses on the approval bridge).
+    fn find_create_target(&self, prompt: &str) -> Option<String> {
+        let lower = prompt.to_lowercase();
+        let verb_pos = ["create ", "write ", "make "]
+            .iter()
+            .find_map(|v| lower.find(v).map(|i| i + v.len()))
+            .or_else(|| {
+                lower
+                    .strip_suffix(" file")
+                    .and_then(|_| lower.find("new ").map(|i| i + 4))
+            })?;
+        let rest = &prompt[verb_pos.min(prompt.len())..];
+        let token = rest
+            .split_whitespace()
+            .find(|t| t.contains('.'))
+            .map(|t| t.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-' && c != '_' && c != '/').to_string())
+            .or_else(|| {
+                rest.split_whitespace()
+                    .next()
+                    .map(|t| format!("{t}.txt"))
+            })?;
+        let token = token.trim().to_string();
+        if token.is_empty() {
+            None
+        } else {
+            Some(token)
+        }
+    }
+
     fn find_named_file(&self, prompt: &str) -> Option<String> {
         // tokens that look like file names
         for token in prompt.split_whitespace() {
@@ -89,21 +120,38 @@ impl Sampler for DemoPlanner {
             .unwrap_or_default();
 
         if n == 1 {
-            // plan: read the named file, or list the directory
-            let call = match self.find_named_file(&prompt) {
-                Some(path) => ToolCall {
+            // plan: create the named file (write path — drives the approval
+            // bridge offline), or read the named file, or list the directory
+            let call = if let Some(name) = self.find_create_target(&prompt) {
+                ToolCall {
                     id: "demo-call-1".into(),
-                    name: "read_file".into(),
-                    args_json: serde_json::json!({ "path": path }).to_string(),
-                },
-                None => ToolCall {
-                    id: "demo-call-1".into(),
-                    name: "list_dir".into(),
-                    args_json: serde_json::json!({ "path": "." }).to_string(),
-                },
+                    name: "write_file".into(),
+                    args_json: serde_json::json!({
+                        "path": name,
+                        "content": format!("# {name}\nCreated by the okra demo planner.\n"),
+                    })
+                    .to_string(),
+                }
+            } else {
+                match self.find_named_file(&prompt) {
+                    Some(path) => ToolCall {
+                        id: "demo-call-1".into(),
+                        name: "read_file".into(),
+                        args_json: serde_json::json!({ "path": path }).to_string(),
+                    },
+                    None => ToolCall {
+                        id: "demo-call-1".into(),
+                        name: "list_dir".into(),
+                        args_json: serde_json::json!({ "path": "." }).to_string(),
+                    },
+                }
             };
             return Ok(SampleResponse {
-                text: "Let me look at the workspace first.".into(),
+                text: if call.name == "write_file" {
+                    "I will create that file now.".into()
+                } else {
+                    "Let me look at the workspace first.".into()
+                },
                 tool_calls: vec![call],
                 stop_reason: StopReason::ToolUse,
                 usage: Usage { input_tokens: 24, output_tokens: 12 },

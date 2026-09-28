@@ -23,7 +23,9 @@ use okra_agent_core::loop_::{Agent, LoopEvent};
 use okra_agent_core::turn::{CancellationCategory, TurnOutcome};
 use okra_kernel as kernel;
 use okra_policy::ToolApprovalCeiling;
-use okra_policy::approval::{ApprovalPolicy, ApprovalService};
+use okra_policy::approval::{
+    ApprovalChannel, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, ApprovalService,
+};
 use okra_providers::Sampler;
 use okra_tools::Registry;
 
@@ -32,6 +34,9 @@ use crate::demo_sampler::DemoPlanner;
 /// Builds a fresh sampler per turn (samplers may carry per-turn state —
 /// e.g. the demo planner's step counter — so they are never shared).
 pub type SamplerFactory = Arc<dyn Fn() -> Arc<dyn Sampler> + Send + Sync>;
+
+/// Frame emitter shared with the approval watchdog (plain closure handle).
+pub type BroadcastFn = Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>;
 
 /// The offline demo planner behind the factory seam (default when no
 /// `--provider` is given; usable with no network).
@@ -262,6 +267,156 @@ pub fn projection_notification(
     })
 }
 
+
+/// One ask sitting in the workbench UI (the proposed action is inline).
+#[derive(Debug, Clone)]
+pub struct PendingApproval {
+    pub id: String,
+    pub tool_name: String,
+    pub call_id: String,
+    pub args_json: String,
+    pub asked_at: f64,
+}
+
+/// The surface-side `ApprovalChannel`: `answer` registers the ask, then
+/// blocks until a surface resolves it (`resolveApproval` command) or the
+/// turn's stop flag flips (→ Cancelled — stop-interruptible by contract).
+/// Fail-closed: the outcome union is unchanged; exactly AllowedOnce grants.
+pub struct SurfaceApprovalChannel {
+    pending: Mutex<Vec<PendingApproval>>,
+    answers: Mutex<std::collections::HashMap<String, ApprovalOutcome>>,
+    wake: std::sync::Condvar,
+    stop: Arc<AtomicBool>,
+}
+
+impl SurfaceApprovalChannel {
+    pub fn new(stop: Arc<AtomicBool>) -> Self {
+        SurfaceApprovalChannel {
+            pending: Mutex::new(Vec::new()),
+            answers: Mutex::new(std::collections::HashMap::new()),
+            wake: std::sync::Condvar::new(),
+            stop,
+        }
+    }
+
+    /// A surface answered: allow → AllowedOnce, deny → Rejected.
+    pub fn resolve(&self, approval_id: &str, allow: bool) -> bool {
+        let outcome = if allow {
+            ApprovalOutcome::AllowedOnce
+        } else {
+            ApprovalOutcome::Rejected
+        };
+        let known = {
+            let mut answers = self.answers.lock().unwrap();
+            answers.insert(approval_id.to_string(), outcome);
+            self.pending
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.id == approval_id)
+        };
+        self.wake.notify_all();
+        known
+    }
+
+    /// Serialized snapshot for `control.awaitingApproval` (stable order).
+    pub fn pending_snapshot(&self) -> Vec<serde_json::Value> {
+        self.pending
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "approvalId": p.id,
+                    "toolName": p.tool_name,
+                    "callId": p.call_id,
+                    "args": p.args_json,
+                    "askedAt": p.asked_at,
+                })
+            })
+            .collect()
+    }
+}
+
+/// `Box<dyn ApprovalChannel>` view over the shared bridge — the service
+/// owns the waterfall, the surface state owns the Arc; both point at the
+/// same pending list.
+struct SharedBridge(Arc<SurfaceApprovalChannel>);
+
+impl ApprovalChannel for SharedBridge {
+    fn answer(&self, request: &ApprovalRequest) -> Option<ApprovalOutcome> {
+        self.0.answer(request)
+    }
+}
+
+impl ApprovalChannel for SurfaceApprovalChannel {
+    fn answer(&self, request: &ApprovalRequest) -> Option<ApprovalOutcome> {
+        self.pending.lock().unwrap().push(PendingApproval {
+            id: request.id.clone(),
+            tool_name: request.tool_name.clone(),
+            call_id: request.call_id.clone(),
+            args_json: request.args_json.clone(),
+            asked_at: now_ms(),
+        });
+        loop {
+            // bounded waits so a stop flip is honoured mid-approval
+            let answers = self.answers.lock().unwrap();
+            let (mut answers, timeout) = self
+                .wake
+                .wait_timeout(answers, std::time::Duration::from_millis(250))
+                .unwrap();
+            if let Some(outcome) = answers.remove(&request.id) {
+                drop(answers);
+                self.pending
+                    .lock()
+                    .unwrap()
+                    .retain(|p| p.id != request.id);
+                self.wake.notify_all();
+                return Some(outcome);
+            }
+            drop(answers);
+            if self.stop.load(Ordering::Relaxed) {
+                self.pending
+                    .lock()
+                    .unwrap()
+                    .retain(|p| p.id != request.id);
+                self.wake.notify_all();
+                return Some(ApprovalOutcome::Cancelled);
+            }
+            let _ = timeout;
+        }
+    }
+}
+
+/// The projection control patch the workbench reads: pending approvals fold
+/// into `control.awaitingApproval` and flip the phase while the turn is
+/// paused on the bridge.
+fn emit_approval_state(
+    notify: &dyn Fn(&str, serde_json::Value),
+    topic: &str,
+    p: &Mutex<SessionProjection>,
+    approvals: &SurfaceApprovalChannel,
+    turn_running: bool,
+    last_len: &mut usize,
+) {
+    let snapshot = approvals.pending_snapshot();
+    if snapshot.len() == *last_len {
+        return; // unchanged — no frame churn
+    }
+    *last_len = snapshot.len();
+    let mut proj = p.lock().unwrap();
+    proj.control["awaitingApproval"] = serde_json::json!(snapshot);
+    if !snapshot.is_empty() {
+        proj.control["phase"] = serde_json::json!("awaitingApproval");
+    } else if turn_running {
+        proj.control["phase"] = serde_json::json!("running");
+    }
+    notify(
+        "v4/projection",
+        projection_notification(topic, &proj)["params"].clone(),
+    );
+}
+
 /// Run one full turn against the state's sampler factory, streaming row
 /// updates into the projection and notifying the attached surface after
 /// each change. `steering` (G4): when present, drained at every projection
@@ -271,7 +426,7 @@ pub fn projection_notification(
 /// (Cancelled(UserRequested)) and recovers through the standard path.
 #[allow(clippy::too_many_arguments)]
 pub fn run_turn_streaming(
-    notify: &mut dyn FnMut(&str, serde_json::Value),
+    broadcast: BroadcastFn,
     topic: String,
     session_id: String,
     cwd: std::path::PathBuf,
@@ -281,6 +436,8 @@ pub fn run_turn_streaming(
     steering: Option<Arc<Mutex<std::collections::VecDeque<String>>>>,
     stop: Arc<AtomicBool>,
     sampler_factory: &SamplerFactory,
+    approvals: Arc<SurfaceApprovalChannel>,
+    unattended: bool,
 ) -> Result<TurnOutcome, String> {
     let steering_rx = steering;
     // 1. turnHeader (running) + userInput rows
@@ -311,7 +468,7 @@ pub fn run_turn_streaming(
         p.control["phase"] = serde_json::json!("running");
         p.control["canStop"] = serde_json::json!(true);
         p.control["activeWorks"] = serde_json::json!([{ "kind": "primaryTurn", "startedAt": now_ms() }]);
-        notify(
+        (broadcast)(
             "v4/projection",
             projection_notification(&topic, &p)["params"].clone(),
         );
@@ -321,11 +478,22 @@ pub fn run_turn_streaming(
     // 2. build the agent (full CLI tool plane + policy ceiling, sampler
     // from the state's factory — real provider when `--provider` was given)
     let registry = build_registry(&cwd);
-    let approvals = ApprovalService::new(ApprovalPolicy::Ask);
-    let mut executor = okra_agent_core::loop_::PolicyToolExecutor::new(registry, approvals);
-    // Serve turns are unattended web turns, same ceiling as headless CLI
-    // runs (arg-hash grants still record every approval).
-    executor.ceiling = ToolApprovalCeiling::UnattendedAllowed;
+    let mut approval_service = ApprovalService::new(ApprovalPolicy::Ask);
+    if !unattended {
+        // attended surfaces: the bridge IS the approval waterfall — the
+        // turn pauses on it until the workbench resolves (or stops)
+        approval_service.add_channel(Box::new(SharedBridge(Arc::clone(&approvals))));
+    }
+    let mut executor = okra_agent_core::loop_::PolicyToolExecutor::new(registry, approval_service);
+    // Attended surfaces (the workbench) ASK through the bridge: the turn
+    // pauses on a non-read-only tool until a surface resolves it. Headless
+    // stdio bridges run UnattendedAllowed (no approver exists there);
+    // arg-hash grants record every decision either way.
+    executor.ceiling = if unattended {
+        ToolApprovalCeiling::UnattendedAllowed
+    } else {
+        ToolApprovalCeiling::GrantsAllowed
+    };
 
     let header = kernel::SessionHeader {
         version: kernel::SESSION_FORMAT_VERSION,
@@ -360,6 +528,25 @@ pub fn run_turn_streaming(
     let row_lock = turn_row_lock.clone();
     let assistant_slot = assistant_row_slot.clone();
     let mut tool_row_by_call: std::collections::HashMap<String, u64> = Default::default();
+    // approval watchdog: while the turn is paused on the bridge, surfaces
+    // still receive frames (control.awaitingApproval / phase flips)
+    let wd_bridge = Arc::clone(&approvals);
+    let wd_proj = Arc::clone(&turn_row_lock);
+    let wd_topic = topic.clone();
+    let wd_broadcast = Arc::clone(&broadcast);
+    let wd_done = Arc::new(AtomicBool::new(false));
+    let wd_done_inner = Arc::clone(&wd_done);
+    let wd_handle = std::thread::spawn(move || {
+        let mut last_len = 0usize;
+        let emit = |m: &str, p: serde_json::Value| wd_broadcast(m, p);
+        while !wd_done_inner.load(Ordering::Relaxed) {
+            emit_approval_state(&emit, &wd_topic, &wd_proj, &wd_bridge, true, &mut last_len);
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        // final state: pending list emptied (or never populated)
+        emit_approval_state(&emit, &wd_topic, &wd_proj, &wd_bridge, true, &mut last_len);
+    });
+
     let outcome = agent.run_turn(&input_text, &mut |ev: LoopEvent| {
         let mut p = row_lock.lock().unwrap();
         // G4 steering drain: steered text becomes a user row on the live
@@ -398,7 +585,7 @@ pub fn run_turn_streaming(
                 }
                 p.revision += 1;
             }
-            LoopEvent::ToolCallStarted { id, name } => {
+            LoopEvent::ToolCallStarted { id, name, args_json } => {
                 let (row_id, base, _) = p.base_row(&turn_id);
                 let mut r = base;
                 r["kind"] = serde_json::json!("toolCall");
@@ -406,6 +593,11 @@ pub fn run_turn_streaming(
                 r["toolName"] = serde_json::json!(name);
                 r["status"] = serde_json::json!("running");
                 r["inputText"] = serde_json::json!("");
+                // raw sampled args — tool cards show the target (path) and
+                // the preview drawer can open it
+                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&args_json) {
+                    r["input"] = args;
+                }
                 r["startedAt"] = serde_json::json!(now_ms());
                 p.upsert_row(r);
                 tool_row_by_call.insert(id, row_id);
@@ -428,16 +620,20 @@ pub fn run_turn_streaming(
             }
             _ => {}
         }
-        notify(
+        (broadcast)(
             "v4/projection",
             projection_notification(&topic_for_events, &p)["params"].clone(),
         );
     });
 
+    wd_done.store(true, Ordering::Relaxed);
+    let _ = wd_handle.join();
+
     // 4. finalize rows + control (honest states: a user stop is an
     // interrupted turn, not an error)
     {
         let mut p = turn_row_lock.lock().unwrap();
+        p.control["awaitingApproval"] = serde_json::json!([]);
         let (assistant_state, header_state) = match &outcome {
             Ok(TurnOutcome::Completed { stop: okra_agent_core::turn::CompletedStop::MaxTokens, .. })
                 | Ok(TurnOutcome::Cancelled { category: Some(CancellationCategory::UserRequested) }) => {
@@ -475,7 +671,7 @@ pub fn run_turn_streaming(
         p.control["canStop"] = serde_json::json!(false);
         p.control["activeWorks"] = serde_json::json!([]);
         p.revision += 1;
-        notify(
+        (broadcast)(
             "v4/projection",
             projection_notification(&topic, &p)["params"].clone(),
         );
@@ -532,6 +728,8 @@ pub fn rows_from_kernel_events(
     let mut current_turn: u64 = 0;
     // tool callId -> toolCall rowId
     let mut tool_row_by_call: std::collections::HashMap<String, u64> = Default::default();
+    // approvalId -> approval rowId
+    let mut approval_row_by_id: std::collections::HashMap<String, u64> = Default::default();
 
     let header_state_of = |kind: &str| match kind {
         "completed" => "completedSuccess",
@@ -632,6 +830,39 @@ pub fn rows_from_kernel_events(
                     }
                 }
             }
+            "approval/asked" => {
+                let row_id = next_row_id;
+                next_row_id += 1;
+                rows.push(serde_json::json!({
+                    "rowId": row_id,
+                    "turnId": format!("t{current_turn}"),
+                    "createdAt": ev.time,
+                    "createdAtSeq": ev.seq,
+                    "kind": "approval",
+                    "approvalId": data["approvalId"].as_str().unwrap_or_default(),
+                    "toolName": data["toolName"].as_str().unwrap_or_default(),
+                    "args": data["args"].as_str().unwrap_or_default(),
+                    "state": "pending",
+                }));
+                approval_row_by_id.insert(
+                    data["approvalId"].as_str().unwrap_or_default().to_string(),
+                    row_id,
+                );
+            }
+            "approval/decided" => {
+                let approval_id = data["approvalId"].as_str().unwrap_or_default();
+                if let Some(row_id) = approval_row_by_id.get(approval_id)
+                    && let Some(row) = rows.iter_mut().find(|r| r["rowId"].as_u64() == Some(*row_id))
+                {
+                    let outcome = data["outcome"].as_str().unwrap_or_default();
+                    row["state"] = serde_json::json!(match outcome {
+                        "allowed-once" => "allowed",
+                        "rejected" => "denied",
+                        "cancelled" => "cancelled",
+                        _ => "denied",
+                    });
+                }
+            }
             "turn/end" => {
                 let turn = data["turn"].as_u64().unwrap_or(0);
                 let kind = data["kind"].as_str().unwrap_or_default().to_string();
@@ -688,6 +919,158 @@ pub fn session_title_from_log(sessions_dir: &Path, session_id: &str) -> Option<S
                 .take(80)
                 .collect::<String>()
         })
+}
+
+/// Percent-decode a query parameter (the UI sends encodeURIComponent).
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() + 1 && i + 2 <= bytes.len() - 1 + 1 => {
+                let hex = |b: u8| -> Option<u8> {
+                    match b {
+                        b'0'..=b'9' => Some(b - b'0'),
+                        b'a'..=b'f' => Some(b - b'a' + 10),
+                        b'A'..=b'F' => Some(b - b'A' + 10),
+                        _ => None,
+                    }
+                };
+                if i + 2 < bytes.len()
+                    && let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2]))
+                {
+                    out.push(h * 16 + l);
+                    i += 3;
+                    continue;
+                }
+                out.push(bytes[i]);
+                i += 1;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Confine a client-supplied relative path to the workspace root: no `..`
+/// escapes, no absolute re-anchoring, symlinks resolved and checked.
+fn confine_to_workspace(
+    root: &Path,
+    rel_raw: &str,
+) -> Result<PathBuf, (u16, String)> {
+    let rel = percent_decode(rel_raw);
+    let rel = rel.trim_start_matches('/');
+    if rel.is_empty() {
+        return Ok(root.to_path_buf());
+    }
+    let candidate = root.join(rel);
+    // lexical check first (clear error), then canonical reality
+    for component in candidate.components() {
+        if component == std::path::Component::ParentDir {
+            return Err((400, "`..` is not allowed".to_string()));
+        }
+    }
+    let canon_root = okra_host::fsutil::canonicalize(root)
+        .map_err(|e| (500, format!("workspace root: {e}")))?;
+    let canon = okra_host::fsutil::canonicalize(&candidate).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            (404, "path not found".to_string())
+        } else {
+            (400, format!("path: {e}"))
+        }
+    })?;
+    if !canon.starts_with(&canon_root) {
+        return Err((400, "path escapes the workspace".to_string()));
+    }
+    Ok(canon)
+}
+
+/// GET /api/files?path=rel — workspace-confined directory listing.
+/// Dot entries (including .okra-sessions) are never listed; symlinks are
+/// reported with `link: true` and never followed.
+pub fn files_listing(cwd: &Path, rel_raw: &str) -> Result<serde_json::Value, (u16, String)> {
+    let dir = confine_to_workspace(cwd, rel_raw)?;
+    if !dir.is_dir() {
+        return Err((400, "not a directory".to_string()));
+    }
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    let read = std::fs::read_dir(&dir).map_err(|e| (500, format!("read_dir: {e}")))?;
+    for entry in read.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue; // dot entries never surface (incl. .okra-sessions)
+        }
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        let is_symlink = ft.is_symlink();
+        let is_dir = if is_symlink {
+            // report the link's own kind; never follow it
+            false
+        } else {
+            ft.is_dir()
+        };
+        let mut item = serde_json::json!({
+            "name": name,
+            "dir": is_dir,
+            "link": is_symlink,
+        });
+        if !is_dir
+            && !is_symlink
+            && let Ok(md) = entry.metadata()
+        {
+            item["size"] = serde_json::json!(md.len());
+        }
+        entries.push(item);
+    }
+    entries.sort_by(|a, b| {
+        b["dir"]
+            .as_bool()
+            .unwrap_or(false)
+            .cmp(&a["dir"].as_bool().unwrap_or(false))
+            .then_with(|| a["name"].as_str().cmp(&b["name"].as_str()))
+    });
+    Ok(serde_json::json!({ "entries": entries }))
+}
+
+/// Preview cap: previews are for reading, not for shipping the whole file.
+const FILE_PREVIEW_MAX_BYTES: u64 = 256 * 1024;
+
+/// GET /api/file?path=rel — safe-read preview (host safe_fs: O_NOFOLLOW,
+/// O_NONBLOCK, regular-file verification) confined to the workspace.
+pub fn file_preview(cwd: &Path, rel_raw: &str) -> Result<serde_json::Value, (u16, String)> {
+    let file = confine_to_workspace(cwd, rel_raw)?;
+    let bytes = okra_host::safe_fs::safe_read(&file).map_err(|e| match e {
+        okra_host::safe_fs::SafeReadError::Io(io)
+            if io.kind() == std::io::ErrorKind::NotFound =>
+        {
+            (404, "file not found".to_string())
+        }
+        other => (400, other.to_string()),
+    })?;
+    let size = bytes.len() as u64;
+    let truncated = size > FILE_PREVIEW_MAX_BYTES;
+    let shown = if truncated {
+        &bytes[..FILE_PREVIEW_MAX_BYTES as usize]
+    } else {
+        &bytes[..]
+    };
+    Ok(serde_json::json!({
+        "path": percent_decode(rel_raw),
+        "size": size,
+        "truncated": truncated,
+        "binary": shown.contains(&0u8),
+        "content": String::from_utf8_lossy(shown),
+    }))
 }
 
 /// Read one session's durable log (the replay source of truth).
@@ -866,14 +1249,16 @@ pub fn serve_stdio(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) ->
                         drop(sessions_guard);
                         let cwd2 = cwd.clone();
                         let sessions_dir2 = sessions_dir.clone();
-                        let mut notify = |m: &str, p: serde_json::Value| {
-                            outbound.notification(m, p)
-                        };
+                        let outbound2 = Arc::clone(&outbound);
+                        let broadcast = Arc::new(
+                            move |m: &str, p: serde_json::Value| outbound2.notification(m, p),
+                        );
                         let err_topic = topic.clone();
                         let factory = demo_sampler_factory(cwd.clone());
                         let stop = Arc::new(AtomicBool::new(false));
+                        let bridge = Arc::new(SurfaceApprovalChannel::new(Arc::clone(&stop)));
                         if let Err(e) = run_turn_streaming(
-                            &mut notify,
+                            broadcast,
                             topic,
                             session_id,
                             cwd2,
@@ -883,6 +1268,8 @@ pub fn serve_stdio(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) ->
                             None,
                             stop,
                             &factory,
+                            bridge,
+                            true,
                         ) {
                             outbound.notification(
                                 "v4/error",

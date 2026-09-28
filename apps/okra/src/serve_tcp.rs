@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::serve::{
-    self, starter_scene_catalog, run_turn_streaming, uuid_v4, SamplerFactory, SessionProjection,
+    self, starter_scene_catalog, run_turn_streaming, uuid_v4, SamplerFactory,
+    SessionProjection, SurfaceApprovalChannel,
 };
 
 pub struct SurfaceWriter {
@@ -62,6 +63,9 @@ pub struct TcpServeState {
     /// Live stop flags keyed by session: the `stop` command flips the flag
     /// the turn thread installed; cancelled at the next step boundary.
     pub stop_flags: Mutex<BTreeMap<String, Arc<AtomicBool>>>,
+    /// Live approval bridges keyed by session: `resolveApproval` answers
+    /// the ask the workbench UI is showing.
+    pub approval_bridges: Mutex<BTreeMap<String, Arc<SurfaceApprovalChannel>>>,
     /// Per-turn sampler source (`--provider openai` → real network model;
     /// default → offline demo planner).
     pub sampler_factory: SamplerFactory,
@@ -108,6 +112,7 @@ impl TcpServeState {
             bus: Mutex::new(okra_host::broadcast::BroadcastBus::new(256)),
             running_turns: Mutex::new(std::collections::BTreeSet::new()),
             stop_flags: Mutex::new(BTreeMap::new()),
+            approval_bridges: Mutex::new(BTreeMap::new()),
             sampler_factory,
             sampler_label,
             next_static: std::sync::atomic::AtomicU64::new(0),
@@ -441,6 +446,57 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
             _ => {}
         }
 
+        // ---- file surfaces: workspace-confined tree + safe-read preview ----
+        // GET /api/files?path=rel ("" = root) — dot entries (incl.
+        // .okra-sessions) are never listed; symlinks are reported but never
+        // followed; the resolved path must stay inside the workspace.
+        if path == "/api/files" || path.starts_with("/api/files?") {
+            let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+            let rel = query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("path="))
+                .unwrap_or("");
+            return match serve::files_listing(&state.cwd, rel) {
+                Ok(body) => write_http(
+                    stream,
+                    200,
+                    "OK",
+                    serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+                ),
+                Err((code, msg)) => write_http(
+                    stream,
+                    code,
+                    "error",
+                    serde_json::to_vec(&serde_json::json!({ "error": msg }))
+                        .unwrap_or_default()
+                        .as_slice(),
+                ),
+            };
+        }
+        if path == "/api/file" || path.starts_with("/api/file?") {
+            let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+            let rel = query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("path="))
+                .unwrap_or("");
+            return match serve::file_preview(&state.cwd, rel) {
+                Ok(body) => write_http(
+                    stream,
+                    200,
+                    "OK",
+                    serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+                ),
+                Err((code, msg)) => write_http(
+                    stream,
+                    code,
+                    "error",
+                    serde_json::to_vec(&serde_json::json!({ "error": msg }))
+                        .unwrap_or_default()
+                        .as_slice(),
+                ),
+            };
+        }
+
         if path == "/api/sessions" {
             let sessions = state.sessions.lock().unwrap();
             let list = serve::list_session_summaries(&state.sessions_dir, &sessions);
@@ -647,6 +703,26 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
         });
     }
 
+    // ---- resolveApproval: answer the ask the workbench is showing ----
+    if cmd_type == "resolveApproval" {
+        let approval_id = envelope["payload"]["approvalId"].as_str().unwrap_or_default();
+        let allow = envelope["payload"]["decision"].as_str() == Some("allow");
+        let resolved = state
+            .approval_bridges
+            .lock()
+            .unwrap()
+            .get(&session_id)
+            .map(|b| b.resolve(approval_id, allow))
+            .unwrap_or(false);
+        eprintln!("[serve-tcp] resolveApproval: session={session_id} id={approval_id} allow={allow} known={resolved}");
+        return serde_json::json!({
+            "commandId": command_id,
+            "status": if resolved { "accepted" } else { "rejected" },
+            "revisionAtDecision": 0,
+            "result": { "type": "approvalResolved", "resolved": resolved }
+        });
+    }
+
     let text = envelope["payload"]["text"].as_str().unwrap_or_default().to_string();
     if cmd_type != "createSession" && cmd_type != "sendText" {
         return serde_json::json!({"commandId":command_id,"status":"rejected","reasonCode":"g4.unsupported","revisionAtDecision":0});
@@ -691,14 +767,21 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
         "commandId":command_id,"status":"accepted","revisionAtDecision":0,"result":result
     });
     eprintln!("[serve-tcp] command accepted: session={session_id} cmd={command_id} type={cmd_type}");
-    // install this turn's stop flag before the thread starts so an early
-    // `stop` command can never race the flag into existence
+    // install this turn's stop flag + approval bridge before the thread
+    // starts so an early `stop`/`resolveApproval` can never race either
+    // into existence
     let stop_flag = Arc::new(AtomicBool::new(false));
     state
         .stop_flags
         .lock()
         .unwrap()
         .insert(session_id.clone(), Arc::clone(&stop_flag));
+    let bridge = Arc::new(SurfaceApprovalChannel::new(Arc::clone(&stop_flag)));
+    state
+        .approval_bridges
+        .lock()
+        .unwrap()
+        .insert(session_id.clone(), Arc::clone(&bridge));
     // spawn the turn: projections broadcast to ALL surfaces (NDJSON + SSE)
     let state2 = Arc::clone(state);
     let turn_session = session_id.clone();
@@ -712,16 +795,18 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
             let projection = Arc::clone(
                 state2.sessions.lock().unwrap().get(&turn_session).unwrap(),
             );
-            let mut notify = |m: &str, p: serde_json::Value| {
+            let b = Arc::clone(&state2);
+            let broadcast = Arc::new(move |m: &str, p: serde_json::Value| {
                 let v = serde_json::json!({"method":m,"params":p});
                 let line = serde_json::to_vec(&v).unwrap_or_default();
-                state2.broadcast_bytes(&line);
-            };
+                b.broadcast_bytes(&line);
+            });
             let _ = run_turn_streaming(
-                &mut notify, turn_topic.clone(), turn_session.clone(),
+                broadcast, turn_topic.clone(), turn_session.clone(),
                 turn_cwd.clone(), turn_sdir.clone(), current_input,
                 projection, Some(Arc::clone(&steer_queue)),
                 Arc::clone(&stop_flag), &factory,
+                Arc::clone(&bridge), false,
             );
             let queued: Vec<String> = {
                 let mut q = steer_queue.lock().unwrap(); q.drain(..).collect()
@@ -735,6 +820,7 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
         // session ever exists.
         state2.running_turns.lock().unwrap().remove(&turn_session);
         state2.stop_flags.lock().unwrap().remove(&turn_session);
+        state2.approval_bridges.lock().unwrap().remove(&turn_session);
     });
     accepted
 }
