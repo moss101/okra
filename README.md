@@ -180,7 +180,9 @@ completes workspace file paths (daemon-side recursive search, confined);
 attached files fold their CONTENT into the logged, model-visible user
 message (16 KB/file, 48 KB/turn), with the attachment list on the row for
 the transcript chips. Traversal pathspecs are refused pre-surface.
-Limitation: steering (mid-turn) sends carry text only.
+Steering (mid-turn sends) carries attachments too: entries fold into the
+model context at the next step boundary via the loop's own steering inbox
+(verified by receipt rows with attachment chips).
 
 **Tools tab (N0015):** a fourth sidebar tab projects the installed
 skills (`.okra/skills/*.md` — name, description, path-conditional

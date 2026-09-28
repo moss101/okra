@@ -30,6 +30,25 @@
    belong to idle-turn sends. Widening the queue to (text, attachments)
    tuples is the follow-up if dogfood needs it.
 
+## Follow-up — implemented same day
+
+The limitation turned out to be worse than recorded: mid-turn steered
+text was COSMETIC — the serve-level queue rendered `[steered]` rows but
+never fed the model (the loop's own steering inbox was never fed; the
+event sink is buffered until turn end, so draining it in the sink was
+too late). Fixed properly:
+
+- The steering queue carries `SteeredInput { text, attachments }`.
+- A forwarder thread (independent of the event sink) moves each entry
+  into the AGENT's steering inbox with attachments folded into the text —
+  the loop then injects it at the next step boundary, logged as
+  `user/message origin=steering` (its own governors + log machinery).
+- `SteeringInjected` events render the receipt row (with the attachment
+  chips); the turn thread's worklist runs each queued entry as its OWN
+  turn so per-entry attachments hold.
+- `g4_steered_sends_carry_attachments`: a steered send with an attachment
+  produces the receipt row with the attachment list mid-turn.
+
 ## Why
 
 References were the last composer gap: getting a file's content into a

@@ -42,7 +42,8 @@ impl SurfaceWriter {
     }
 }
 
-pub type SteeringChannel = Arc<Mutex<VecDeque<String>>>;
+/// The steering queue element: text + attachment paths (N0017 follow-up).
+pub type SteeringChannel = Arc<Mutex<VecDeque<crate::serve::SteeredInput>>>;
 
 pub struct TcpServeState {
     pub cwd: std::path::PathBuf,
@@ -280,7 +281,9 @@ fn handle_client(state: &Arc<TcpServeState>, stream: TcpStream) {
                 let session_id = params["sessionId"].as_str().unwrap_or_default().to_string();
                 let text = params["text"].as_str().unwrap_or_default().to_string();
                 let queued = state.steering.lock().unwrap().get(&session_id)
-                    .map(|ch| ch.lock().unwrap().push_back(text)).is_some();
+                    .map(|ch| ch.lock().unwrap().push_back(crate::serve::SteeredInput {
+                        text, attachments: Vec::new(),
+                    })).is_some();
                 respond(id_field, serde_json::json!({"steered":queued}));
             }
             "v4/command" => {
@@ -390,7 +393,10 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
             .entry(session_id.clone())
             .or_insert_with(|| Arc::new(Mutex::new(VecDeque::new())))
             .clone();
-        queue.lock().unwrap().push_back(text);
+        queue.lock().unwrap().push_back(crate::serve::SteeredInput {
+            text,
+            attachments: Vec::new(),
+        });
         let queued_len = queue.lock().unwrap().len();
         let reply = serde_json::json!({ "steered": true, "queued_len": queued_len });
         eprintln!("[serve-tcp] steered via /steer: session={session_id} queued_len={queued_len}");
@@ -1218,7 +1224,13 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
         .lock().unwrap()
         .insert(session_id.clone());
     if !gate_acquired {
-        steer_queue.lock().unwrap().push_back(text);
+        steer_queue.lock().unwrap().push_back(crate::serve::SteeredInput {
+            text,
+            attachments: envelope["payload"]["attachments"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default(),
+        });
         eprintln!("[serve-tcp] steered: session={session_id} cmd={command_id} type={cmd_type}");
         return serde_json::json!({
             "commandId": command_id,
@@ -1260,8 +1272,11 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
     let turn_sdir = state.sessions_dir.clone();
     let factory = Arc::clone(&state.sampler_factory);
     std::thread::spawn(move || {
-        let mut current_input = text;
-        loop {
+        // worklist: every entry (the original send + each steered input)
+        // becomes its OWN turn, carrying its own attachments
+        let mut work = std::collections::VecDeque::new();
+        work.push_back(crate::serve::SteeredInput { text, attachments });
+        while let Some(entry) = work.pop_front() {
             let projection = Arc::clone(
                 state2.sessions.lock().unwrap().get(&turn_session).unwrap(),
             );
@@ -1273,17 +1288,19 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
             });
             let _ = run_turn_streaming(
                 broadcast, turn_topic.clone(), turn_session.clone(),
-                turn_cwd.clone(), turn_sdir.clone(), current_input,
+                turn_cwd.clone(), turn_sdir.clone(), entry.text,
                 projection, Some(Arc::clone(&steer_queue)),
                 Arc::clone(&stop_flag), &factory,
                 Arc::clone(&bridge), false,
-                attachments.clone(),
+                entry.attachments,
             );
-            let queued: Vec<String> = {
+            let queued: Vec<crate::serve::SteeredInput> = {
                 let mut q = steer_queue.lock().unwrap(); q.drain(..).collect()
             };
             if queued.is_empty() { break; }
-            current_input = queued.join("\n");
+            for e in queued {
+                work.push_back(e);
+            }
         }
         // release the turn gate LAST: a command landing just before this is
         // queued and drains at the next turn's first projection event (as a

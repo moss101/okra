@@ -1300,3 +1300,83 @@ fn g4_attachments_fold_into_the_turn() {
         std::panic::resume_unwind(panic);
     }
 }
+
+/// N0017 follow-up — steering carries attachments: a command landing on a
+/// LIVE turn used to drop its attachment paths (text-only queue). The
+/// steered input now folds its files into the model context at the next
+/// step boundary, and the receipt row carries the attachment list.
+#[test]
+fn g4_steered_sends_carry_attachments() {
+    let td = tempfile::tempdir().unwrap();
+    let marker = "okra-steered-attachment-42";
+    std::fs::write(td.path().join("late.md"), format!("{marker}\n")).unwrap();
+    std::fs::write(td.path().join("notes.md"), "# notes\nsteering attachments\n").unwrap();
+    let (mut daemon, addr) = spawn_daemon_env(td.path(), &[("OKRA_DEMO_DELAY_MS", "1500")]);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let frames = std::sync::Arc::new(mutex_vec());
+        let writer = std::sync::Arc::clone(&frames);
+        let a = addr.to_string();
+        let t = std::thread::spawn(move || {
+            sse_collect(&a, "steer-att", &writer, &|f| {
+                f.iter().any(|f| {
+                    f["params"]["rows"].as_array().map(|rows| {
+                        rows.iter().any(|r| {
+                            r["kind"] == "userInput"
+                                && r["text"].as_str().map(|x| x.contains("late.md")).unwrap_or(false)
+                        })
+                    }).unwrap_or(false)
+                })
+            })
+        });
+        std::thread::sleep(Duration::from_millis(300));
+
+        // start the slow turn
+        let (status, reply) = http_post_command(&addr, &serde_json::json!({
+            "commandId": "sa-1",
+            "type": "sendText",
+            "sessionId": "steer-att",
+            "payload": { "text": "summarize notes.md" }
+        }));
+        assert_eq!(status, 200, "{reply}");
+        // wait until running, then steer WITH an attachment
+        let running = wait_for(&frames, &|f| {
+            f.iter().any(|f| f["params"]["control"]["phase"] == "running")
+        });
+        assert!(running);
+        let (status, reply) = http_post_command(&addr, &serde_json::json!({
+            "commandId": "sa-2",
+            "type": "sendText",
+            "sessionId": "steer-att",
+            "payload": {
+                "text": "also read late.md",
+                "attachments": ["late.md"]
+            }
+        }));
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(reply["result"]["type"], "steeringQueued", "{reply}");
+
+        // the steered receipt row carries the attachment list, and the
+        // folded content reached the model-visible turn (marker in text)
+        let got = wait_for(&frames, &|f| {
+            f.iter().any(|f| {
+                f["params"]["rows"].as_array().map(|rows| {
+                    rows.iter().any(|r| {
+                        r["kind"] == "userInput"
+                            && r["text"].as_str().map(|x| x.contains("[steered]")).unwrap_or(false)
+                            && r["attachments"].as_array().map(|a| {
+                                a.iter().any(|p| p.as_str() == Some("late.md"))
+                            }).unwrap_or(false)
+                    })
+                }).unwrap_or(false)
+            })
+        });
+        assert!(got, "steered row with attachments never surfaced; frames tail: {:?}",
+            frames.lock().unwrap().last());
+        let _ = t.join();
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}

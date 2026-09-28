@@ -108,6 +108,14 @@ pub fn build_registry(cwd: &Path) -> Registry {
     registry
 }
 
+/// One steered input waiting in the serve-level queue: text plus its
+/// attachment paths (N0017 follow-up — steering no longer drops files).
+#[derive(Debug, Clone)]
+pub struct SteeredInput {
+    pub text: String,
+    pub attachments: Vec<String>,
+}
+
 /// One live session projection.
 pub struct SessionProjection {
     session_id: String,
@@ -464,7 +472,7 @@ pub fn run_turn_streaming(
     sessions_dir: std::path::PathBuf,
     input_text: String,
     turn_row_lock: Arc<Mutex<SessionProjection>>,
-    steering: Option<Arc<Mutex<std::collections::VecDeque<String>>>>,
+    steering: Option<Arc<Mutex<std::collections::VecDeque<SteeredInput>>>>,
     stop: Arc<AtomicBool>,
     sampler_factory: &SamplerFactory,
     approvals: Arc<SurfaceApprovalChannel>,
@@ -587,22 +595,49 @@ pub fn run_turn_streaming(
         emit_approval_state(&emit, &wd_topic, &wd_proj, &wd_bridge, true, &mut last_len);
     });
 
+    // surface-queue → agent steering inbox FORWARDER: a dedicated thread
+    // (the event sink is buffered until turn end, so it cannot forward
+    // mid-turn). Mid-turn arrivals reach the MODEL at the next step
+    // boundary — logged user/message origin=steering — instead of
+    // rendering cosmetic rows; each entry's attachments fold into the
+    // forwarded text.
+    let fwd_queue = steering_rx.clone();
+    let fwd_cwd = cwd.clone();
+    let fwd_inbox = agent.steering_sender();
+    let forwarded = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let fwd_done = Arc::new(AtomicBool::new(false));
+    {
+        let forwarded = Arc::clone(&forwarded);
+        let fwd_done = Arc::clone(&fwd_done);
+        std::thread::spawn(move || {
+            while !fwd_done.load(Ordering::Relaxed) {
+                let entries: Vec<crate::serve::SteeredInput> = match fwd_queue {
+                    Some(ref q) => {
+                        let mut q = q.lock().unwrap();
+                        q.drain(..).collect()
+                    }
+                    None => Vec::new(),
+                };
+                for entry in entries {
+                    let (folded, _) = fold_attachments(&fwd_cwd, &entry.text, &entry.attachments);
+                    forwarded.lock().unwrap().push_back(crate::serve::SteeredInput {
+                        text: folded.clone(),
+                        attachments: entry.attachments,
+                    });
+                    let _ = fwd_inbox.send(okra_agent_core::steering::Tagged {
+                        interjection: okra_agent_core::steering::PendingInterjection {
+                            text: folded,
+                        },
+                        submitted_while_running: true,
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+        });
+    }
+
     let outcome = agent.run_turn(&input_text, &mut |ev: LoopEvent| {
         let mut p = row_lock.lock().unwrap();
-        // G4 steering drain: steered text becomes a user row on the live
-        // session (from whichever surface submitted it)
-        while let Some(steer_text) = steering_rx
-            .as_ref()
-            .and_then(|q| q.lock().ok().and_then(|mut q| q.pop_front()))
-        {
-            let (_row_id, base, _) = p.base_row(&turn_id);
-            let mut r = base;
-            r["kind"] = serde_json::json!("userInput");
-            r["text"] = serde_json::json!(format!("[steered] {steer_text}"));
-            r["origin"] = serde_json::json!("realUser");
-            p.upsert_row(r);
-            p.revision += 1;
-        }
         match ev {
             LoopEvent::TextDelta { text } => {
                 let mut slot = assistant_slot.lock().unwrap();
@@ -623,6 +658,21 @@ pub fn run_turn_streaming(
                     let cur = row["text"].as_str().unwrap_or_default().to_string();
                     row["text"] = serde_json::json!(format!("{cur}{text}"));
                 }
+                p.revision += 1;
+            }
+            LoopEvent::SteeringInjected { text } => {
+                // the loop drained the inbox INTO the model — the row is the
+                // honest receipt (the text is the folded, logged form)
+                let (_row_id, base, _) = p.base_row(&turn_id);
+                let mut r = base;
+                r["kind"] = serde_json::json!("userInput");
+                r["text"] = serde_json::json!(format!("[steered] {text}"));
+                r["origin"] = serde_json::json!("realUser");
+                let entry = forwarded.lock().unwrap().pop_front();
+                if let Some(e) = entry && !e.attachments.is_empty() {
+                    r["attachments"] = serde_json::json!(e.attachments);
+                }
+                p.upsert_row(r);
                 p.revision += 1;
             }
             LoopEvent::ToolCallStarted { id, name, args_json } => {
@@ -668,6 +718,7 @@ pub fn run_turn_streaming(
 
     wd_done.store(true, Ordering::Relaxed);
     let _ = wd_handle.join();
+    fwd_done.store(true, Ordering::Relaxed);
 
     // 4. finalize rows + control (honest states: a user stop is an
     // interrupted turn, not an error)
