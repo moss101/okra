@@ -336,6 +336,16 @@ pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), ToolErro
             .and_then(|_| f.sync_all())
             .map_err(|e| ToolError::tool_failed(format!("cannot write temp file: {e}")))?;
     }
+    // An existing target's mode (exec bit on scripts, restrictive modes)
+    // belongs to the file, not to this write — a fresh temp file would
+    // otherwise reset it on rename (dogfood day-1 finding: overwriting a
+    // script silently dropped +x). Carry the mode across the rename.
+    #[cfg(unix)]
+    if let Ok(meta) = std::fs::metadata(path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
+    }
     match std::fs::rename(&tmp, path) {
         Ok(()) => {
             // fsync the directory so the rename itself is durable
