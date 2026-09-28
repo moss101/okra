@@ -1031,6 +1031,10 @@ html[data-theme="light"] .icon-moon { display: none; }
   word-break: break-word;
 }
 
+/* ---------- virtualizer spacers ---------- */
+
+.vspacer { width: 100%; flex: none; }
+
 /* ---------- scrollbars ---------- */
 
 .transcript::-webkit-scrollbar, .task-list::-webkit-scrollbar, .tool-body::-webkit-scrollbar { width: 10px; }

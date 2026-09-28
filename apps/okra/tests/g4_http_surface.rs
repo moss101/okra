@@ -458,7 +458,19 @@ fn g4_workbench_assets_are_served() {
         // 3. the app script parses (strip HTTP headers before node --check)
         let (status, js) = http_get(&addr, "/app.js");
         assert_eq!(status, 200);
-        for marker in ["EventSource(", "/api/sessions", "'/command'", "renderMarkdown", "'stop'"] {
+        for marker in [
+            "EventSource(",
+            "/api/sessions",
+            "'/command'",
+            "renderMarkdown",
+            "'stop'",
+            // transcript virtualizer (UI-SHELL-PLAN U1): keyed reconciliation
+            // + windowed rendering with layout checkpoints
+            "transcript virtualizer",
+            "layout checkpoints",
+            "rowSig",
+            "layoutWindow",
+        ] {
             assert!(js.contains(marker), "app.js missing `{marker}`");
         }
         let js_body = js

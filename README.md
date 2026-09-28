@@ -165,6 +165,16 @@ interrupted turns recover through the standard repair path). The UI is
 embedded in the binary at compile time (`ui/`, dependency-free — no build
 step, no node_modules).
 
+**Transcript virtualization (U1, N0011):** the transcript is a custom
+windowed renderer with layout checkpoints (ChatGPT2 docs/07 design): rows
+are keyed by stable id and reconciled by mutation signature — markdown is
+rendered exactly once per row, tool-card expansion survives re-renders —
+and only the viewport ± overscan exists in the DOM, positioned by top/
+bottom spacers over a checkpoint map of real measured heights (scroll-
+anchored so content never jumps when checkpoints refine). A 2k-row
+streaming task stays bounded and smooth; verified live at 127 rows with a
+24-node window and across replay.
+
 **Changes tab (N0010):** the third sidebar tab answers "what did the
 agent change?" — branch + working-tree status with code badges, and a
 per-file unified diff in the preview drawer (`/api/git`, `/api/git/diff`;

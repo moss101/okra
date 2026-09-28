@@ -543,6 +543,251 @@ function toolGlyphSvg(name) {
   return svg;
 }
 
+/* ---------- transcript virtualizer ----------
+ *
+ * The daemon streams FULL projection snapshots (often several per second
+ * during a turn). Rebuilding every row per frame — re-running markdown on
+ * every assistant row — is O(transcript) per frame and dies on long tasks
+ * (UI-SHELL-PLAN U1: "a 2k-message streaming task stays at 60 fps").
+ *
+ * Two mechanisms, per the ChatGPT2 docs/07 design:
+ * 1. KEYED RECONCILIATION — rows are cached by stable identity (rowId)
+ *    with a cheap per-kind mutation signature; unchanged rows reuse their
+ *    DOM node (markdown is rendered exactly once per row, tool-card
+ *    expansion survives re-renders).
+ * 2. WINDOWED RENDERING WITH LAYOUT CHECKPOINTS — only the rows near the
+ *    viewport exist in the DOM; positions come from the layout-checkpoint
+ *    map (real measured heights, remembered; unrendered rows use per-kind
+ *    estimates) driving top/bottom spacers. When checkpoints change above
+ *    the viewport, scroll position is compensated so content never jumps.
+ */
+
+const virtualizer = {
+  cache: new Map(),     // key -> {sig, el}   (keyed DOM reuse)
+  heights: new Map(),   // key -> measured px (layout checkpoints)
+  toolOpen: new Set(),  // callId -> card expanded (survives rebuilds)
+  spacers: null,        // [topDiv, bottomDiv] once created
+};
+
+const ROW_ESTIMATE = {
+  turnHeader: 34,
+  userInput: 48,
+  assistantText: 56,
+  toolCall: 52,
+  approval: 128,
+  _default: 48,
+};
+
+function rowKey(r) { return 'r' + r.rowId; }
+
+function rowSig(r) {
+  switch (r.kind) {
+    case 'turnHeader': return String(r.state || '');
+    case 'userInput': return 't' + (r.text || '');
+    case 'assistantText': return (r.state || '') + '|' + (r.text || '').length;
+    case 'toolCall': return [r.status, r.output && r.output.text ? r.output.text.length : 0,
+      r.input && r.input.path ? r.input.path : '', r.startedAt, r.endedAt].join('|');
+    case 'approval': return String(r.state || '');
+    default: return JSON.stringify(r).slice(0, 80);
+  }
+}
+
+function estimateHeight(key, r) {
+  const measured = virtualizer.heights.get(key);
+  if (measured !== undefined) return measured;
+  if (r && r.kind === 'assistantText') {
+    // rough flow estimate: ~70 chars/line at the transcript width
+    const lines = Math.ceil((r.text || '').length / 70) + ((r.text || '').match(/\n/g) || []).length;
+    return 26 + lines * 24;
+  }
+  return ROW_ESTIMATE[(r && r.kind) || '_default'] || ROW_ESTIMATE._default;
+}
+
+function buildRowNode(r) {
+  const div = el('div', 'row row-' + r.kind);
+  switch (r.kind) {
+    case 'turnHeader': {
+      div.classList.add('row-turn');
+      div.appendChild(el('span', 't-state-' + (r.state || ''), 'turn · ' + (r.state || '').replace('completed', '')));
+      break;
+    }
+    case 'userInput': {
+      div.classList.add('row-user');
+      const bubble = el('div', 'user-bubble');
+      let text = r.text || '';
+      if (text.startsWith('[steered] ')) {
+        const chip = el('span', 'steered-chip', 'steered');
+        bubble.appendChild(chip);
+        text = text.slice('[steered] '.length);
+      }
+      bubble.appendChild(document.createTextNode(text));
+      div.appendChild(bubble);
+      break;
+    }
+    case 'assistantText': {
+      div.classList.add('row-assistant', 'state-' + (r.state || 'complete'));
+      const md = el('div', 'md');
+      md.innerHTML = renderMarkdown(r.text || '');
+      div.appendChild(md);
+      break;
+    }
+    case 'toolCall': {
+      div.appendChild(renderToolCard(r));
+      break;
+    }
+    case 'approval': {
+      div.appendChild(renderApprovalCard(r));
+      break;
+    }
+    default:
+      div.textContent = JSON.stringify(r);
+  }
+  return div;
+}
+
+function buildPendingApprovalNode(a) {
+  const div = el('div', 'row row-approval');
+  div.appendChild(renderApprovalCard({
+    approvalId: a.approvalId,
+    toolName: a.toolName,
+    args: a.args,
+    state: 'pending',
+  }));
+  return div;
+}
+
+/// The checkpoint pass: remember real rendered heights (rAF-batched).
+function measurePass(host, keys) {
+  requestAnimationFrame(() => {
+    for (const key of keys) {
+      const entry = virtualizer.cache.get(key);
+      if (!entry || !entry.el.isConnected) continue;
+      const h = entry.el.offsetHeight;
+      if (h > 0 && virtualizer.heights.get(key) !== h) {
+        virtualizer.heights.set(key, h);
+        virtualizer.relayout = true;
+      }
+    }
+    if (virtualizer.relayout) {
+      virtualizer.relayout = false;
+      layoutWindow(true); // compensate anchors with the refined heights
+    }
+  });
+}
+
+/// Compute [start, end) of the visible window from checkpoints.
+function windowBounds(count) {
+  const transcript = $('transcript');
+  const OVERSCAN = 900;
+  const top = transcript.scrollTop - OVERSCAN;
+  const bottom = transcript.scrollTop + transcript.clientHeight + OVERSCAN;
+  let y = 0;
+  let start = 0;
+  let startTop = 0;
+  let started = false;
+  for (let i = 0; i < count; i++) {
+    const h = estimateHeight(virtualizer.viewKeys[i], virtualizer.viewMeta[i]);
+    if (!started && y + h > top) {
+      start = i;
+      startTop = y;
+      started = true;
+    }
+    if (started && y >= bottom) {
+      return { start, end: i, startTop };
+    }
+    y += h;
+  }
+  if (!started && count > 0) {
+    start = Math.max(0, count - 1);
+    startTop = y;
+  }
+  return { start, end: count, startTop };
+}
+
+/// Sum checkpoint/estimate heights for rows [from, to).
+function spanHeight(from, to, keys, meta) {
+  let total = 0;
+  for (let i = from; i < to && i < keys.length; i++) {
+    total += estimateHeight(keys[i], meta[i]);
+  }
+  return total;
+}
+
+/// (Re)render only the window; spacers stand in for the rest.
+function layoutWindow(anchorCompensate) {
+  const host = $('rows');
+  const transcript = $('transcript');
+  const keys = virtualizer.viewKeys || [];
+  const meta = virtualizer.viewMeta || [];
+  const count = keys.length;
+  if (!count) { host.textContent = ''; return; }
+
+  const before = transcript.scrollTop;
+  const pinned = transcript.scrollHeight - before - transcript.clientHeight < 90;
+
+  const { start, end, startTop } = windowBounds(count);
+  const topPad = spanHeight(0, start, keys, meta);
+  const bottomPad = spanHeight(end, count, keys, meta);
+
+  if (!virtualizer.spacers) {
+    virtualizer.spacers = [el('div', 'vspacer'), el('div', 'vspacer')];
+  }
+
+  const winSig = start + ':' + end + ':' + count;
+  if (virtualizer.winSig !== winSig) {
+    // window identity changed: rebuild the window from the keyed cache
+    virtualizer.winSig = winSig;
+    host.textContent = '';
+    host.appendChild(virtualizer.spacers[0]);
+    const measured = [];
+    for (let i = start; i < end; i++) {
+      const key = keys[i];
+      const r = meta[i];
+      let entry = virtualizer.cache.get(key);
+      if (!entry || entry.sig !== rowSig(r)) {
+        const node = r.__pending ? buildPendingApprovalNode(r) : buildRowNode(r);
+        entry = { sig: rowSig(r), el: node };
+        virtualizer.cache.set(key, entry);
+      }
+      host.appendChild(entry.el);
+      measured.push(key);
+    }
+    host.appendChild(virtualizer.spacers[1]);
+    measurePass(host, measured);
+  } else {
+    // same window: refresh only rows whose mutation signature changed —
+    // markdown of unchanged rows is never re-rendered
+    const measured = [];
+    for (let i = start; i < end; i++) {
+      const key = keys[i];
+      const r = meta[i];
+      let entry = virtualizer.cache.get(key);
+      if (!entry || entry.sig !== rowSig(r)) {
+        const node = r.__pending ? buildPendingApprovalNode(r) : buildRowNode(r);
+        if (entry && entry.el.isConnected) {
+          entry.el.replaceWith(node);
+        }
+        entry = { sig: rowSig(r), el: node };
+        virtualizer.cache.set(key, entry);
+        measured.push(key);
+      }
+    }
+    if (measured.length) measurePass(host, measured);
+  }
+
+  // spacers position the window in the virtual coordinate space
+  virtualizer.spacers[0].style.height = topPad + 'px';
+  virtualizer.spacers[1].style.height = bottomPad + 'px';
+
+  if (pinned) {
+    transcript.scrollTop = transcript.scrollHeight;
+  } else if (anchorCompensate && topPad !== virtualizer.lastTopPad) {
+    // a checkpoint above the viewport got refined: keep the content glued
+    transcript.scrollTop = before + (topPad - (virtualizer.lastTopPad || 0));
+  }
+  virtualizer.lastTopPad = topPad;
+}
+
 function renderRows() {
   const host = $('rows');
   const transcript = $('transcript');
@@ -552,67 +797,44 @@ function renderRows() {
   const empty = $('empty-state');
   const showEmpty = !state.rows.length && !state.pendingNewTask && state.control.phase !== 'running';
   empty.style.display = showEmpty ? '' : 'none';
-  if (showEmpty) { host.textContent = ''; refreshComposerMode(); return; }
+  if (showEmpty) {
+    host.textContent = '';
+    virtualizer.viewKeys = [];
+    virtualizer.viewMeta = [];
+    virtualizer.winSig = null;
+    refreshComposerMode();
+    return;
+  }
 
-  host.textContent = '';
+  // assemble the flat view: durable rows + LIVE pending approvals (the
+  // kernel row only exists post-decision, so asks awaiting an answer
+  // render straight from control)
   const approvalRowIds = new Set(
     state.rows.filter((r) => r.kind === 'approval').map((r) => r.approvalId));
+  const meta = [];
   for (const r of state.rows) {
-    const div = el('div', 'row row-' + r.kind);
-    switch (r.kind) {
-      case 'turnHeader': {
-        div.classList.add('row-turn');
-        div.appendChild(el('span', 't-state-' + (r.state || ''), 'turn · ' + (r.state || '').replace('completed', '')));
-        break;
-      }
-      case 'userInput': {
-        div.classList.add('row-user');
-        const bubble = el('div', 'user-bubble');
-        let text = r.text || '';
-        if (text.startsWith('[steered] ')) {
-          const chip = el('span', 'steered-chip', 'steered');
-          bubble.appendChild(chip);
-          text = text.slice('[steered] '.length);
-        }
-        bubble.appendChild(document.createTextNode(text));
-        div.appendChild(bubble);
-        break;
-      }
-      case 'assistantText': {
-        div.classList.add('row-assistant', 'state-' + (r.state || 'complete'));
-        const md = el('div', 'md');
-        md.innerHTML = renderMarkdown(r.text || '');
-        div.appendChild(md);
-        break;
-      }
-      case 'toolCall': {
-        div.appendChild(renderToolCard(r));
-        break;
-      }
-      case 'approval': {
-        div.appendChild(renderApprovalCard(r));
-        break;
-      }
-      default:
-        div.textContent = JSON.stringify(r);
-    }
-    host.appendChild(div);
+    meta.push(r);
   }
-
-  // LIVE pending approvals: the kernel row only exists post-decision, so
-  // asks still awaiting an answer render straight from control
   for (const a of state.control.awaitingApproval || []) {
     if (approvalRowIds.has(a.approvalId)) continue;
-    const div = el('div', 'row row-approval');
-    div.appendChild(renderApprovalCard({
-      approvalId: a.approvalId,
-      toolName: a.toolName,
-      args: a.args,
-      state: 'pending',
-    }));
-    host.appendChild(div);
+    meta.push({ __pending: true, rowId: 'pending-' + a.approvalId, approvalId: a.approvalId, toolName: a.toolName, args: a.args, kind: 'approval' });
   }
 
+  virtualizer.viewMeta = meta;
+  virtualizer.viewKeys = meta.map((r) => rowKey(r));
+
+  // bound the cache: drop entries far outside any plausible window
+  if (virtualizer.cache.size > 1200) {
+    const keep = new Set(virtualizer.viewKeys);
+    for (const key of [...virtualizer.cache.keys()]) {
+      if (!keep.has(key) && virtualizer.cache.size > 900) {
+        virtualizer.cache.delete(key);
+        virtualizer.heights.delete(key);
+      }
+    }
+  }
+
+  layoutWindow(false);
   if (pinned) transcript.scrollTop = transcript.scrollHeight;
   refreshComposerMode();
 }
@@ -664,8 +886,16 @@ function renderToolCard(r) {
     body.textContent = '…';
   }
 
-  head.addEventListener('click', () => card.classList.toggle('open'));
-  if (isError) card.classList.add('open');
+  const openState = virtualizer.toolOpen.has(r.toolCallId);
+  head.addEventListener('click', () => {
+    const nowOpen = !card.classList.contains('open');
+    card.classList.toggle('open', nowOpen);
+    if (r.toolCallId) {
+      if (nowOpen) virtualizer.toolOpen.add(r.toolCallId);
+      else virtualizer.toolOpen.delete(r.toolCallId);
+    }
+  });
+  if (isError || openState) card.classList.add('open');
   card.appendChild(head);
   card.appendChild(body);
   return card;
@@ -867,6 +1097,17 @@ function init() {
   $('tab-changes').addEventListener('click', () => switchTab('changes'));
   $('preview-close').addEventListener('click', closePreview);
   $('preview-backdrop').addEventListener('click', closePreview);
+
+  // scrolling re-windows the transcript (rAF-throttled)
+  let scrollQueued = false;
+  $('transcript').addEventListener('scroll', () => {
+    if (scrollQueued) return;
+    scrollQueued = true;
+    requestAnimationFrame(() => {
+      scrollQueued = false;
+      if (virtualizer.viewKeys && virtualizer.viewKeys.length) layoutWindow(false);
+    });
+  });
 
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
