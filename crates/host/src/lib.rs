@@ -8,6 +8,7 @@
 //! - fsutil: the single sanctioned canonicalize/home_dir call sites
 
 pub mod bigmodel;
+pub mod bots;
 pub mod broadcast;
 pub mod checkpoints;
 pub mod client_info;
@@ -134,3 +135,4 @@ pub use commands::{Command, CommandScope, CommandSource, CommandsError, Commands
 pub use bigmodel::{ApiKeyEnsureResult, ApiKeyEnsureStatus, BizClient, BizEnvelopeDiagnostics, CodingPlanEntitlement, TeamPlanBizContext, UnavailableReason, UreqBizClient, classify_personal_entitlement, classify_team_entitlement, ensure_team_plan_project_api_key, is_active_personal_coding_plan};
 pub use i18n::{negotiate_locale, parse_catalog_document, Catalog, LocaleTag};
 pub use runtime_env::{build_agent_runtime_env, capture_login_shell_env_snapshot, extract_captured_env_snapshot, format_log_prefix_at, format_timestamp_utc_ms, parse_null_separated_env_snapshot, resolve_shell_path, CaptureError, CaptureOptions, LoginShellExecutor, RealLoginShellExecutor, ServiceLogger, StderrSink, DEFAULT_MAX_BUFFER, DEFAULT_TIMEOUT, LOGIN_ENV_CAPTURE_PREFIX, LOGIN_ENV_CAPTURE_SUFFIX};
+pub use bots::{parse_bot_command, normalize_bot_command_policy, normalize_bot_current_options, normalize_bot_config, normalize_allowed_workspaces, is_user_command_allowed, is_workspace_allowed, resolve_workspace_by_value, create_workspace_ref, find_bot, find_callback_bot, find_authorized_bot, build_bot_credential_key, build_bot_webhook_secret_key, BotCommand, BotCommandPolicy, BotConfig, BotCurrentOptions, BotWorkspaceRef, BotsConfigFile};
