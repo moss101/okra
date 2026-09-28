@@ -1129,6 +1129,7 @@ html[data-theme="light"] .icon-moon { display: none; }
   align-items: center;
   gap: 7px;
   min-width: 0;
+  flex-wrap: wrap;
 }
 
 .tool-entry-name {
