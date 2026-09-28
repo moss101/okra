@@ -342,7 +342,15 @@ pub fn run_turn_streaming(
         Err(e) => return Err(format!("open kernel session: {e}")),
     };
 
-    let config = okra_agent_core::loop_::AgentConfig { max_steps: 32, unattended: true, ..Default::default() };
+    // managed pin ceiling clamps every serve surface's turn budget (the
+    // CLI clamps its own --max-turns flag); re-read per turn so a pin
+    // deployed mid-session is honored by the next turn
+    let (max_steps, clamped) = okra_host::managed_policy::runtime_pin().clamp_max_turns(32);
+    let max_steps = max_steps as usize;
+    if clamped {
+        eprintln!("[pin] max-turns clamped to {max_steps}");
+    }
+    let config = okra_agent_core::loop_::AgentConfig { max_steps, unattended: true, ..Default::default() };
     let sampler = (sampler_factory)();
     let mut agent = Agent::new(config, sampler, Box::new(executor), kernel_session);
     agent.set_stop_flag(stop);
