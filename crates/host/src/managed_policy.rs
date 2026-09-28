@@ -333,6 +333,15 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 impl ManagedPin {
     fn with_file_hash(mut self, file_hash: String) -> Self {
         if let Some(p) = self.provenance.as_mut() {
@@ -355,6 +364,69 @@ pub fn load_trusted_signers(path: &Path) -> Option<Vec<String>> {
             .map(str::to_string)
             .collect(),
     )
+}
+
+/// The admin-side counterpart of the envelope parsed by
+/// `load_managed_pin_verified`: sign a policy payload so a distributed pin
+/// is tamper-evident and its signer provable. The signature covers
+/// `sha256(payload_text)` — the exact bytes verification hashes — so an
+/// envelope can never certify a payload other than the one embedded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignedPinEnvelope {
+    /// The policy JSON, embedded verbatim (string, not re-serialized —
+    /// re-serialization could silently differ from the signed bytes).
+    pub payload: String,
+    /// Ed25519 public key of the signer, 64 lowercase hex chars.
+    pub signer: String,
+    /// Ed25519 signature over sha256(payload), 128 hex chars.
+    pub signature: String,
+}
+
+/// Validate the policy FIRST, then sign: an admin can never mint an
+/// envelope for a payload the daemon would fail-closed on for schema
+/// reasons — the error surfaces at signing time, not at every deployed
+/// machine. The seed is the 32-byte Ed25519 signing seed; its public key
+/// is what a trust file must list.
+pub fn sign_policy_envelope(seed: [u8; 32], policy_json: &str) -> Result<SignedPinEnvelope, String> {
+    // parse errors name the schema problem before any key material is used
+    ManagedPolicy::from_json_str(policy_json)?;
+    let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let digest: [u8; 32] = {
+        let mut h = Sha256::new();
+        h.update(policy_json.as_bytes());
+        h.finalize().into()
+    };
+    use ed25519_dalek::Signer as _;
+    let signature = key.sign(&digest);
+    Ok(SignedPinEnvelope {
+        payload: policy_json.to_string(),
+        signer: hex_encode(&key.verifying_key().to_bytes()),
+        signature: hex_encode(&signature.to_bytes()),
+    })
+}
+
+/// Parse a signing-seed file for `okra pin-sign --key-file`: either exactly/// 32 raw bytes, or hex text (64 hex chars, surrounding whitespace allowed).
+/// Anything else is an error naming what was wrong — never a truncated key.
+pub fn parse_signing_seed(raw: &[u8]) -> Result<[u8; 32], String> {
+    if raw.len() == 32 {
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(raw);
+        return Ok(seed);
+    }
+    let text = std::str::from_utf8(raw)
+        .map_err(|_| format!("key file is neither 32 raw bytes nor UTF-8 hex text ({} bytes)", raw.len()))?
+        .trim();
+    decode_32_hex(text).ok_or_else(|| {
+        format!("key file text is not 64 hex chars (got {} chars)", text.len())
+    })
+}
+
+/// The hex Ed25519 public key a provisioned trust file must list for this
+/// signing seed — what `--generate-key` prints so an admin can copy it
+/// without touching key material math themselves.
+pub fn public_key_hex(seed: [u8; 32]) -> String {
+    let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    hex_encode(&key.verifying_key().to_bytes())
 }
 
 /// Approval resolution under the pin: an `approvalMustAsk` pin clamps
@@ -478,8 +550,103 @@ mod tests {
         (serde_json::to_string(&doc).unwrap(), hex_encode(&key.verifying_key().to_bytes()))
     }
 
-    fn hex_encode(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    const POLICY_JSON: &str =
+        r#"{"source":"corp-it","sandboxCeiling":"read-only","approvalMustAsk":true}"#;
+
+    #[test]
+    fn sign_round_trips_through_verified_load() {
+        let env = sign_policy_envelope([7u8; 32], POLICY_JSON).unwrap();
+        assert_eq!(env.signer.len(), 64);
+        assert_eq!(env.signature.len(), 128);
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("pin.json");
+        std::fs::write(&path, serde_json::to_vec(&env).unwrap()).unwrap();
+        // unsigned trust file (None): any valid-signature signer enforces
+        let pin = load_managed_pin(&path);
+        assert_eq!(pin.state, PinState::Enforced);
+        let prov = pin.provenance.unwrap();
+        assert_eq!(prov.signature_verified, Some(true));
+        assert_eq!(prov.signer.as_deref(), Some(env.signer.as_str()));
+        assert_eq!(prov.source, "corp-it");
+        // and the policy dims actually carry
+        let pin = load_managed_pin(&path);
+        assert_eq!(pin.sandbox_ceiling(), Some(SandboxCeiling::ReadOnly));
+        assert!(pin.approval_must_ask());
+    }
+
+    #[test]
+    fn signed_piner_is_enforced_only_when_trusted() {
+        let env = sign_policy_envelope([9u8; 32], POLICY_JSON).unwrap();
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("pin.json");
+        std::fs::write(&path, serde_json::to_vec(&env).unwrap()).unwrap();
+        let trust = td.path().join("trust.json");
+        std::fs::write(&trust, serde_json::to_vec(&vec![env.signer.clone()]).unwrap()).unwrap();
+        let trusted = load_trusted_signers(&trust).unwrap();
+        let pin = load_managed_pin_verified(&path, Some(&trusted));
+        assert_eq!(pin.state, PinState::Enforced);
+        // a different key's trust list fails the same envelope closed
+        let other = sign_policy_envelope([3u8; 32], POLICY_JSON).unwrap();
+        let strangers = vec![other.signer.clone()];
+        let pin = load_managed_pin_verified(&path, Some(&strangers));
+        match &pin.state {
+            PinState::FailClosed { reason } => assert!(reason.contains("not trusted"), "{reason}"),
+            other => panic!("expected fail-closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sign_refuses_a_payload_the_daemon_would_reject() {
+        let err = sign_policy_envelope([1u8; 32], "{\"sandboxCeiling\": \"nonsense\"}").unwrap_err();
+        assert!(err.contains("schema mismatch"), "{err}");
+        // and nothing was signed: the envelope never exists for bad payloads
+        let env2 = sign_policy_envelope([1u8; 32], "not json");
+        assert!(env2.is_err());
+    }
+
+    #[test]
+    fn tampered_payload_after_signing_fails_verification() {
+        let env = sign_policy_envelope([5u8; 32], POLICY_JSON).unwrap();
+        let mut tampered = env.clone();
+        tampered.payload = POLICY_JSON.replace("corp-it", "attacker");
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("pin.json");
+        std::fs::write(&path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+        match load_managed_pin(&path).state {
+            PinState::FailClosed { reason } => {
+                assert!(reason.contains("signature invalid"), "{reason}")
+            }
+            other => panic!("expected fail-closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signing_seed_parses_raw_and_hex_and_nothing_else() {
+        // raw 32 bytes pass through
+        let raw: Vec<u8> = (0u8..=31).collect();
+        let expected: [u8; 32] = raw.as_slice().try_into().unwrap();
+        assert_eq!(parse_signing_seed(&raw).unwrap(), expected);
+        // hex text with trailing newline (the realistic file form)
+        let hex_file: String = "ab".repeat(32) + "\n";
+        assert_eq!(
+            parse_signing_seed(hex_file.as_bytes()).unwrap(),
+            [0xabu8; 32]
+        );
+        // uppercase hex is accepted too
+        assert_eq!(
+            parse_signing_seed(b"AB".repeat(32).as_slice()).unwrap(),
+            [0xabu8; 32]
+        );
+        // non-UTF-8 bytes of the wrong length refuse, naming the flaw
+        assert!(parse_signing_seed(&[0xff, 0xfe, 0x00])
+            .unwrap_err()
+            .contains("neither 32 raw bytes"));
+        assert!(parse_signing_seed(b"ab".repeat(31).as_slice())
+            .unwrap_err()
+            .contains("not 64 hex chars"));
+        assert!(parse_signing_seed(b"hello world, this is not a key at all")
+            .unwrap_err()
+            .contains("not 64 hex chars"));
     }
 
     #[test]

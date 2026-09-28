@@ -144,6 +144,38 @@ fn build_registry(cwd: &std::path::Path) -> Registry {
     serve::build_registry(cwd)
 }
 
+/// Write key/secret bytes with owner-only permissions on unix (best-effort
+/// 0600; on non-unix the plain write is the platform's best available).
+fn write_private_0600(path: &std::path::Path, bytes: &[u8]) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap_or_else(|e| {
+                eprintln!("error: write {}: {e}", path.display());
+                std::process::exit(1);
+            });
+        f.write_all(bytes).unwrap_or_else(|e| {
+            eprintln!("error: write {}: {e}", path.display());
+            std::process::exit(1);
+        });
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, bytes).unwrap_or_else(|e| {
+        eprintln!("error: write {}: {e}", path.display());
+        std::process::exit(1);
+    });
+}
+
 fn main() {
     // `okra bench-continuation [--turns N --files K --reads-per-turn R]`: G2
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -327,6 +359,117 @@ fn main() {
     }
 
 
+    // `okra pin-sign --policy PATH (--key HEX | --key-file PATH) [-o OUT]`:
+    // the admin-side counterpart of pin-status — mint the signed envelope
+    // an enterprise trust model distributes. `--generate-key KEYFILE`
+    // provisions a fresh signing seed instead (raw 32 bytes, 0600) and
+    // prints the public key a trust file must list.
+    if argv.first().map(String::as_str) == Some("pin-sign") {
+        let mut policy: Option<PathBuf> = None;
+        let mut key_hex: Option<String> = None;
+        let mut key_file: Option<PathBuf> = None;
+        let mut generate_key: Option<PathBuf> = None;
+        let mut out: Option<PathBuf> = None;
+        let mut i = 1;
+        while i < argv.len() {
+            match argv[i].as_str() {
+                "--policy" => {
+                    i += 1;
+                    policy = Some(PathBuf::from(argv.get(i).cloned().unwrap_or_default()));
+                }
+                "--key" => {
+                    i += 1;
+                    key_hex = Some(argv.get(i).cloned().unwrap_or_default());
+                }
+                "--key-file" => {
+                    i += 1;
+                    key_file = Some(PathBuf::from(argv.get(i).cloned().unwrap_or_default()));
+                }
+                "--generate-key" => {
+                    i += 1;
+                    generate_key = Some(PathBuf::from(argv.get(i).cloned().unwrap_or_default()));
+                }
+                "-o" | "--output" => {
+                    i += 1;
+                    out = Some(PathBuf::from(argv.get(i).cloned().unwrap_or_default()));
+                }
+                other => {
+                    eprintln!("error: unknown pin-sign flag {other}");
+                    std::process::exit(2);
+                }
+            }
+            i += 1;
+        }
+
+        if let Some(path) = generate_key {
+            let seed = okra_host::plugins::signing::generate_seed()
+                .unwrap_or_else(|e| {
+                    eprintln!("error: CSPRNG unavailable: {e}");
+                    std::process::exit(1);
+                });
+            write_private_0600(&path, &seed);
+            println!(
+                "{}",
+                serde_json::json!({
+                    "keyFile": path.to_string_lossy(),
+                    "publicKey": okra_host::managed_policy::public_key_hex(seed),
+                })
+            );
+            std::process::exit(0);
+        }
+
+        let policy = policy.unwrap_or_else(|| {
+            eprintln!("error: pin-sign requires --policy PATH");
+            std::process::exit(2);
+        });
+        let seed = if let Some(hex) = key_hex {
+            okra_host::managed_policy::parse_signing_seed(hex.as_bytes())
+                .unwrap_or_else(|e| {
+                    eprintln!("error: --key: {e}");
+                    std::process::exit(2);
+                })
+        } else if let Some(path) = key_file {
+            let raw = std::fs::read(&path).unwrap_or_else(|e| {
+                eprintln!("error: key file {}: {e}", path.display());
+                std::process::exit(2);
+            });
+            okra_host::managed_policy::parse_signing_seed(&raw).unwrap_or_else(|e| {
+                eprintln!("error: {}: {e}", path.display());
+                std::process::exit(2);
+            })
+        } else {
+            eprintln!("error: pin-sign requires --key HEX or --key-file PATH");
+            std::process::exit(2);
+        };
+        let payload = std::fs::read_to_string(&policy).unwrap_or_else(|e| {
+            eprintln!("error: policy {}: {e}", policy.display());
+            std::process::exit(2);
+        });
+        let envelope = okra_host::managed_policy::sign_policy_envelope(seed, &payload)
+            .unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            });
+        let rendered = serde_json::to_vec_pretty(&envelope).unwrap();
+        match out {
+            Some(path) => {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                std::fs::write(&path, &rendered).unwrap_or_else(|e| {
+                    eprintln!("error: write {}: {e}", path.display());
+                    std::process::exit(1);
+                });
+            }
+            None => {
+                use std::io::Write as _;
+                std::io::stdout().write_all(&rendered).unwrap();
+                println!();
+            }
+        }
+        std::process::exit(0);
+    }
+
     // `okra pin-status [--pin PATH]`: operator view of the managed policy
     // pin — which bytes are in force, from where, under which state.
     if argv.first().map(String::as_str) == Some("pin-status") {
@@ -358,10 +501,6 @@ fn main() {
             .join(".okra")
             .join("managed-policy.json");
         let path = pin_path.unwrap_or(default_path);
-        let _ = std::fs::write(
-            std::path::Path::new("/tmp/pin-debug/last-run.txt"),
-            format!("{trust_file:?} {trusted_signers:?} argv={argv:?}"),
-        );
         let pin = okra_host::load_managed_pin_verified(&path, trusted_signers.as_deref());
         let prov = pin.provenance.clone();
         println!(

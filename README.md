@@ -95,7 +95,12 @@ M6  scale                      ◐ i18n slice: daemon-side en-US/zh-CN catalog
                                   reused TS UI); Windows bring-up armed —
                                   `.github/workflows/windows.yml` +
                                   `docs/m6-windows-port.md` inventory (runner
-                                  itself is a user decision)
+                                  itself is a user decision); **managed-pin
+                                  loop closed end to end** — admin signs with
+                                  `okra pin-sign` (Ed25519 envelope over
+                                  sha256(payload), key provisioning via
+                                  `--generate-key`), daemon verifies + trust-
+                                  files gate, `pin-status` reports state honestly
 ```
 
 
