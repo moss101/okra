@@ -1073,6 +1073,43 @@ pub fn file_preview(cwd: &Path, rel_raw: &str) -> Result<serde_json::Value, (u16
     }))
 }
 
+/// GET /api/git — branch + working-tree changes (the Changes tab source).
+/// Outside a repository this is honest: `repository: false`.
+pub fn git_overview(cwd: &Path) -> Result<serde_json::Value, (u16, String)> {
+    let repo = match okra_host::git::GitRepository::open(cwd) {
+        Ok(r) => r,
+        Err(_) => return Ok(serde_json::json!({ "repository": false })),
+    };
+    let head = repo.head().map_err(|e| (500, e.to_string()))?;
+    let changes: Vec<serde_json::Value> = repo
+        .status()
+        .map_err(|e| (500, e.to_string()))?
+        .into_iter()
+        // the daemon's own bookkeeping is never a user-visible change
+        .filter(|c| !c.path.starts_with(".okra-sessions"))
+        .map(|c| serde_json::json!({ "code": c.code, "path": c.path }))
+        .collect();
+    Ok(serde_json::json!({
+        "repository": true,
+        "branch": head.branch,
+        "hash": head.hash,
+        "changes": changes,
+    }))
+}
+
+/// GET /api/git/diff?path=rel — unified working-tree diff for one file
+/// (repo-root-relative; `..` and option-looking paths refused).
+pub fn git_diff(cwd: &Path, rel_raw: &str) -> Result<serde_json::Value, (u16, String)> {
+    let repo = okra_host::git::GitRepository::open(cwd)
+        .map_err(|_| (400, "not a git repository".to_string()))?;
+    let path = percent_decode(rel_raw);
+    if path.split(['/', '\\']).any(|seg| seg == "..") {
+        return Err((400, "`..` is not allowed".to_string()));
+    }
+    let diff = repo.diff_file(&path).map_err(|e| (400, e.to_string()))?;
+    Ok(serde_json::json!({ "path": path, "diff": diff }))
+}
+
 /// Read one session's durable log (the replay source of truth).
 pub fn session_events(
     sessions_dir: &Path,

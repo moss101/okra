@@ -924,6 +924,46 @@ html[data-theme="light"] .icon-moon { display: none; }
 }
 .tool-path:hover { text-decoration: underline; }
 
+/* ---------- changes (git) ---------- */
+
+.git-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px 4px;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.git-branch {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.git-dirty { margin-left: auto; font-size: var(--text-xs); color: var(--text-tertiary); }
+
+.git-code {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: 700;
+  border-radius: var(--radius-xs);
+  padding: 1px 6px;
+  flex: none;
+}
+.git-code.st-mod { color: var(--warning); background: color-mix(in srgb, var(--warning) 14%, transparent); }
+.git-code.st-un { color: var(--info); background: color-mix(in srgb, var(--info) 14%, transparent); }
+.git-code.st-del { color: var(--danger); background: color-mix(in srgb, var(--danger) 12%, transparent); }
+.git-code.st-ren { color: var(--accent); background: var(--accent-soft); }
+
+/* diff lines in the preview drawer */
+
+.dl { padding: 0 4px; border-radius: 2px; }
+.dl-add { color: var(--success); background: color-mix(in srgb, var(--success) 12%, transparent); }
+.dl-del { color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
+.dl-hunk { color: var(--info); margin-top: 4px; }
+.dl-meta { color: var(--text-tertiary); font-weight: 600; margin-top: 6px; }
+
 /* ---------- preview drawer ---------- */
 
 .preview-backdrop {

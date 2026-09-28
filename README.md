@@ -165,6 +165,12 @@ interrupted turns recover through the standard repair path). The UI is
 embedded in the binary at compile time (`ui/`, dependency-free — no build
 step, no node_modules).
 
+**Changes tab (N0010):** the third sidebar tab answers "what did the
+agent change?" — branch + working-tree status with code badges, and a
+per-file unified diff in the preview drawer (`/api/git`, `/api/git/diff`;
+read-only; `.okra-sessions` never surfaces; honest `repository:false`
+outside a repo). An approved write shows up here within seconds.
+
 **Attended approvals (N0009):** the workbench ASKS — side-effecting tools
 pause the turn on an inline approval card (approved bytes shown, Allow
 once / Deny), resolved over the same v4 seam (`resolveApproval` command);

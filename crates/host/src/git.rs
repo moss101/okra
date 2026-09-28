@@ -121,6 +121,16 @@ impl GitRepository {
         Ok(!self.status()?.is_empty())
     }
 
+    /// Unified working-tree diff vs HEAD for ONE path (workspace-relative;
+    /// `--` guards option parsing). Untracked files have no diff — they
+    /// surface through `status` instead.
+    pub fn diff_file(&self, path: &str) -> Result<String, GitError> {
+        if path.starts_with('-') {
+            return Err(GitError::UnsafePath(path.to_string()));
+        }
+        run_git(&self.root, &["diff", "--", path])
+    }
+
     /// Stage all changes and commit. Returns the new commit hash.
     pub fn commit_all(&self, message: &str) -> Result<String, GitError> {
         run_git(&self.root, &["add", "-A"])?;

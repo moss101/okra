@@ -497,6 +497,49 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
             };
         }
 
+        // ---- git surfaces: branch + working-tree changes + per-file diff ----
+        if path == "/api/git" {
+            return match serve::git_overview(&state.cwd) {
+                Ok(body) => write_http(
+                    stream,
+                    200,
+                    "OK",
+                    serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+                ),
+                Err((code, msg)) => write_http(
+                    stream,
+                    code,
+                    "error",
+                    serde_json::to_vec(&serde_json::json!({ "error": msg }))
+                        .unwrap_or_default()
+                        .as_slice(),
+                ),
+            };
+        }
+        if path == "/api/git/diff" || path.starts_with("/api/git/diff?") {
+            let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+            let rel = query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("path="))
+                .unwrap_or("");
+            return match serve::git_diff(&state.cwd, rel) {
+                Ok(body) => write_http(
+                    stream,
+                    200,
+                    "OK",
+                    serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+                ),
+                Err((code, msg)) => write_http(
+                    stream,
+                    code,
+                    "error",
+                    serde_json::to_vec(&serde_json::json!({ "error": msg }))
+                        .unwrap_or_default()
+                        .as_slice(),
+                ),
+            };
+        }
+
         if path == "/api/sessions" {
             let sessions = state.sessions.lock().unwrap();
             let list = serve::list_session_summaries(&state.sessions_dir, &sessions);

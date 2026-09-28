@@ -131,15 +131,102 @@ const files = {
   preview: null,
 };
 
+const gitState = {
+  active: false,
+  overview: null,   // {repository, branch, hash, changes[]}
+};
+
 function switchTab(tab) {
   files.active = tab === 'files';
-  $('tab-tasks').classList.toggle('active', !files.active);
+  gitState.active = tab === 'changes';
+  $('tab-tasks').classList.toggle('active', tab === 'tasks');
   $('tab-files').classList.toggle('active', files.active);
-  $('tab-tasks').setAttribute('aria-selected', String(!files.active));
-  $('tab-files').setAttribute('aria-selected', String(files.active));
-  $('task-list').hidden = files.active;
+  $('tab-changes').classList.toggle('active', gitState.active);
+  for (const [id, on] of [
+    ['tab-tasks', 'tasks'], ['tab-files', 'files'], ['tab-changes', 'changes'],
+  ]) {
+    $(id).setAttribute('aria-selected', String(tab === on));
+  }
+  $('task-list').hidden = files.active || gitState.active;
   $('file-tree').hidden = !files.active;
+  $('changes-list').hidden = !gitState.active;
   if (files.active && !files.dirs['']) loadFiles('');
+  if (gitState.active) loadGit();
+}
+
+async function loadGit() {
+  try {
+    const data = await fetch('/api/git').then((r) => r.json());
+    gitState.overview = data;
+    renderChanges();
+  } catch (_) { /* transient */ }
+}
+
+function renderChanges() {
+  const host = $('changes-list');
+  host.textContent = '';
+  const ov = gitState.overview;
+  if (!ov) { host.appendChild(el('div', 'tree-empty', 'loading…')); return; }
+  if (!ov.repository) {
+    host.appendChild(el('div', 'tree-empty', 'This workspace is not a git repository.'));
+    return;
+  }
+  const headRow = el('div', 'git-head');
+  headRow.appendChild(el('span', 'git-branch', ov.branch || 'HEAD'));
+  const dirty = (ov.changes || []).length;
+  headRow.appendChild(el('span', 'git-dirty', dirty ? dirty + ' changed' : 'clean'));
+  host.appendChild(headRow);
+  if (!dirty) {
+    host.appendChild(el('div', 'tree-empty', 'No working-tree changes.'));
+    return;
+  }
+  for (const c of ov.changes || []) {
+    const row = el('button', 'tree-row');
+    row.type = 'button';
+    row.appendChild(el('span', 'git-code ' + statusClass(c.code), c.code || 'M'));
+    row.appendChild(el('span', 'f-name', c.path));
+    row.addEventListener('click', () => openDiff(c.path));
+    host.appendChild(row);
+  }
+}
+
+function statusClass(code) {
+  if (!code) return 'st-mod';
+  if (code.includes('?')) return 'st-un';
+  if (code.includes('D')) return 'st-del';
+  if (code.includes('R')) return 'st-ren';
+  return 'st-mod';
+}
+
+async function openDiff(path) {
+  try {
+    const data = await fetch('/api/git/diff?path=' + encodeURIComponent(path)).then((r) => r.json());
+    if (data.error) { toast('error', 'Diff', data.error); return; }
+    $('preview-path').textContent = path;
+    $('preview-meta').textContent = 'working-tree diff vs HEAD';
+    const body = $('preview-body');
+    body.textContent = '';
+    if (!data.diff) {
+      const none = el('span', 'tool-nooutput', 'no diff (untracked file? see the Changes list code)');
+      body.appendChild(none);
+    } else {
+      for (const line of String(data.diff).split('\n')) {
+        const div = el('div', 'dl ' + diffLineClass(line));
+        div.textContent = line || ' ';
+        body.appendChild(div);
+      }
+    }
+    document.getElementById('preview-drawer').hidden = false;
+    document.getElementById('preview-backdrop').hidden = false;
+  } catch (_) { /* transient */ }
+}
+
+function diffLineClass(line) {
+  if (line.startsWith('+')) return 'dl-add';
+  if (line.startsWith('-')) return 'dl-del';
+  if (line.startsWith('@@')) return 'dl-hunk';
+  if (line.startsWith('diff ') || line.startsWith('index ')) return 'dl-meta';
+  return '';
 }
 
 async function loadFiles(rel) {
@@ -777,6 +864,7 @@ function init() {
 
   $('tab-tasks').addEventListener('click', () => switchTab('tasks'));
   $('tab-files').addEventListener('click', () => switchTab('files'));
+  $('tab-changes').addEventListener('click', () => switchTab('changes'));
   $('preview-close').addEventListener('click', closePreview);
   $('preview-backdrop').addEventListener('click', closePreview);
 
@@ -788,8 +876,9 @@ function init() {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'n') { e.preventDefault(); newTask(); }
   });
 
-  // keep the task list fresh (turns can finish in other surfaces)
-  setInterval(loadSessions, 15000);
+  // keep the task list fresh (turns can finish in other surfaces);
+  // the Changes tab rides the same cadence (writes land as diffs)
+  setInterval(() => { loadSessions(); if (gitState.active) loadGit(); }, 15000);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) loadSessions(); });
 }
 

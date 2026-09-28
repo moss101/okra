@@ -778,3 +778,77 @@ fn g4_files_api_lists_and_previews_safely() {
         std::panic::resume_unwind(panic);
     }
 }
+
+/// G4 breadth — git surfaces: the Changes tab source. Branch + status +
+/// per-file working-tree diff; honest `repository:false` outside a repo.
+#[test]
+fn g4_git_surfaces_report_branch_status_and_diff() {
+    let td = tempfile::tempdir().unwrap();
+    // a real repository with one committed file and one uncommitted change
+    let run = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(td.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    run(&["init", "-q"]);
+    run(&["config", "user.email", "drive@okra.local"]);
+    run(&["config", "user.name", "okra drive"]);
+    std::fs::write(td.path().join("committed.md"), "line one\nline two\n").unwrap();
+    run(&["add", "-A"]);
+    run(&["commit", "-q", "-m", "seed"]);
+    std::fs::write(td.path().join("committed.md"), "line one\nline two edited\n").unwrap();
+    std::fs::write(td.path().join("untracked.txt"), "new file").unwrap();
+
+    let (mut daemon, addr) = spawn_daemon(td.path());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // 1. overview: branch + both change kinds
+        let (status, body) = http_get(&addr, "/api/git");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"repository\":true"), "{body}");
+        assert!(body.contains("committed.md"), "{body}");
+        assert!(body.contains("untracked.txt"), "{body}");
+
+        // 2. the modified file has a real unified diff
+        let (status, body) = http_get(&addr, "/api/git/diff?path=committed.md");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("line two edited"), "{body}");
+        assert!(body.contains("diff --git"), "{body}");
+
+        // 3. an untracked file has NO diff (honest empty, not an error)
+        let (status, body) = http_get(&addr, "/api/git/diff?path=untracked.txt");
+        assert_eq!(status, 200, "{body}");
+
+        // 4. traversal and unknown files are refused honestly
+        let (status, _) = http_get(&addr, "/api/git/diff?path=..%2Fsecrets");
+        assert_eq!(status, 400);
+        // a path with no working-tree change is an honest EMPTY diff
+        // (git exits 0), not an error
+        let (status, body) = http_get(&addr, "/api/git/diff?path=no-such-file.md");
+        assert_eq!(status, 200);
+        assert!(body.contains("\"diff\":\"\""), "expected empty diff: {body}");
+
+        // 5. outside a repository: honest `repository:false`, diff refuses
+        let td2 = tempfile::tempdir().unwrap();
+        let (mut daemon2, addr2) = spawn_daemon(td2.path());
+        let inner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (status, body) = http_get(&addr2, "/api/git");
+            assert_eq!(status, 200);
+            assert!(body.contains("\"repository\":false"), "{body}");
+            let (status, _) = http_get(&addr2, "/api/git/diff?path=x");
+            assert_eq!(status, 400);
+        }));
+        let _ = daemon2.kill();
+        let _ = daemon2.wait();
+        if let Err(panic) = inner {
+            std::panic::resume_unwind(panic);
+        }
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
