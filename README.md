@@ -115,18 +115,22 @@ M6  scale                      ◐ i18n slice: daemon-side en-US/zh-CN catalog
 ```
 
 
-## G3 dogfooding week — started 2026-09-28
+## G3 dogfooding week — DEFERRED BY USER DECISION (2026-09-28, note N0009)
 
-Day 1: the harness (`scripts/dogfood-log.sh` + `docs/dogfood/day-01-2026-09-28.md`)
-was produced BY okra — `--provider openai` (glm-5.3-flash) driving
-write_file/list_dir/read_file through the real pipeline. Run 1 cancelled
-honestly on a gateway timeout; run 2 completed (16 steps, 15k tokens).
-Findings live in `docs/dogfood/`; week complete = 7 day entries.
-Both fixable day-1 findings closed same day (write mode preservation
-`282e511`; harness wc-padding `3e0b011`). Day-2 pre-flight (09-28
-15:40 +03): binary current with all fixes, `--version` clean, key
-parses (never printed), gateway 200 in 0.6 s, workspace + docs +
-script bits verified, automation armed for 07:30 +03.
+Dogfooding will restart once the application is complete (user: "we
+will start dog food once the app is complete — that would allow us to
+fetch and track more bugs"). The daily automation was deleted before
+its first fire; the M3 gate review moves with it.
+
+What stands: day 1 (2026-09-28) ran for real — `--provider openai`
+(glm-5.3-flash) driving write_file/list_dir/read_file through the
+actual pipeline; run 1 cancelled honestly on a gateway timeout, run 2
+completed (16 steps, 15k tokens). Both fixable day-1 findings were
+closed same day (write mode preservation `282e511`; harness wc-padding
+`3e0b011`). Day-1 artifacts remain banked in `docs/dogfood/` and the
+journal; the harness (`scripts/dogfood-log.sh`) is ready for the
+restart. Priority shifts to completing the app: M1 sandbox vendoring +
+real providers, M4 TUI, M5 differentiators, M6 remainder.
 
 ## Real-Zed ACP drive (2026-09-27)
 
