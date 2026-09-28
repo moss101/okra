@@ -376,10 +376,10 @@ pub fn find_callback_bot<'a>(
     provider: &str,
     payload: &Value,
 ) -> Option<&'a BotConfig> {
-    if let Some(bot_id) = payload.get("botId").and_then(Value::as_str) {
-        if !bot_id.is_empty() {
-            return find_bot(config, bot_id);
-        }
+    if let Some(bot_id) = payload.get("botId").and_then(Value::as_str)
+        && !bot_id.is_empty()
+    {
+        return find_bot(config, bot_id);
     }
     config
         .bots
@@ -455,8 +455,7 @@ pub fn get_workspace_key(workspace_path: &str, workspace_identity: Option<&str>)
 pub fn get_workspace_label(workspace_path: &str) -> String {
     workspace_path
         .split(['/', '\\'])
-        .filter(|s| !s.is_empty())
-        .next_back()
+        .rfind(|s: &&str| !s.is_empty())
         .unwrap_or(workspace_path)
         .to_string()
 }
@@ -497,10 +496,10 @@ pub fn resolve_workspace_by_value(
 ) -> Option<BotWorkspaceRef> {
     let trimmed = value.trim();
     let filtered = filter_allowed_workspaces(workspaces, allowed);
-    if let Ok(index) = trimmed.parse::<usize>() {
-        if index > 0 {
-            return filtered.get(index - 1).map(|w| (*w).clone());
-        }
+    if let Ok(index) = trimmed.parse::<usize>()
+        && index > 0
+    {
+        return filtered.get(index - 1).map(|w| (*w).clone());
     }
     let normalized = trimmed.to_lowercase();
     filtered
