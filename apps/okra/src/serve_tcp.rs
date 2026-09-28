@@ -73,6 +73,8 @@ pub struct TcpServeState {
     /// output-pump thread appending to a bounded scrollback the SSE
     /// endpoint streams incrementally.
     pub terminals: Mutex<BTreeMap<String, Arc<TermEntry>>>,
+    /// Runtime MCP status from explicit probes (Tools tab).
+    pub mcp_status: Mutex<BTreeMap<String, serde_json::Value>>,
     /// Per-turn sampler source (`--provider openai` → real network model;
     /// default → offline demo planner).
     pub sampler_factory: SamplerFactory,
@@ -121,6 +123,7 @@ impl TcpServeState {
             stop_flags: Mutex::new(BTreeMap::new()),
             approval_bridges: Mutex::new(BTreeMap::new()),
             terminals: Mutex::new(BTreeMap::new()),
+            mcp_status: Mutex::new(BTreeMap::new()),
             sampler_factory,
             sampler_label,
             next_static: std::sync::atomic::AtomicU64::new(0),
@@ -607,6 +610,31 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
         };
     }
 
+    if method == "POST" && (path == "/api/mcp/probe") {
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 {
+            reader.read_exact(&mut body)?;
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        let name = parsed["name"].as_str().map(str::to_string);
+        return match serve::mcp_probe(&state.cwd, &state.mcp_status, name.as_deref()) {
+            Ok(body) => write_http(
+                stream,
+                200,
+                "OK",
+                serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+            ),
+            Err((code, msg)) => write_http(
+                stream,
+                code,
+                "error",
+                serde_json::to_vec(&serde_json::json!({ "error": msg }))
+                    .unwrap_or_default()
+                    .as_slice(),
+            ),
+        };
+    }
     if path == "/api/skills" {
         let body = serve::skills_listing(&state.cwd);
         return write_http(
@@ -617,7 +645,7 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
         );
     }
     if path == "/api/mcp" {
-        let body = serve::mcp_listing(&state.cwd);
+        let body = serve::mcp_listing(&state.cwd, &state.mcp_status);
         return write_http(
             stream,
             200,

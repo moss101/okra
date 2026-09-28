@@ -1247,6 +1247,15 @@ html[data-theme="light"] .icon-moon { display: none; }
   color: var(--text-primary);
 }
 
+.mcp-status {
+  font-size: var(--text-xs);
+  border-radius: var(--radius-full);
+  padding: 0 8px;
+}
+.mcp-status.st-connected { color: var(--success); background: color-mix(in srgb, var(--success) 12%, transparent); }
+.mcp-status.st-timeout { color: var(--warning); background: color-mix(in srgb, var(--warning) 14%, transparent); }
+.mcp-status.st-error, .mcp-status.st-no-command { color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
+
 /* ---------- commit box ---------- */
 
 .git-section {

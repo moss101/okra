@@ -1380,3 +1380,78 @@ fn g4_steered_sends_carry_attachments() {
         std::panic::resume_unwind(panic);
     }
 }
+
+/// N0018 — runtime MCP status: probing a configured stdio server connects
+/// (initialize + tools/list), caches the status into /api/mcp, and unknown
+/// names probe nothing. The fixture is a real JSON-RPC-over-stdio
+/// responder — the transport is one-shot per request, so the shell script
+/// answers whichever request arrives.
+#[test]
+fn g4_mcp_probe_connects_and_caches_status() {
+    let td = tempfile::tempdir().unwrap();
+    // a one-shot MCP responder: echoes the request id, answers initialize
+    // and tools/list
+    let server_script = r#"#!/bin/sh
+read req
+id=$(printf '%s' "$req" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+case "$req" in
+  *initialize*)
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"fake-tools","version":"1.0"}}}\n' "$id" ;;
+  *tools/list*)
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"probe-tool","description":"canned","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+  *)
+    printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+esac
+"#;
+    let fixture = td.path().join("fake-mcp.sh");
+    std::fs::write(&fixture, server_script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::create_dir_all(td.path().join(".okra")).unwrap();
+    std::fs::write(
+        td.path().join(".okra").join("config.json"),
+        serde_json::json!({
+            "mcp": { "servers": {
+                "fake": { "command": fixture.to_string_lossy() },
+                "broken": { "command": "/nope/no-such-mcp-server" }
+            } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let (mut daemon, addr) = spawn_daemon(td.path());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // 1. probe all: fake connects, broken errors
+        let (status, body) = http_post(&addr, "/api/mcp/probe", &serde_json::json!({}));
+        assert_eq!(status, 200, "{body}");
+        let body = body.to_string();
+        assert!(body.contains("probe-tool"), "tool names missing: {body}");
+        assert!(body.contains("connected"), "{body}");
+
+        // 2. the status is CACHED into the listing
+        let (status, body) = http_get(&addr, "/api/mcp");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"status\":\"connected\""), "no cached status: {body}");
+        assert!(body.contains("probe-tool"), "cached tools missing: {body}");
+
+        // 3. probing a single named server works and prunes others' output
+        let (status, body) = http_post(
+            &addr,
+            "/api/mcp/probe",
+            &serde_json::json!({ "name": "broken" }),
+        );
+        assert_eq!(status, 200, "{body}");
+        let body = body.to_string();
+        assert!(body.contains("broken"), "{body}");
+        assert!(body.contains("error"), "broken server not reported: {body}");
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}

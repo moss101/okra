@@ -1383,11 +1383,82 @@ pub fn skills_listing(cwd: &Path) -> serde_json::Value {
     serde_json::json!({ "dir": ".okra/skills", "skills": skills })
 }
 
+/// POST /api/mcp/probe — connect to one (or all) configured stdio MCP
+/// servers, initialize + tools/list with a bounded wait, and cache the
+/// runtime status the Tools tab displays. Probing is explicit (a POST),
+/// never a side effect of listing.
+pub fn mcp_probe(
+    cwd: &Path,
+    status_cache: &Mutex<std::collections::BTreeMap<String, serde_json::Value>>,
+    name: Option<&str>,
+) -> Result<serde_json::Value, (u16, String)> {
+    use std::sync::mpsc;
+    let home = okra_host::fsutil::home_dir().unwrap_or_else(|| cwd.to_path_buf());
+    let svc = okra_host::mcp_sync::McpSyncService::new(home);
+    let servers = svc.load(Some(cwd)).map_err(|e| (500, e.to_string()))?;
+    let mut probed = Vec::new();
+    for r in servers {
+        if let Some(n) = name && r.name != n {
+            continue;
+        }
+        let command = r.config["command"].as_str().map(str::to_string);
+        let args: Vec<String> = r.config["args"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        let mut status = serde_json::json!({
+            "name": r.name,
+            "enabled": r.enabled,
+            "status": "no-command",
+            "probedAt": now_ms(),
+        });
+        if let Some(command) = command {
+            let (tx, rx) = mpsc::channel();
+            let srv = r.name.clone();
+            std::thread::spawn(move || {
+                let mut client = okra_tools::McpClient::stdio(&srv, &command, &args);
+                if client.initialize().is_err() {
+                    let _ = tx.send(serde_json::json!({ "status": "error" }));
+                    return;
+                }
+                let tools = client.tools_list().unwrap_or_default();
+                let _ = tx.send(serde_json::json!({
+                    "status": "connected",
+                    "protocolVersion": client.protocol_version,
+                    "serverInfo": client.server_info,
+                    "tools": tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+                    "toolCount": tools.len(),
+                }));
+            });
+            match rx.recv_timeout(std::time::Duration::from_secs(8)) {
+                Ok(mut result) => {
+                    result["name"] = serde_json::json!(r.name);
+                    result["enabled"] = serde_json::json!(r.enabled);
+                    result["probedAt"] = serde_json::json!(now_ms());
+                    status = result;
+                }
+                Err(_) => {
+                    status["status"] = serde_json::json!("timeout");
+                }
+            }
+        }
+        status_cache
+            .lock()
+            .unwrap()
+            .insert(r.name.clone(), status.clone());
+        probed.push(status);
+    }
+    Ok(serde_json::json!({ "probed": probed }))
+}
+
 /// GET /api/mcp — configured MCP servers across scopes (workspace
-/// `.okra/mcp.json` wins over user-level configs). Status is the sync
-/// domain's truth: enabled flag + source + scope; the launch summary is
-/// the command/url from the config.
-pub fn mcp_listing(cwd: &Path) -> serde_json::Value {
+/// `.okra/config.json` `mcp.servers` wins over user-level sources).
+/// Status is the sync domain's truth (enabled + source + scope) plus the
+/// cached RUNTIME status from the last explicit probe, when present.
+pub fn mcp_listing(
+    cwd: &Path,
+    status_cache: &Mutex<std::collections::BTreeMap<String, serde_json::Value>>,
+) -> serde_json::Value {
     let home = okra_host::fsutil::home_dir().unwrap_or_else(|| cwd.to_path_buf());
     let svc = okra_host::mcp_sync::McpSyncService::new(home);
     let servers: Vec<serde_json::Value> = svc
@@ -1411,13 +1482,17 @@ pub fn mcp_listing(cwd: &Path) -> serde_json::Value {
                 .or_else(|| r.config["url"].as_str().map(str::to_string))
                 .or_else(|| r.config["type"].as_str().map(str::to_string))
                 .unwrap_or_default();
-            serde_json::json!({
+            let mut item = serde_json::json!({
                 "name": r.name,
                 "enabled": r.enabled,
                 "source": r.source.as_str(),
                 "scope": if r.workspace_path.is_some() { "workspace" } else { "user" },
                 "summary": summary,
-            })
+            });
+            if let Some(st) = status_cache.lock().unwrap().get(&r.name) {
+                item["status"] = st.clone();
+            }
+            item
         })
         .collect();
     serde_json::json!({ "servers": servers })

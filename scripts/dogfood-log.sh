@@ -1,5 +1,5 @@
 #!/bin/sh
-# dogfood-log.sh — append a dated entry to journal/<label>.md
+# dogfood-log.sh — append a dated entry to journal/<dated>-<label>.md
 # usage: dogfood-log.sh <label> [--stream <ndjson-file>] [notes ...]
 
 set -eu
@@ -24,6 +24,10 @@ fi
 
 mkdir -p journal
 
+# day-1 convention: dated journal files (journal/2026-09-28-day01.md);
+# the bare label drifted from it (G3 session-4 finding)
+dated=$(date +%Y-%m-%d)
+
 stream_line=
 if [ -n "$stream" ]; then
     mkdir -p streams
@@ -46,7 +50,7 @@ else
     version=okra
 fi
 
-file=journal/$label.md
+file=journal/${dated}-${label}.md
 
 if [ ! -f "$file" ]; then
     printf '# %s\n' "$label" > "$file"

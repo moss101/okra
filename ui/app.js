@@ -198,7 +198,23 @@ function renderTools() {
   }
 
   const servers = (tools.data.mcp && tools.data.mcp.servers) || [];
-  host.appendChild(el('div', 'git-section', 'MCP servers'));
+  const mcpHead = el('div', 'git-section');
+  mcpHead.appendChild(el('span', null, 'MCP servers'));
+  const probeBtn = el('button', 'stage-btn', 'probe');
+  probeBtn.type = 'button';
+  probeBtn.title = 'Connect + list tools (bounded)';
+  probeBtn.style.marginLeft = 'auto';
+  probeBtn.style.textTransform = 'none';
+  probeBtn.style.letterSpacing = 'normal';
+  probeBtn.addEventListener('click', async () => {
+    probeBtn.disabled = true;
+    try {
+      await post('/api/mcp/probe', {});
+      await loadTools();
+    } catch (_) { /* transient */ }
+  });
+  mcpHead.appendChild(probeBtn);
+  host.appendChild(mcpHead);
   if (!servers.length) {
     host.appendChild(el('div', 'tree-empty',
       'None configured — add servers to .okra/mcp.json.'));
@@ -209,8 +225,21 @@ function renderTools() {
     head.appendChild(el('span', 'mcp-dot' + (sv.enabled ? ' on' : ' off')));
     head.appendChild(el('span', 'tool-entry-name', sv.name));
     head.appendChild(el('span', 'mcp-scope', (sv.scope || '') + ' · ' + (sv.source || '')));
+    head.appendChild(el('span', 'tool-entry-name', sv.name));
+    if (sv.status && sv.status.status) {
+      head.appendChild(el('span', 'mcp-status st-' + sv.status.status,
+        sv.status.status === 'connected'
+          ? 'connected · ' + (sv.status.toolCount || 0) + ' tools'
+          : sv.status.status));
+    }
+    head.appendChild(el('span', 'mcp-scope', (sv.scope || '') + ' · ' + (sv.source || '')));
     row.appendChild(head);
     if (sv.summary) row.appendChild(el('div', 'tool-entry-desc mono', sv.summary));
+    if (sv.status && (sv.status.tools || []).length) {
+      const chips = el('div', 'pattern-chips');
+      for (const tn of sv.status.tools) chips.appendChild(el('span', 'pattern-chip', tn));
+      row.appendChild(chips);
+    }
     if (!sv.enabled) row.appendChild(el('div', 'tool-entry-desc', 'disabled'));
     host.appendChild(row);
   }
