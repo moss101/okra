@@ -210,7 +210,7 @@ pub fn app_ca_cert_paths(config_dir: &Path) -> (PathBuf, PathBuf) {
 
 /// Status of the app CA pair on disk (the reuse contract is exact:
 /// BOTH present → reuse; anything else → generation is required, which
-/// needs an X.509 crate decision and is deliberately not half-rolled here).
+/// `ensure_app_ca_pair` performs via rcgen — pure Rust, ECDSA-P256).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppCaPairStatus {
     /// cert + key both present → reuse (fingerprints stay stable).
@@ -234,6 +234,100 @@ pub fn app_ca_pair_status(config_dir: &Path) -> (AppCaPairStatus, PathBuf, PathB
         (false, false) => AppCaPairStatus::Missing,
     };
     (status, cert, key)
+}
+
+/// The X.509/PEM result of a generation pass.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeneratedCaPem {
+    pub cert_pem: String,
+    pub key_pem: String,
+}
+
+/// Generate a self-signed CA (ECDSA-P256, SHA-256, 10-year validity,
+/// `CA: true` + `keyCertSign`/`cRLSign`/`digitalSignature` — the donor's
+/// profile with an EC key instead of RSA-2048; equal security at far less
+/// code, and the PEM is consumed by the same NODE_EXTRA_CA_CERTS channel).
+pub fn generate_self_signed_ca_pem(common_name: &str) -> Result<GeneratedCaPem, String> {
+    let mut params = rcgen::CertificateParams::new(vec![]).map_err(|e| e.to_string())?;
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, common_name);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::OrganizationName, "okra");
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CountryName, "XX");
+    let not_before = rcgen::date_time_ymd(2026, 9, 28);
+    params.not_before = not_before;
+    params.not_after = rcgen::date_time_ymd(2036, 9, 26); // ~10 years
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+        rcgen::KeyUsagePurpose::DigitalSignature,
+    ];
+    // cryptographically random serial
+    let mut serial = [0u8; 16];
+    fill_random(&mut serial);
+    serial[0] &= 0x7f; // keep the serial non-negative
+    params.serial_number = Some(rcgen::SerialNumber::from_slice(&serial));
+
+    let key_pair = rcgen::KeyPair::generate().map_err(|e| format!("CA keygen: {e}"))?;
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|e| format!("CA self-sign: {e}"))?;
+    Ok(GeneratedCaPem {
+        cert_pem: cert.pem(),
+        key_pem: key_pair.serialize_pem(),
+    })
+}
+
+fn fill_random(buf: &mut [u8]) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    // mix time + pid + a counter: non-secret material (a serial number),
+    // so this PRNG is adequate; no key material derives from it.
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut state = t ^ (std::process::id() as u64) << 32 ^ COUNTER.fetch_add(1, Ordering::Relaxed);
+    for chunk in buf.chunks_mut(8) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        for (i, b) in chunk.iter_mut().enumerate() {
+            *b = (state >> (i * 8)) as u8;
+        }
+    }
+}
+
+/// Ensure the app CA pair exists; generate on first use. Idempotent: when
+/// cert AND key are already present they are returned as-is, so the
+/// fingerprint stays stable and already-trusted children never see drift.
+/// The key file is written 0600 (sensitive material); the cert 0644.
+pub fn ensure_app_ca_pair(
+    config_dir: &Path,
+) -> Result<(AppCaPairStatus, PathBuf, PathBuf), String> {
+    let (status, cert_path, key_path) = app_ca_pair_status(config_dir);
+    if status == AppCaPairStatus::Complete {
+        return Ok((status, cert_path, key_path));
+    }
+    // a half-present pair is stale by contract — regenerate both together
+    let certs_dir = cert_path
+        .parent()
+        .ok_or_else(|| "cert path has no parent".to_string())?;
+    std::fs::create_dir_all(certs_dir).map_err(|e| format!("create certs dir: {e}"))?;
+    let pem = generate_self_signed_ca_pem("okra Network CA")?;
+    std::fs::write(&cert_path, &pem.cert_pem).map_err(|e| format!("write cert: {e}"))?;
+    std::fs::write(&key_path, &pem.key_pem).map_err(|e| format!("write key: {e}"))?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&cert_path, std::fs::Permissions::from_mode(0o644))
+        .map_err(|e| format!("cert perms: {e}"))?;
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("key perms: {e}"))?;
+    Ok((AppCaPairStatus::Complete, cert_path, key_path))
 }
 
 #[cfg(test)]
@@ -338,6 +432,41 @@ mod tests {
         let path = patch.get("PATH").map(String::as_str).unwrap();
         assert!(path.ends_with(&dir.join("bfs").to_string_lossy().to_string()), "{path}");
         assert!(path.starts_with("/usr/bin"), "{path}");
+    }
+
+    #[test]
+    fn ensure_app_ca_pair_generates_then_reuses() {
+        let td = tempfile::tempdir().unwrap();
+        let (status, cert, key) = ensure_app_ca_pair(td.path()).unwrap();
+        assert_eq!(status, AppCaPairStatus::Complete);
+        let cert_pem = std::fs::read_to_string(&cert).unwrap();
+        let key_pem = std::fs::read_to_string(&key).unwrap();
+        assert!(cert_pem.starts_with("-----BEGIN CERTIFICATE-----"), "{cert_pem}");
+        assert!(key_pem.contains("PRIVATE KEY"), "{key_pem}");
+
+        use std::os::unix::fs::PermissionsExt;
+        let key_mode = std::fs::metadata(&key).unwrap().permissions().mode();
+        assert_eq!(key_mode & 0o777, 0o600, "key must be 0600");
+        let cert_mode = std::fs::metadata(&cert).unwrap().permissions().mode();
+        assert_eq!(cert_mode & 0o777, 0o644);
+
+        // idempotent: second call reuses the exact same bytes (stable
+        // fingerprint — an already-trusted child must never see drift)
+        let cert_before = std::fs::read(&cert).unwrap();
+        let (status2, cert2, key2) = ensure_app_ca_pair(td.path()).unwrap();
+        assert_eq!(status2, AppCaPairStatus::Complete);
+        assert_eq!(cert2, cert);
+        assert_eq!(key2, key);
+        assert_eq!(std::fs::read(&cert2).unwrap(), cert_before);
+    }
+
+    #[test]
+    fn generated_ca_pem_pair_is_wellformed() {
+        let pem = generate_self_signed_ca_pem("okra Network CA").unwrap();
+        assert!(pem.cert_pem.contains("BEGIN CERTIFICATE"));
+        assert!(pem.cert_pem.contains("END CERTIFICATE"));
+        assert!(pem.key_pem.contains("PRIVATE KEY"));
+        assert!(pem.cert_pem.len() > 400, "a real CA cert is non-trivial");
     }
 
     #[test]
