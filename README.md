@@ -132,7 +132,9 @@ captured.
 `okra serve --tcp` serves a real task workbench at `http://127.0.0.1:<port>/`
 (decision N0008): tasks sidebar + streaming transcript + send/stop composer,
 paired light/dark design tokens (ChatGPT2 docs/07 token architecture), tool
-cards with status/duration, steered-message chips, turn dividers, in-app
+cards with status/duration/**and real output bodies** (tool outputs are
+logged — model-visible means logged — and replayed; pre-output logs fall
+back to status-only cards), steered-message chips, turn dividers, in-app
 turn-complete toasts. It drives the full pipeline — `--provider openai
 --model NAME` for a real network model, the same four-tool registry as the
 CLI — and survives reloads: tasks list from the SQLite index
