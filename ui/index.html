@@ -106,8 +106,10 @@
         Turn in progress — sending will steer the running task.
       </div>
       <div class="composer" id="composer">
-        <textarea id="composer-input" rows="1" placeholder="Describe a task…"
+        <div class="attach-chips" id="attach-chips" hidden></div>
+        <textarea id="composer-input" rows="1" placeholder="Describe a task…  (@ to mention a file)"
           aria-label="Task input"></textarea>
+        <div class="mention-pop" id="mention-pop" hidden></div>
         <button class="send-btn" id="send-btn" type="button" disabled title="Send (Enter)">
           <svg class="icon-send" viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path d="M2.5 8 13 3 9.5 13 7.5 8.8 2.5 8Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
           <svg class="icon-stop" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><rect x="3" y="3" width="10" height="10" rx="2" fill="currentColor"/></svg>

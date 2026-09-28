@@ -643,6 +643,29 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
             ),
         };
     }
+    if path == "/api/files/search" || path.starts_with("/api/files/search?") {
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let q = query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("q="))
+            .unwrap_or("");
+        return match serve::file_search(&state.cwd, q) {
+            Ok(body) => write_http(
+                stream,
+                200,
+                "OK",
+                serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+            ),
+            Err((code, msg)) => write_http(
+                stream,
+                code,
+                "error",
+                serde_json::to_vec(&serde_json::json!({ "error": msg }))
+                    .unwrap_or_default()
+                    .as_slice(),
+            ),
+        };
+    }
     if path == "/api/file" || path.starts_with("/api/file?") {
         let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
         let rel = query
@@ -1155,6 +1178,22 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
     }
 
     let text = envelope["payload"]["text"].as_str().unwrap_or_default().to_string();
+    let attachments: Vec<String> = envelope["payload"]["attachments"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    // refuse traversal BEFORE anything surfaces
+    for a in &attachments {
+        if a.split(['/', '\\']).any(|seg| seg == "..") || a.starts_with('-') {
+            return serde_json::json!({
+                "commandId": command_id,
+                "status": "rejected",
+                "reasonCode": "okra.attachment.pathRefused",
+                "message": format!("attachment path refused: {a}"),
+                "revisionAtDecision": 0,
+            });
+        }
+    }
     if cmd_type != "createSession" && cmd_type != "sendText" {
         return serde_json::json!({"commandId":command_id,"status":"rejected","reasonCode":"g4.unsupported","revisionAtDecision":0});
     }
@@ -1238,6 +1277,7 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
                 projection, Some(Arc::clone(&steer_queue)),
                 Arc::clone(&stop_flag), &factory,
                 Arc::clone(&bridge), false,
+                attachments.clone(),
             );
             let queued: Vec<String> = {
                 let mut q = steer_queue.lock().unwrap(); q.drain(..).collect()

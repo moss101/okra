@@ -175,6 +175,13 @@ anchored so content never jumps when checkpoints refine). A 2k-row
 streaming task stays bounded and smooth; verified live at 127 rows with a
 24-node window and across replay.
 
+**Composer mentions + attachments (N0017):** `@` in the composer
+completes workspace file paths (daemon-side recursive search, confined);
+attached files fold their CONTENT into the logged, model-visible user
+message (16 KB/file, 48 KB/turn), with the attachment list on the row for
+the transcript chips. Traversal pathspecs are refused pre-surface.
+Limitation: steering (mid-turn) sends carry text only.
+
 **Tools tab (N0015):** a fourth sidebar tab projects the installed
 skills (`.okra/skills/*.md` — name, description, path-conditional
 patterns) and the configured MCP servers (workspace + user scopes,

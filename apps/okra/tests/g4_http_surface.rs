@@ -1205,3 +1205,98 @@ fn g4_tools_surface_projects_skills_and_mcp() {
         std::panic::resume_unwind(panic);
     }
 }
+
+/// N0017 — composer attachments: the payload's attachment paths fold their
+/// CONTENT into the logged, model-visible user message (model-visible
+/// means logged), the row carries the attachment list for the UI chips,
+/// and traversal pathspecs are refused before anything surfaces.
+#[test]
+fn g4_attachments_fold_into_the_turn() {
+    let td = tempfile::tempdir().unwrap();
+    let secret = "okra-attachment-marker-7f3a";
+    std::fs::write(td.path().join("notes.md"), format!("# notes\n{secret}\n")).unwrap();
+    let (mut daemon, addr) = spawn_daemon(td.path());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let frames = std::sync::Arc::new(mutex_vec());
+        let writer = std::sync::Arc::clone(&frames);
+        let a = addr.to_string();
+        let t = std::thread::spawn(move || {
+            sse_collect(&a, "att-session", &writer, &|f| {
+                f.iter().any(|f| f["params"]["control"]["phase"] == "completedSuccess")
+            })
+        });
+        std::thread::sleep(Duration::from_millis(300));
+
+        // 1. traversal is refused pre-surface
+        let (status, reply) = http_post_command(&addr, &serde_json::json!({
+            "commandId": "att-bad",
+            "type": "sendText",
+            "sessionId": "att-session",
+            "payload": { "text": "leak this", "attachments": ["../secrets"] }
+        }));
+        assert_eq!(status, 400, "{reply}");
+        assert_eq!(reply["reasonCode"], "okra.attachment.pathRefused", "{reply}");
+
+        // 2. a real attachment folds into the turn
+        let (status, reply) = http_post_command(&addr, &serde_json::json!({
+            "commandId": "att-1",
+            "type": "sendText",
+            "sessionId": "att-session",
+            "payload": {
+                "text": "summarize the attached file",
+                "attachments": ["notes.md"]
+            }
+        }));
+        assert_eq!(status, 200, "{reply}");
+
+        let got = wait_for(&frames, &|f| {
+            f.iter().any(|f| f["params"]["control"]["phase"] == "completedSuccess")
+        });
+        assert!(got, "turn never completed");
+        let _ = t.join();
+
+        // 3. the fold is model-visible AND logged: the replayed user row
+        //    carries the attachment list AND the file content
+        let (status, rows) = http_get(&addr, "/api/sessions/att-session/rows");
+        assert_eq!(status, 200, "{rows}");
+        assert!(rows.contains("\"attachments\":[\"notes.md\"]"), "row lacks attachment list: {rows}");
+        assert!(rows.contains(secret), "attached content never reached the model-visible turn: {rows}");
+
+        // 4. missing attachments are listed, not fatal. (Wait for turn 1:
+        // a command landing on a LIVE turn is steering, and the steering
+        // queue carries text only — attachments belong to idle-turn sends.)
+        let idle = wait_for(&frames, &|f| {
+            f.iter().any(|f| f["params"]["control"]["phase"] == "completedSuccess")
+        });
+        assert!(idle, "turn 1 never completed");
+        std::thread::sleep(Duration::from_millis(300));
+        let (status, reply) = http_post_command(&addr, &serde_json::json!({
+            "commandId": "att-2",
+            "type": "sendText",
+            "sessionId": "att-session",
+            "payload": {
+                "text": "second turn",
+                "attachments": ["does-not-exist.md"]
+            }
+        }));
+        assert_eq!(status, 200, "{reply}");
+        // poll the replay until the second turn's fold is on disk
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut reported = false;
+        while Instant::now() < deadline {
+            let (status, rows) = http_get(&addr, "/api/sessions/att-session/rows");
+            assert_eq!(status, 200);
+            if rows.contains("attachments not loaded: does-not-exist.md") {
+                reported = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert!(reported, "missing attachment not reported honestly");
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}

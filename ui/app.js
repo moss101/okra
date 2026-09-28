@@ -594,7 +594,7 @@ function newTask() {
 async function send() {
   const input = $('composer-input');
   const text = input.value.trim();
-  if (!text) return;
+  if (!text && !state.attachments.length) return;
 
   let id = state.activeId;
   const isNew = !id;
@@ -607,6 +607,8 @@ async function send() {
     connectSSE(id);
   }
   input.value = '';
+  const attachments = state.attachments.splice(0);
+  renderAttachChips();
   autosize();
   refreshComposerMode();
 
@@ -615,7 +617,7 @@ async function send() {
       commandId: 'web-' + Date.now(),
       type: isNew ? 'createSession' : 'sendText',
       sessionId: id,
-      payload: { text },
+      payload: { text, attachments },
     });
   } catch (e) {
     toast('error', 'Could not send', String(e));
@@ -761,6 +763,13 @@ function buildRowNode(r) {
         text = text.slice('[steered] '.length);
       }
       bubble.appendChild(document.createTextNode(text));
+      for (const p of r.attachments || []) {
+        const chip = el('span', 'attach-chip static');
+        chip.appendChild(el('span', 'attach-name', p));
+        chip.addEventListener('click', () => openPreview(p));
+        bubble.appendChild(el('div'));
+        bubble.appendChild(chip);
+      }
       div.appendChild(bubble);
       break;
     }
@@ -1136,11 +1145,12 @@ function refreshComposerMode() {
 }
 
 function updateSendDisabled() {
-  const hasText = $('composer-input').value.trim().length > 0;
+  const hasPayload = $('composer-input').value.trim().length > 0
+    || state.attachments.length > 0;
   const running = turnActive();
   // while a turn is live (running or awaiting approval) the button is STOP
   // (enabled when a task is active); otherwise it sends (enabled on text)
-  $('send-btn').disabled = running ? !state.activeId : !hasText;
+  $('send-btn').disabled = running ? !state.activeId : !hasPayload;
 }
 
 function autosize() {
@@ -1219,6 +1229,98 @@ async function requestNotificationPermission() {
   if (Notification.permission === 'default') {
     try { await Notification.requestPermission(); } catch (_) { /* denied */ }
   }
+}
+
+/* ---------- composer attachments + @-mentions (ChatGPT2 docs/07) ----------
+ *
+ * Chips hold workspace paths; the daemon folds their CONTENT into the
+ * logged, model-visible user message (bounded). @-tokens in the composer
+ * query GET /api/files/search and complete to workspace paths.
+ */
+
+state.attachments = [];
+
+function renderAttachChips() {
+  const host = $('attach-chips');
+  host.textContent = '';
+  host.hidden = !state.attachments.length;
+  for (const p of state.attachments) {
+    const chip = el('span', 'attach-chip');
+    chip.appendChild(el('span', 'attach-name', p));
+    const x = el('button', 'attach-x', '\u00d7');
+    x.type = 'button';
+    x.title = 'Remove attachment';
+    x.addEventListener('click', () => {
+      state.attachments = state.attachments.filter((q) => q !== p);
+      renderAttachChips();
+    });
+    chip.appendChild(x);
+    host.appendChild(chip);
+  }
+  updateSendDisabled();
+}
+
+function addAttachment(p) {
+  if (!p || state.attachments.includes(p)) return;
+  state.attachments.push(p);
+  renderAttachChips();
+}
+
+/* --- mentions --- */
+
+const mentions = { open: false, items: [], start: -1, token: '' };
+
+function updateMentions() {
+  const t = $('composer-input');
+  const upToCaret = t.value.slice(0, t.selectionStart);
+  const m = /(^|\s)@([^\s@]*)$/.exec(upToCaret);
+  if (!m) { closeMentions(); return; }
+  mentions.start = t.selectionStart - m[2].length - 1;
+  mentions.token = m[2];
+  clearTimeout(mentions.debounce);
+  mentions.debounce = setTimeout(async () => {
+    try {
+      const data = await fetch('/api/files/search?q=' + encodeURIComponent(mentions.token))
+        .then((r) => r.json());
+      mentions.items = (data.matches || []).filter((p) => !state.attachments.includes(p));
+      mentions.open = mentions.items.length > 0;
+      renderMentions();
+    } catch (_) { /* transient */ }
+  }, 120);
+}
+
+function renderMentions() {
+  const pop = $('mention-pop');
+  pop.textContent = '';
+  pop.hidden = !mentions.open;
+  if (!mentions.open) return;
+  mentions.items.slice(0, 8).forEach((p, i) => {
+    const item = el('button', 'mention-item' + (i === 0 ? ' sel' : ''), p);
+    item.type = 'button';
+    item.addEventListener('click', () => applyMention(p));
+    pop.appendChild(item);
+  });
+}
+
+function applyMention(p) {
+  const t = $('composer-input');
+  if (mentions.start >= 0) {
+    t.value = t.value.slice(0, mentions.start) + p + ' ' + t.value.slice(t.selectionStart);
+    mentions.open = false;
+    $('mention-pop').hidden = true;
+    t.focus();
+    const caret = mentions.start + p.length + 1;
+    t.setSelectionRange(caret, caret);
+  }
+  // a mentioned file doubles as an attachment: its content rides the turn
+  addAttachment(p);
+  autosize();
+  updateSendDisabled();
+}
+
+function closeMentions() {
+  mentions.open = false;
+  $('mention-pop').hidden = true;
 }
 
 /* ---------- theme ---------- */
@@ -1443,8 +1545,25 @@ function init() {
   $('new-task').addEventListener('click', newTask);
 
   const input = $('composer-input');
-  input.addEventListener('input', () => { autosize(); updateSendDisabled(); });
+  input.addEventListener('input', () => { autosize(); updateSendDisabled(); updateMentions(); });
   input.addEventListener('keydown', (e) => {
+    if (mentions.open) {
+      const items = [...document.querySelectorAll('.mention-item')];
+      const sel = items.findIndex((i) => i.classList.contains('sel'));
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        const next = e.key === 'ArrowDown'
+          ? Math.min(items.length - 1, sel + 1) : Math.max(0, sel - 1);
+        items.forEach((it, i) => it.classList.toggle('sel', i === next));
+        return;
+      }
+      if (e.key === 'Enter' && items.length) {
+        e.preventDefault();
+        applyMention(mentions.items[Math.max(0, sel)]);
+        return;
+      }
+      if (e.key === 'Escape') { e.preventDefault(); closeMentions(); return; }
+    }
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!turnActive()) send(); }
   });
 

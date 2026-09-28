@@ -469,12 +469,18 @@ pub fn run_turn_streaming(
     sampler_factory: &SamplerFactory,
     approvals: Arc<SurfaceApprovalChannel>,
     unattended: bool,
+    attachments: Vec<String>,
 ) -> Result<TurnOutcome, String> {
     let steering_rx = steering;
+    // attachments fold BEFORE anything surfaces: model-visible means
+    // logged, so the folded text is what the row and the kernel event
+    // carry (the raw attachment list rides the row for the UI chips).
+    let input_text_orig = input_text.clone();
+    let (input_text, attachments) = fold_attachments(&cwd, &input_text, &attachments);
     // 1. turnHeader (running) + userInput rows
     let (assistant_row_slot, turn_id) = {
         let mut p = turn_row_lock.lock().unwrap();
-        p.set_title_if_empty(&input_text);
+        p.set_title_if_empty(&input_text_orig);
         let turn_id = uuid_v4();
         let (header_id, header_row, _) = p.base_row(&turn_id);
         let header = {
@@ -493,6 +499,9 @@ pub fn run_turn_streaming(
             r["kind"] = serde_json::json!("userInput");
             r["text"] = serde_json::json!(input_text);
             r["origin"] = serde_json::json!("realUser");
+            if !attachments.is_empty() {
+                r["attachments"] = serde_json::json!(attachments);
+            }
             r
         };
         p.upsert_row(user);
@@ -822,7 +831,7 @@ pub fn rows_from_kernel_events(
                 let steered = data["origin"].as_str() == Some("steering");
                 let row_id = next_row_id;
                 next_row_id += 1;
-                rows.push(serde_json::json!({
+                let mut row = serde_json::json!({
                     "rowId": row_id,
                     "turnId": format!("t{current_turn}"),
                     "createdAt": ev.time,
@@ -830,7 +839,21 @@ pub fn rows_from_kernel_events(
                     "kind": "userInput",
                     "text": if steered { format!("[steered] {text}") } else { text.to_string() },
                     "origin": "realUser",
-                }));
+                });
+                // attachments are replayed from the fold markers in the
+                // logged text (the transcript of record)
+                let attached: Vec<&str> = text
+                    .match_indices("[Attached file: ")
+                    .filter_map(|(i, _)| {
+                        let rest = &text[i + "[Attached file: ".len()..];
+                        let end = rest.find(']')?;
+                        rest[..end].split(" — ").next()
+                    })
+                    .collect();
+                if !attached.is_empty() {
+                    row["attachments"] = serde_json::json!(attached);
+                }
+                rows.push(row);
             }
             "assistant/message" => {
                 let row_id = next_row_id;
@@ -1195,6 +1218,102 @@ pub fn git_commit(cwd: &Path, message: &str) -> Result<serde_json::Value, (u16, 
     Ok(serde_json::json!({ "hash": hash, "branch": repo.head().map(|h| h.branch).unwrap_or_default() }))
 }
 
+/// Per-turn attachment budget: content is folded into the logged,
+/// model-visible user message, so it is bounded like any other prompt.
+const ATTACH_FILE_CAP: usize = 16 * 1024;
+const ATTACH_TOTAL_CAP: usize = 48 * 1024;
+
+/// Fold attachment files into the turn input: each existing, confined file
+/// inlines as a fenced block after the prompt; missing/unreadable ones are
+/// listed as such. Model-visible means logged — the fold happens BEFORE
+/// the user message row/event, so the log stays the transcript of record.
+fn fold_attachments(
+    cwd: &Path,
+    input_text: &str,
+    attachments: &[String],
+) -> (String, Vec<String>) {
+    if attachments.is_empty() {
+        return (input_text.to_string(), Vec::new());
+    }
+    let mut folded = String::new();
+    let mut missing = Vec::new();
+    let mut total = 0usize;
+    for rel in attachments {
+        let Ok(file) = confine_to_workspace(cwd, rel) else {
+            missing.push(rel.clone());
+            continue;
+        };
+        let bytes = match okra_host::safe_fs::safe_read(&file) {
+            Ok(b) => b,
+            Err(_) => {
+                missing.push(rel.clone());
+                continue;
+            }
+        };
+        if total + bytes.len().min(ATTACH_FILE_CAP) > ATTACH_TOTAL_CAP {
+            missing.push(format!("{rel} (attachment budget exhausted)"));
+            continue;
+        }
+        let capped = bytes.len() > ATTACH_FILE_CAP;
+        let shown = &bytes[..bytes.len().min(ATTACH_FILE_CAP)];
+        let text = String::from_utf8_lossy(shown);
+        folded.push_str(&format!(
+            "\n\n[Attached file: {rel}{}]\n```\n{}\n```",
+            if capped { " — truncated" } else { "" },
+            text.trim_end(),
+        ));
+        total += shown.len();
+    }
+    let mut out = input_text.to_string();
+    if !folded.is_empty() {
+        out.push_str("\n\n--- attachments ---");
+        out.push_str(&folded);
+    }
+    if !missing.is_empty() {
+        out.push_str(&format!("\n\n[attachments not loaded: {}]", missing.join(", ")));
+    }
+    (out, attachments.to_vec())
+}
+
+/// Recursive workspace file search for @-mentions: same confinement and
+/// dot-entry rules as the tree, substring match on the relative path,
+/// results capped.
+pub fn file_search(cwd: &Path, query_raw: &str) -> Result<serde_json::Value, (u16, String)> {
+    let query = percent_decode(query_raw).to_lowercase();
+    let root = okra_host::fsutil::canonicalize(cwd).map_err(|e| (500, format!("root: {e}")))?;
+    let mut results = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            let Ok(ft) = entry.file_type() else { continue };
+            let path = entry.path();
+            let rel = path
+                .strip_prefix(&root)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if ft.is_dir() {
+                // symlinks are never followed
+                if !ft.is_symlink() && stack.len() < 64 {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if query.is_empty() || rel.to_lowercase().contains(&query) {
+                results.push(rel);
+                if results.len() >= 50 {
+                    return Ok(serde_json::json!({ "matches": results, "capped": true }));
+                }
+            }
+        }
+    }
+    Ok(serde_json::json!({ "matches": results, "capped": false }))
+}
+
 /// GET /api/skills — the workspace's installed skills (`.okra/skills/*.md`)
 /// with their path-conditional activation patterns (disclosure layer 1).
 pub fn skills_listing(cwd: &Path) -> serde_json::Value {
@@ -1450,6 +1569,7 @@ pub fn serve_stdio(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) ->
                             &factory,
                             bridge,
                             true,
+                            Vec::new(),
                         ) {
                             outbound.notification(
                                 "v4/error",
