@@ -111,6 +111,11 @@ was produced BY okra — `--provider openai` (glm-5.3-flash) driving
 write_file/list_dir/read_file through the real pipeline. Run 1 cancelled
 honestly on a gateway timeout; run 2 completed (16 steps, 15k tokens).
 Findings live in `docs/dogfood/`; week complete = 7 day entries.
+Both fixable day-1 findings closed same day (write mode preservation
+`282e511`; harness wc-padding `3e0b011`). Day-2 pre-flight (09-28
+15:40 +03): binary current with all fixes, `--version` clean, key
+parses (never printed), gateway 200 in 0.6 s, workspace + docs +
+script bits verified, automation armed for 07:30 +03.
 
 ## Real-Zed ACP drive (2026-09-27)
 
