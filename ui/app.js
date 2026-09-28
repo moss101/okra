@@ -328,6 +328,7 @@ function closePreview() {
 
 const state = {
   sessions: [],            // [{id,title,status,eventCount,live}]
+  unread: {},              // sessionId -> true (tray unread model)
   activeId: null,
   rows: [],                // latest full snapshot for the active task
   control: { phase: 'draft' },
@@ -395,6 +396,10 @@ function connectSSE(id) {
     updateConn(true);
     let msg;
     try { msg = JSON.parse(e.data); } catch (_) { return; }
+    if (msg && msg.method === 'v4/notification') {
+      handleNotification(msg.params || {});
+      return;
+    }
     const p = msg && msg.params;
     if (!p || p.sessionId !== state.activeId) return;
     // frames are FULL snapshots — replace wholesale
@@ -422,6 +427,7 @@ function updateConn(on) {
 
 async function selectSession(id) {
   state.activeId = id;
+  delete state.unread[id];
   state.pendingNewTask = false;
   renderTaskList();
   $('topbar-title').textContent = titleOf(id);
@@ -506,7 +512,9 @@ function renderTaskList() {
     return;
   }
   for (const s of state.sessions) {
-    const item = el('button', 'task-item' + (s.id === state.activeId ? ' active' : ''));
+    const unread = state.unread[s.id];
+    const item = el('button', 'task-item' + (s.id === state.activeId ? ' active' : '')
+      + (unread ? ' unread' : ''));
     item.type = 'button';
     item.appendChild(el('span', 'task-item-title', s.title || 'Task ' + s.id));
     const meta = el('span', 'task-item-meta');
@@ -514,7 +522,7 @@ function renderTaskList() {
     meta.appendChild(dot);
     meta.appendChild(el('span', null, (s.live ? 'live · ' : '') + (s.eventCount != null ? s.eventCount + ' events' : '')));
     item.appendChild(meta);
-    item.addEventListener('click', () => selectSession(s.id));
+    item.addEventListener('click', () => { delete state.unread[s.id]; selectSession(s.id); });
     host.appendChild(item);
   }
 }
@@ -1023,6 +1031,64 @@ function toast(kind, title, body, onClick) {
   setTimeout(() => t.remove(), 5000);
 }
 
+/* ---------- notifications (3-class boundary, ChatGPT2 docs/02) ----------
+ *
+ * The daemon classifies and REDACTS (labels are metadata — tool output,
+ * file contents and prompts never leave the process). The surface applies
+ * the focus policy: focused -> in-app toast only; unfocused -> native
+ * Notification (when granted) + toast, and background tasks accrue an
+ * unread dot that clears on selection (the tray unread model).
+ */
+
+const NOTIF_CLASS_LABEL = {
+  turn_complete: 'Task finished',
+  permission_request: 'Approval needed',
+  question: 'Question',
+};
+
+function handleNotification(n) {
+  const classLabel = NOTIF_CLASS_LABEL[n.class] || 'Update';
+  const isPermission = n.class === 'permission_request';
+  const unfocused = document.hidden || !document.hasFocus();
+
+  // unread dot for background tasks (cleared on selection)
+  if (n.sessionId !== state.activeId) {
+    state.unread[n.sessionId] = true;
+    renderTaskList();
+  }
+
+  // the local task title is app-internal; the NATIVE body stays the
+  // daemon-redacted label — never richer
+  const local = n.sessionId === state.activeId
+    ? $('topbar-title').textContent
+    : (state.sessions.find((x) => x.id === n.sessionId) || {}).title;
+  const title = local || classLabel;
+
+  toast(isPermission ? 'error' : 'ok', classLabel, title || n.label, () => {
+    if (n.sessionId && state.sessions.some((x) => x.id === n.sessionId)) {
+      selectSession(n.sessionId);
+    }
+  });
+
+  if (unfocused && 'Notification' in window && Notification.permission === 'granted') {
+    try {
+      const notif = new Notification('okra — ' + classLabel, {
+        body: n.label,          // the redacted label, nothing more
+        tag: n.sessionId,       // one notification per task
+        silent: isPermission,   // permissions already glow in-app
+      });
+      notif.onclick = () => { window.focus(); if (n.sessionId) selectSession(n.sessionId); };
+    } catch (_) { /* best-effort */ }
+  }
+}
+
+async function requestNotificationPermission() {
+  if (!('Notification' in window)) return;
+  if (Notification.permission === 'default') {
+    try { await Notification.requestPermission(); } catch (_) { /* denied */ }
+  }
+}
+
 /* ---------- theme ---------- */
 
 function applyTheme(theme) {
@@ -1236,6 +1302,7 @@ function termKeyHandler(e) {
 function init() {
   initTheme();
   loadHealth();
+  requestNotificationPermission();
   loadSessions();
   loadScenes();
   renderTaskList();

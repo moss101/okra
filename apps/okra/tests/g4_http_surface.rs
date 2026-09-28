@@ -686,6 +686,13 @@ fn g4_approvals_pause_turn_until_resolved() {
             }
             assert!(!approval_id.is_empty());
 
+            // the permission-request notification class surfaced for the ask
+            let perm_notif = frames.lock().unwrap().iter().any(|f| {
+                f["method"] == "v4/notification"
+                    && f["params"]["class"] == "permission_request"
+            });
+            assert!(perm_notif, "no permission_request notification; frames: {frames:?}");
+
             // resolve from the "workbench"
             let (status, reply) = http_post_command(&addr, &serde_json::json!({
                 "commandId": format!("apr-resolve-{session}"),
@@ -961,6 +968,64 @@ fn g4_terminals_run_a_real_pty_over_http() {
         assert_eq!(status, 200, "{body}");
         let (status, body) = http_get(&addr, "/api/term");
         assert!(body.contains("\"ids\":[]"), "terminal not pruned: {body}");
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// N0013 — notifications: turn completion and permission asks surface the
+/// 3-class boundary over the wire, and the label is REDACTED — the task
+/// title's content (the prompt) never leaves the daemon.
+#[test]
+fn g4_notifications_classify_and_redact_over_the_wire() {
+    let td = tempfile::tempdir().unwrap();
+    std::fs::write(td.path().join("notes.md"), "# notes\nnotification breadth\n").unwrap();
+    let (mut daemon, addr) = spawn_daemon(td.path());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let frames = std::sync::Arc::new(mutex_vec());
+        let writer = std::sync::Arc::clone(&frames);
+        let a = addr.to_string();
+        let t = std::thread::spawn(move || {
+            sse_collect(&a, "notif-session", &writer, &|f| {
+                f.iter().any(|f| f["method"] == "v4/notification")
+            })
+        });
+        std::thread::sleep(Duration::from_millis(300));
+
+        let (status, reply) = http_post_command(&addr, &serde_json::json!({
+            "commandId": "notif-1",
+            "type": "sendText",
+            "sessionId": "notif-session",
+            "payload": { "text": "summarize notes.md" }
+        }));
+        assert_eq!(status, 200, "{reply}");
+
+        let got = wait_for(&frames, &|f| {
+            f.iter().any(|f| f["method"] == "v4/notification")
+        });
+        assert!(got, "no notification frame arrived; frames: {frames:?}");
+
+        let notif = frames
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|f| f["method"] == "v4/notification")
+            .cloned()
+            .unwrap();
+        assert_eq!(notif["params"]["class"], "turn_complete", "{notif}");
+        assert_eq!(notif["params"]["sessionId"], "notif-session", "{notif}");
+        // the redaction contract: the prompt is CONTENT — it never rides
+        // the label to a lock screen
+        let label = notif["params"]["label"].as_str().unwrap_or_default();
+        assert!(
+            !label.contains("summarize"),
+            "redaction leak: {label:?}"
+        );
+        assert!(label.len() <= 81, "label must stay bounded: {label:?}");
+        let _ = t.join();
     }));
     let _ = daemon.kill();
     let _ = daemon.wait();

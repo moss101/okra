@@ -26,6 +26,7 @@ use okra_policy::ToolApprovalCeiling;
 use okra_policy::approval::{
     ApprovalChannel, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, ApprovalService,
 };
+use okra_host::notifications::{classify, NotificationClass};
 use okra_providers::Sampler;
 use okra_tools::Registry;
 
@@ -151,6 +152,10 @@ impl SessionProjection {
 
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        Some(&self.session_id)
     }
 
     fn alloc_row_id(&mut self) -> u64 {
@@ -391,6 +396,15 @@ impl ApprovalChannel for SurfaceApprovalChannel {
 /// The projection control patch the workbench reads: pending approvals fold
 /// into `control.awaitingApproval` and flip the phase while the turn is
 /// paused on the bridge.
+/// The session id of a projection (the notification envelope needs it).
+fn proj_session_of(p: &Mutex<SessionProjection>) -> String {
+    p.lock()
+        .unwrap()
+        .session_id()
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn emit_approval_state(
     notify: &dyn Fn(&str, serde_json::Value),
     topic: &str,
@@ -402,6 +416,23 @@ fn emit_approval_state(
     let snapshot = approvals.pending_snapshot();
     if snapshot.len() == *last_len {
         return; // unchanged — no frame churn
+    }
+    // new asks surface the permission-request class (redacted label: the
+    // tool name is metadata, the args are never sent to a lock screen)
+    for ask in snapshot.iter().skip(*last_len) {
+        let n = classify(
+            NotificationClass::PermissionRequest,
+            &format!("Approval needed: {}", ask["toolName"].as_str().unwrap_or("tool")),
+            &proj_session_of(p),
+        );
+        notify(
+            "v4/notification",
+            serde_json::json!({
+                "class": n.class,
+                "label": n.label,
+                "sessionId": n.session_id,
+            }),
+        );
     }
     *last_len = snapshot.len();
     let mut proj = p.lock().unwrap();
@@ -674,6 +705,35 @@ pub fn run_turn_streaming(
         (broadcast)(
             "v4/projection",
             projection_notification(&topic, &p)["params"].clone(),
+        );
+    }
+
+    // 6. native-notification boundary (3 classes, redacted — ChatGPT2
+    // docs/02): the surface decides native vs in-app from ITS focus; the
+    // daemon only guarantees the label carries no content.
+    {
+        let title = turn_row_lock
+            .lock()
+            .ok()
+            .and_then(|p| p.title().map(str::to_string))
+            .unwrap_or_else(|| session_id.clone());
+        let (class, label) = match &outcome {
+            Ok(TurnOutcome::Cancelled { category: Some(CancellationCategory::UserRequested) }) => {
+                (NotificationClass::TurnComplete, format!("Task stopped: {title}"))
+            }
+            Ok(TurnOutcome::Completed { .. }) => {
+                (NotificationClass::TurnComplete, format!("Task completed: {title}"))
+            }
+            _ => (NotificationClass::TurnComplete, format!("Task failed: {title}")),
+        };
+        let n = classify(class, &label, &session_id);
+        (broadcast)(
+            "v4/notification",
+            serde_json::json!({
+                "class": n.class,
+                "label": n.label,
+                "sessionId": n.session_id,
+            }),
         );
     }
 

@@ -175,6 +175,13 @@ anchored so content never jumps when checkpoints refine). A 2k-row
 streaming task stays bounded and smooth; verified live at 127 rows with a
 24-node window and across replay.
 
+**Notifications (N0013):** the 3-class boundary is live — the daemon
+classifies and REDACTS (`v4/notification` frames on turn completion and
+permission asks; labels are metadata, content never leaves the process)
+and the surface applies the focus policy: focused → in-app toast,
+unfocused → Web Notification with only the redacted label. Background
+tasks accrue a sidebar unread dot that clears on selection.
+
 **Terminal pane (N0012):** a collapsible PTY pane below the transcript —
 a real interactive shell in the workspace, streamed over
 `GET /api/term/<id>/sse` with keystrokes typed through
