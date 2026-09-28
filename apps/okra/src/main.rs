@@ -648,6 +648,10 @@ fn main() {
             }
             None => (serve::demo_sampler_factory(tcp_cwd.clone()), "demo".to_string()),
         };
+        if !tcp_cwd.is_dir() {
+            eprintln!("error: --cwd {:?} is not a directory", tcp_cwd);
+            std::process::exit(2);
+        }
         // loopback-only posture
         let host_part = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(&addr).to_string();
         if !host_part.starts_with("127.0.0.1") && !host_part.starts_with("localhost") && !host_part.starts_with("[::1]") {

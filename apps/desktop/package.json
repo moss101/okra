@@ -1,0 +1,15 @@
+{
+  "name": "okra-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "description": "okra desktop shell — a thin Electron main (window + daemon lifecycle only) around the workbench served by `okra serve`",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "smoke": "electron . --smoke",
+    "test": "node --test --test-force-exit"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0"
+  }
+}

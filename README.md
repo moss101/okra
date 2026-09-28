@@ -279,3 +279,22 @@ changes.
 - Crate dependency direction is enforced by `scripts/check-boundaries.sh`.
 - Day-1 clippy bans: no raw process spawn, no raw `home_dir`, no raw
   `canonicalize`.
+
+## Desktop shell (dev)
+
+`apps/desktop` is a thin Electron main (MASTER-PLAN block #50: window +
+daemon lifecycle only — every product behavior stays in the daemon and its
+web workbench):
+
+```sh
+cargo build --release          # or target/debug is found too
+cd apps/desktop
+npm install                    # electron
+npm start -- --cwd /path/to/project
+```
+
+The shell spawns `okra serve --tcp --cwd`, waits for the handshake (bind
++ `/health`), and points the window at the workbench. Closing the window
+stops the daemon. `npm run smoke` verifies the handshake without a window;
+`npm test` runs the handshake acceptance against the real binary with
+plain node (no electron needed).
