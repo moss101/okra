@@ -78,8 +78,13 @@ impl AcpClient {
 
 static UPDATES: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
 
-fn drain_updates() -> Vec<serde_json::Value> {
+/// Tests run in parallel in ONE process and share the global update feed,
+/// so a drain is only meaningful for one specific session — filter by it.
+fn drain_updates(session_id: &str) -> Vec<serde_json::Value> {
     std::mem::take(&mut *UPDATES.lock().unwrap())
+        .into_iter()
+        .filter(|u| u["sessionId"] == serde_json::Value::String(session_id.to_string()))
+        .collect()
 }
 
 fn kill(mut child: Child) {
@@ -134,7 +139,7 @@ fn g4_acp_editor_seam_end_to_end() {
         assert!(prompt["error"].is_null(), "{prompt}");
         assert_eq!(prompt["result"]["stopReason"], "end_turn", "{prompt}");
 
-        let updates = drain_updates();
+        let updates = drain_updates(&session_id);
         assert!(!updates.is_empty(), "no session/update notifications streamed");
         for u in &updates {
             assert_eq!(u["sessionId"], session_id, "every update carries the sessionId: {u}");
@@ -253,6 +258,79 @@ fn g4_acp_cancel_aborts_running_turn_and_session_recovers() {
             "prompt": [ { "type": "text", "text": "summarize notes.md" } ]
         }));
         assert_eq!(after["result"]["stopReason"], "end_turn", "{after}");
+    }));
+    kill(agent);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// The pin max-turns ceiling reaches the ACP surface too: under a
+/// maxTurnsCeiling-1 pin the editor turn is clamped (daemon stderr names
+/// it) and still ends with an honest stop reason.
+#[test]
+#[allow(clippy::disallowed_methods)] // test harness: runs the compiled binary
+fn g4_acp_turn_budget_honors_pin_ceiling() {
+    use std::process::Command as Cmd;
+    let td = tempfile::tempdir().unwrap();
+    let workspace = td.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("notes.md"), "# probe\n").unwrap();
+    let pin = td.path().join("pin.json");
+    std::fs::write(&pin, r#"{ "version": 1, "source": "corp-it", "maxTurnsCeiling": 1 }"#).unwrap();
+
+    let mut cmd = Cmd::new(env!("CARGO_BIN_EXE_okra"));
+    cmd.args(["serve", "--acp", "--cwd", &workspace.to_string_lossy()])
+        .env("OKRA_MANAGED_PIN", &pin)
+        .env_remove("OKRA_TRUST_FILE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut agent = cmd.spawn().expect("spawn okra serve --acp");
+    let stderr = std::io::BufReader::new(agent.stderr.take().unwrap());
+    let stderr_lines: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
+    {
+        let sink = std::sync::Arc::clone(&stderr_lines);
+        std::thread::spawn(move || {
+            for line in stderr.lines().map_while(Result::ok) {
+                sink.lock().unwrap().push(line);
+            }
+        });
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut client = AcpClient {
+            stdin: agent.stdin.take().unwrap(),
+            reader: BufReader::new(agent.stdout.take().unwrap()),
+            next_id: 1,
+        };
+        client.request(
+            "initialize",
+            serde_json::json!({ "protocolVersion": 1, "clientInfo": { "name": "c", "version": "0" } }),
+        );
+        let new = client.request("session/new", serde_json::json!({}));
+        let session_id = new["result"]["sessionId"].as_str().unwrap().to_string();
+        let prompt = client.request("session/prompt", serde_json::json!({
+            "sessionId": session_id,
+            "prompt": [ { "type": "text", "text": "read notes.md" } ]
+        }));
+        // the clamped turn still returns an HONEST stop reason
+        assert!(prompt["error"].is_null(), "{prompt}");
+        assert!(
+            prompt["result"]["stopReason"].is_string(),
+            "a stop reason is always reported: {prompt}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if stderr_lines.lock().unwrap().iter().any(|l| l.contains("[pin] max-turns clamped to 1")) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            stderr_lines.lock().unwrap().iter().any(|l| l.contains("[pin] max-turns clamped to 1")),
+            "daemon stderr must name the clamp: {:?}",
+            stderr_lines.lock().unwrap()
+        );
     }));
     kill(agent);
     if let Err(panic) = result {

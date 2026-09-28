@@ -316,8 +316,14 @@ fn acp_turn(
         kernel::SessionHandle::open(sessions_dir, kernel_id, kernel::SessionAccess::Write)
             .map_err(|e| format!("open kernel session: {e}"))?;
 
+    // the pin ceiling clamps the ACP turn budget like every other surface
+    let (max_steps, clamped) = okra_host::managed_policy::runtime_pin().clamp_max_turns(8);
+    let max_steps = max_steps as usize;
+    if clamped {
+        eprintln!("[pin] max-turns clamped to {max_steps}");
+    }
     let config = okra_agent_core::loop_::AgentConfig {
-        max_steps: 8,
+        max_steps,
         unattended: true,
         ..Default::default()
     };
