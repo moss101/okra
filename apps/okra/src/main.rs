@@ -45,7 +45,14 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut args = std::env::args().skip(1);
+    // `--version` must never be mistaken for a prompt: the dogfood harness
+    // probes it, and a whole agent turn per probe is the bug it prevents
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.iter().any(|a| a == "--version" || a == "-V") {
+        println!("okra {}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+    let mut args = argv.into_iter();
     let mut json = false;
     let mut cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut max_turns = 32usize;
