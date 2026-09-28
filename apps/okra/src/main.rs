@@ -627,6 +627,15 @@ fn main() {
                 eprintln!("error: unknown provider {p} (supported: openai)");
                 std::process::exit(2);
             }
+        // the daemon refuses to start a provider the managed pin denies —
+        // enforcement at the same gate the CLI prompt path uses
+        let pin = okra_host::managed_policy::runtime_pin();
+        if let Some(p) = &provider
+            && !pin.provider_allowed(p)
+        {
+            eprintln!("error: provider \"{p}\" is denied by the managed policy pin");
+            std::process::exit(1);
+        }
         let model_name = model.unwrap_or_else(|| "gpt-4o-mini".to_string());
         let (factory, label) = match &provider {
             Some(_) => {
@@ -720,7 +729,7 @@ fn main() {
         serve::serve_stdio(cwd, sessions_dir);
     }
 
-    let args = match parse_args() {
+    let mut args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("error: {e}\n");
@@ -826,21 +835,71 @@ fn main() {
         }
     }
 
+    // Managed policy pin (enterprise): ENFORCED, not just reportable — a
+    // pin at the managed path clamps the settings this run started with
+    // before any model call or tool runs. NotConfigured → zero effect.
+    let pin = okra_host::managed_policy::runtime_pin();
+    if let okra_host::managed_policy::PinState::FailClosed { reason } = &pin.state {
+        eprintln!("[pin] fail-closed: {reason} — managed dimensions at their most restrictive");
+    }
+    if let Some(p) = &args.provider
+        && !pin.provider_allowed(p)
+    {
+        eprintln!(
+            "error: provider \"{p}\" is denied by the managed policy pin (source: {})",
+            pin.provenance.as_ref().map(|pr| pr.source.as_str()).unwrap_or("managed")
+        );
+        std::process::exit(1);
+    }
+    {
+        let (mt, clamped) = pin.clamp_max_turns(args.max_turns as u32);
+        if clamped {
+            eprintln!("[pin] max-turns clamped to {mt}");
+        }
+        args.max_turns = mt as usize;
+    }
+
     // Kernel-enforced self-confinement (N0006): irreversible; the process
     // physically cannot leave the workspace (or touch the network under
     // read-only/strict) from this point on.
     let extra_writable: Vec<PathBuf> = vec![sessions_root.clone()];
-    if let Some(mode_str) = &args.sandbox
-        && mode_str != "off" {
-            let mode = match mode_str.as_str() {
-                "read-only" | "readonly" => okra_policy::SandboxMode::ReadOnly,
-                "strict" => okra_policy::SandboxMode::ReadOnly,
-                "workspace-write" => okra_policy::SandboxMode::WorkspaceWrite,
-                other => {
-                    eprintln!("error: unknown --sandbox mode {other}");
-                    std::process::exit(2);
-                }
+    let mut sandbox_mode: Option<okra_policy::SandboxMode> = match args.sandbox.as_deref() {
+        None | Some("off") => None,
+        Some("read-only" | "readonly" | "strict") => Some(okra_policy::SandboxMode::ReadOnly),
+        Some("workspace-write") => Some(okra_policy::SandboxMode::WorkspaceWrite),
+        Some(other) => {
+            eprintln!("error: unknown --sandbox mode {other}");
+            std::process::exit(2);
+        }
+    };
+    // pin sandbox ceiling: a requested mode above the ceiling clamps down,
+    // and "off" under a ceiling turns confinement ON at the ceiling —
+    // unconstrained is more permissive than any ceiling allows.
+    if let Some(ceiling) = pin.sandbox_ceiling() {
+        let ceiling_mode = match ceiling {
+            okra_host::managed_policy::SandboxCeiling::ReadOnly => {
+                Some(okra_policy::SandboxMode::ReadOnly)
+            }
+            okra_host::managed_policy::SandboxCeiling::WorkspaceWrite => {
+                Some(okra_policy::SandboxMode::WorkspaceWrite)
+            }
+            // the kernel's strongest mode (workspace-write) is already at
+            // or under this ceiling — nothing to clamp
+            okra_host::managed_policy::SandboxCeiling::DangerFullAccess => None,
+        };
+        if let Some(cm) = ceiling_mode {
+            let exceeds = match sandbox_mode {
+                None => true,
+                Some(m) => m == okra_policy::SandboxMode::WorkspaceWrite && cm == okra_policy::SandboxMode::ReadOnly,
             };
+            if exceeds {
+                eprintln!("[pin] sandbox clamped to {cm:?} by the managed policy pin");
+                sandbox_mode = Some(cm);
+            }
+        }
+    }
+    if let Some(mode) = sandbox_mode {
+        {
             let policy = okra_policy::SandboxExecutionPolicy {
                 mode,
                 workspace_root: args.cwd.clone(),
@@ -863,6 +922,7 @@ fn main() {
                 }
             }
         }
+    }
     drop(extra_writable);
 
     // sampler: task spec planner (G1) or interactive demo planner (G0)

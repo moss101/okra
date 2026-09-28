@@ -105,7 +105,13 @@ M6  scale                      ◐ i18n slice: daemon-side en-US/zh-CN catalog
                                   `okra pin-sign` (Ed25519 envelope over
                                   sha256(payload), key provisioning via
                                   `--generate-key`), daemon verifies + trust-
-                                  files gate, `pin-status` reports state honestly
+                                  files gate, `pin-status` reports state honestly,
+                                  and the pin is ENFORCED at runtime — every
+                                  agent run clamps sandbox/max-turns and
+                                  refuses non-allowlisted providers before
+                                  any model call (fail-closed pins apply
+                                  read-only confinement); serve --tcp
+                                  refuses denied providers at startup
 ```
 
 

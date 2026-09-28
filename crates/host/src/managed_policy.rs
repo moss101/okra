@@ -429,6 +429,25 @@ pub fn public_key_hex(seed: [u8; 32]) -> String {
     hex_encode(&key.verifying_key().to_bytes())
 }
 
+/// Load the pin a RUNNING process must enforce. Resolution order:
+/// `OKRA_MANAGED_PIN` env (tests, deployment override) → `<home>/.okra/managed-
+/// policy.json`. Absent file = NotConfigured (user in control); present
+/// but broken = FailClosed (most restrictive) — both honest states the
+/// caller must act on, never skip.
+pub fn runtime_pin() -> ManagedPin {
+    let path = match std::env::var_os("OKRA_MANAGED_PIN") {
+        Some(p) if !p.is_empty() => PathBuf::from(p),
+        _ => crate::fsutil::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/"))
+            .join(".okra")
+            .join("managed-policy.json"),
+    };
+    let trust = std::env::var_os("OKRA_TRUST_FILE")
+        .map(PathBuf::from)
+        .and_then(|p| load_trusted_signers(&p));
+    load_managed_pin_verified(&path, trust.as_deref())
+}
+
 /// Approval resolution under the pin: an `approvalMustAsk` pin clamps
 /// `never` → `ask`, and reports the override.
 pub fn resolve_approval(pin: &ManagedPin, user_allows_never: bool) -> (bool, bool) {
