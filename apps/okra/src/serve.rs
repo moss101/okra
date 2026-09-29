@@ -126,6 +126,24 @@ fn ask_user_spec_rest() -> okra_tools::ToolSpec {
     }
 }
 
+/// The identity ToolSpec fields the computer-tool registrations set
+/// inline (keeps the sites terse; the meaningful fields differ per tool).
+fn computer_spec_rest() -> okra_tools::ToolSpec {
+    okra_tools::ToolSpec {
+        name: String::new(),
+        namespace: None,
+        title: None,
+        description: String::new(),
+        arguments_schema: None,
+        kind: None,
+        behavior_version: None,
+        idempotent: false,
+        read_only: false,
+        timeout_ms: None,
+        max_concurrency: None,
+    }
+}
+
 /// Register configured MCP servers' tools into the turn registry
 /// (N0019 + N0022): each enabled stdio server connects ONCE as a
 /// persistent session (initialize + tools_list over a live child), and
@@ -797,6 +815,144 @@ pub fn run_turn_streaming(
             },
         ));
     }
+    // N0023: computer control tools (Claude Desktop parity, AX-first).
+    // The approval card IS the split consent: computer_act's card grants
+    // the named app for that batch; computer_screenshot's card is the
+    // screen-takeover consent. Separate tools, separate consents.
+    {
+        let spec_observe = okra_tools::ToolSpec {
+            name: "computer_observe".into(),
+            description: "Observe an application's accessibility tree (element ids, roles, labels, positions). Call this before computer_act.".into(),
+            arguments_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": { "app": { "type": "string" } },
+                "required": ["app"],
+            })),
+            kind: Some("computer".into()),
+            ..computer_spec_rest()
+        };
+        // read_only stays FALSE: observing the user's screen is a privacy
+        // side-effect — the approval card is the app-capability consent
+        let entry = okra_tools::ToolEntry::new(spec_observe, okra_tools::ToolMetadata::default());
+        let _ = registry.register(okra_tools::ErasedTool::simple(
+            entry,
+            vec![okra_tools::ResourceAccess::All],
+            move |args: &serde_json::Value| {
+                let app = args["app"].as_str().unwrap_or_default().to_string();
+                match okra_computer::backend::observe(&app) {
+                    Ok(tree) => okra_tools::ToolStream::terminal_only(Ok(
+                        okra_tools::ToolOutput::text(
+                            serde_json::to_string_pretty(&tree).unwrap_or_default(),
+                        ),
+                    )),
+                    Err(e) => okra_tools::ToolStream::terminal_only(Err(
+                        okra_tools::ToolError::tool_failed(e),
+                    )),
+                }
+            },
+        ));
+
+        let spec_act = okra_tools::ToolSpec {
+            name: "computer_act".into(),
+            description: "Execute a batch of element-targeted actions (click/type/press_key) against one app, in order, stopping at the first error; each executed action is followed by a re-observe.".into(),
+            arguments_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "app": { "type": "string" },
+                    "typing": { "type": "boolean", "description": "true when the user is actively typing — input injection pauses" },
+                    "actions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": { "type": "string", "enum": ["click", "type", "press_key"] },
+                                "element_id": { "type": "string" },
+                                "text": { "type": "string" },
+                                "key": { "type": "string" }
+                            },
+                            "required": ["kind"]
+                        }
+                    }
+                },
+                "required": ["app", "actions"],
+            })),
+            kind: Some("computer".into()),
+            ..computer_spec_rest()
+        };
+        let entry = okra_tools::ToolEntry::new(
+            spec_act,
+            okra_tools::ToolMetadata::default(),
+        );
+        eprintln!("[comp-debug] registering computer_act");
+        let reg_result = registry.register(okra_tools::ErasedTool::simple(
+            entry,
+            vec![okra_tools::ResourceAccess::All],
+            move |args: &serde_json::Value| {
+                eprintln!("[comp-debug] computer_act CLOSURE RAN");
+                let app = args["app"].as_str().unwrap_or_default().to_string();
+                let typing = args["typing"].as_bool().unwrap_or(false);
+                let actions: Vec<okra_computer::AxAction> = args["actions"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                eprintln!("[comp-debug] computer_act EXECUTING app={app}");
+                    eprintln!("[comp-debug] actions raw: {}", args);
+                let results = okra_computer::backend::execute_real(&app, &actions, typing);
+                okra_tools::ToolStream::terminal_only(Ok(okra_tools::ToolOutput::text(
+                    serde_json::to_string_pretty(&results).unwrap_or_default(),
+                )))
+            },
+        ));
+        eprintln!("[comp-debug] computer_act register result: {reg_result:?}");
+
+        let spec_shot = okra_tools::ToolSpec {
+            name: "computer_screenshot".into(),
+            description: "Capture the screen (no sound); returns a PNG data URL the workbench renders.".into(),
+            arguments_schema: Some(serde_json::json!({ "type": "object", "properties": {} })),
+            kind: Some("computer".into()),
+            ..computer_spec_rest()
+        };
+        // screen-takeover consent: the screenshot approval card IS it
+        let entry = okra_tools::ToolEntry::new(spec_shot, okra_tools::ToolMetadata::default());
+        let _ = registry.register(okra_tools::ErasedTool::simple(
+            entry,
+            vec![okra_tools::ResourceAccess::All],
+            move |_args: &serde_json::Value| {
+                match okra_computer::backend::screenshot() {
+                    Ok(png) => {
+                        let b64 = {
+                            // minimal base64 (no dependency in this crate's path)
+                            const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                            let mut out = String::with_capacity(png.len().div_ceil(3) * 4);
+                            for chunk in png.chunks(3) {
+                                let b = [chunk[0],
+                                    *chunk.get(1).unwrap_or(&0),
+                                    *chunk.get(2).unwrap_or(&0)];
+                                out.push(T[(b[0] >> 2) as usize] as char);
+                                out.push(T[(((b[0] & 0x03) << 4) | (b[1] >> 4)) as usize] as char);
+                                out.push(if chunk.len() > 1 {
+                                    T[(((b[1] & 0x0f) << 2) | (b[2] >> 6)) as usize] as char
+                                } else { '=' });
+                                out.push(if chunk.len() > 2 { T[(b[2] & 0x3f) as usize] as char } else { '=' });
+                            }
+                            out
+                        };
+                        okra_tools::ToolStream::terminal_only(Ok(okra_tools::ToolOutput::text(
+                            format!("data:image/png;base64,{b64}"),
+                        )))
+                    }
+                    Err(e) => okra_tools::ToolStream::terminal_only(Err(
+                        okra_tools::ToolError::tool_failed(e),
+                    )),
+                }
+            },
+        ));
+    }
+
     let mut approval_service = ApprovalService::new(ApprovalPolicy::Ask);
     if !unattended {
         // attended surfaces: the bridge IS the approval waterfall — the

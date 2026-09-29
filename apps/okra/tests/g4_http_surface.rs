@@ -1664,3 +1664,158 @@ fn g4_ask_user_question_flow() {
         std::panic::resume_unwind(panic);
     }
 }
+
+/// N0023 — computer control through the workbench: observe/act/screenshot
+/// tools run the real backend against FIXTURE binaries (env-overridable),
+/// every call is approval-gated, and the screenshot returns a PNG data
+/// URL the UI renders.
+#[test]
+fn g4_computer_control_end_to_end() {
+    let td = tempfile::tempdir().unwrap();
+    let bin = td.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+
+    // osascript fixture: canned AX tree; act calls append to a log
+    let osa = bin.join("osascript");
+    std::fs::write(
+        &osa,
+        r#"#!/bin/sh
+log_file="$OKRA_AX_LOG"
+for arg in "$@"; do
+  case "$arg" in
+    *AXPress*) echo "AXPress $arg" >> "$log_file" ;;
+  esac
+done
+echo 'window|0|w0|10|20|800|600'
+echo 'elem|0|1|AXButton|Save|100|300|80|30|AXPress'
+"#,
+    )
+    .unwrap();
+    // cliclick fixture: logs coordinates
+    let cliclick = bin.join("cliclick");
+    std::fs::write(
+        &cliclick,
+        r#"#!/bin/sh
+echo "cliclick $*" >> "$OKRA_AX_LOG"
+"#,
+    )
+    .unwrap();
+    // screencapture fixture: writes a valid tiny PNG
+    let sc = bin.join("screencapture");
+    std::fs::write(
+        &sc,
+        r#"#!/bin/sh
+for arg in "$@"; do
+  case "$arg" in
+    /*.png)
+      printf '\x89PNG\r\n\x1a\n' > "$arg"
+      head -c 64 /dev/zero >> "$arg"
+      ;;
+  esac
+done
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    for f in [&osa, &cliclick, &sc] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let log = td.path().join("ax.log");
+
+    let (mut daemon, addr) = spawn_daemon_env(
+        td.path(),
+        &[
+            ("OKRA_OSASCRIPT", osa.to_string_lossy().as_ref()),
+            ("OKRA_CLICKER", cliclick.to_string_lossy().as_ref()),
+            ("OKRA_SCREENCAPTURE", sc.to_string_lossy().as_ref()),
+            ("OKRA_AX_LOG", log.to_string_lossy().as_ref()),
+            ("PATH", &format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())),
+        ],
+    );
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // each tool run gets its OWN session + collector: stale
+        // awaitingApproval frames from an earlier turn would otherwise be
+        // resolved again (resolved:false)
+        let run_tool = |prompt: &str, sid: &str| {
+            let frames = std::sync::Arc::new(mutex_vec());
+            let writer = std::sync::Arc::clone(&frames);
+            let a = addr.to_string();
+            let sid_owned = sid.to_string();
+            let t = std::thread::spawn(move || {
+                sse_collect(&a, &sid_owned, &writer, &|f| {
+                    f.iter().any(|f| f["params"]["control"]["phase"] == "completedSuccess")
+                })
+            });
+            std::thread::sleep(Duration::from_millis(300));
+            let (status, reply) = http_post_command(&addr, &serde_json::json!({
+                "commandId": format!("comp-{}", sid),
+                "type": "sendText",
+                "sessionId": sid,
+                "payload": { "text": prompt }
+            }));
+            assert_eq!(status, 200, "{reply}");
+            let deadline = Instant::now() + Duration::from_secs(25);
+            loop {
+                if Instant::now() > deadline {
+                    panic!("approval never arrived for {sid}; frames: {frames:?}");
+                }
+                let pending = frames.lock().unwrap().iter().rev().find_map(|f| {
+                    f["params"]["control"]["awaitingApproval"]
+                        .as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|p| p["approvalId"].as_str().map(str::to_string))
+                });
+                match pending {
+                    Some(id) => {
+                        let (status, reply) = http_post_command(&addr, &serde_json::json!({
+                            "commandId": format!("comp-apr-{sid}"),
+                            "type": "resolveApproval",
+                            "sessionId": sid,
+                            "payload": { "approvalId": id, "decision": "allow" }
+                        }));
+                        assert_eq!(status, 200, "{reply}");
+                        assert_eq!(reply["result"]["resolved"], true, "{reply}");
+                        break;
+                    }
+                    None => std::thread::sleep(Duration::from_millis(150)),
+                }
+            }
+            let got = wait_for(&frames, &|f| {
+                f.iter().any(|f| f["params"]["control"]["phase"] == "completedSuccess")
+            });
+            assert!(got, "turn never completed for {sid}");
+            let _ = t.join();
+        };
+
+        // 1. observe → approval card → canned tree
+        run_tool("computer observe Finder", "comp-obs");
+        let (status, rows) = http_get(&addr, "/api/sessions/comp-obs/rows");
+        assert_eq!(status, 200, "{rows}");
+        assert!(rows.contains("computer_observe"), "{rows}");
+        assert!(rows.contains("AXButton") || rows.contains("w0/e1"), "tree missing: {rows}");
+
+        // 2. act: AXPress path reaches the fixture osascript with the args
+        run_tool("computer act Finder click w0/e1", "comp-act");
+        let (status, rows) = http_get(&addr, "/api/sessions/comp-act/rows");
+        assert!(rows.contains("computer_act"), "{rows}");
+        let log_contents = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            log_contents.contains("AXPress"),
+            "click never reached the backend: {log_contents}"
+        );
+
+        // 3. screenshot: PNG data URL
+        run_tool("computer screenshot", "comp-shot");
+        let (status, rows) = http_get(&addr, "/api/sessions/comp-shot/rows");
+        assert!(
+            rows.contains("data:image/png;base64,"),
+            "screenshot data URL missing: {rows}"
+        );
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}

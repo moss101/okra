@@ -182,6 +182,17 @@ verdict feeds the existing nudge path. Class-gated (`repeating`/
 `offtrack` — calibrated live), fail-open, inert without the key
 (`OKRA_SEMANTIC_WATCH=off` disables).
 
+**Computer control (N0023):** the Claude Desktop flagship, real on
+macOS — `computer_observe` (AX tree: element ids/roles/labels/positions),
+`computer_act` (batch click/type/press_key, AXPress-structural when the
+element reports it, coordinate fallback from AX positions, stop-on-first
+error, re-observe after every action, user_actively_typing guard), and
+`computer_screenshot` (PNG data URL rendered in tool cards). All three
+prompt — the approval card IS the split consent (per-app capability for
+act, screen-takeover for screenshot); read-only marking was deliberately
+avoided so observing the screen prompts too. Binaries env-overridable
+(`OKRA_OSASCRIPT`/`OKRA_CLICKER`/`OKRA_SCREENCAPTURE`) for hermetic tests.
+
 **Persistent MCP sessions (N0022):** one live child process per MCP
 server for the daemon's lifetime (spawn-once piped stdio in the
 sanctioned module, reader thread, bounded requests) — stateful servers

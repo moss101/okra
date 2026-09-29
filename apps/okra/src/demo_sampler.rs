@@ -135,6 +135,61 @@ impl Sampler for DemoPlanner {
                     usage: Usage { input_tokens: 24, output_tokens: 12 },
                 });
             }
+            // computer control branches (N0023, offline-drivable)
+            if let Some(rest) = prompt.strip_prefix("computer ") {
+                let mk = |name: &str, args: serde_json::Value| ToolCall {
+                    id: "demo-call-1".into(),
+                    name: name.into(),
+                    args_json: args.to_string(),
+                };
+                if let Some(app) = rest.strip_prefix("observe ") {
+                    return Ok(SampleResponse {
+                        text: format!("Observing {app} via the AX tree."),
+                        tool_calls: vec![mk(
+                            "computer_observe",
+                            serde_json::json!({ "app": app.trim() }),
+                        )],
+                        stop_reason: StopReason::ToolUse,
+                        usage: Usage { input_tokens: 24, output_tokens: 12 },
+                    });
+                }
+                if rest.trim() == "screenshot" {
+                    return Ok(SampleResponse {
+                        text: "Capturing the screen.".into(),
+                        tool_calls: vec![mk("computer_screenshot", serde_json::json!({}))],
+                        stop_reason: StopReason::ToolUse,
+                        usage: Usage { input_tokens: 24, output_tokens: 12 },
+                    });
+                }
+                if let Some(rest) = rest.strip_prefix("act ") {
+                    let mut parts = rest.split_whitespace();
+                    let app = parts.next().unwrap_or_default().to_string();
+                    // "act <app> click <element>" — the element is the
+                    // last token (the verb names the gesture)
+                    let element = parts
+                        .last()
+                        .unwrap_or("w0/e1")
+                        .to_string();
+                    // AxAction::Click carries app per action (the contract's
+                    // per-action consent subject)
+                    return Ok(SampleResponse {
+                        text: format!("Acting on {app}."),
+                        tool_calls: vec![mk(
+                            "computer_act",
+                            serde_json::json!({
+                                "app": app,
+                                "actions": [{
+                                    "kind": "click",
+                                    "app": app,
+                                    "element_id": element
+                                }]
+                            }),
+                        )],
+                        stop_reason: StopReason::ToolUse,
+                        usage: Usage { input_tokens: 24, output_tokens: 12 },
+                    });
+                }
+            }
             if let Some(rest) = prompt.strip_prefix("mcp ") {
                 let (token, tail) = match rest.split_once(' ') {
                     Some((t, r)) => (t.trim(), r.trim()),

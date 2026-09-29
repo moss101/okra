@@ -990,6 +990,14 @@ html[data-theme="light"] .icon-moon { display: none; }
   50% { border-color: color-mix(in srgb, var(--warning) 85%, transparent); }
 }
 
+/* screenshot tool results */
+.shot-img {
+  max-width: 100%;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-default);
+  display: block;
+}
+
 /* ---------- question cards (ask_user) ---------- */
 
 .question-card {

@@ -1401,6 +1401,7 @@ dependencies = [
  "ed25519-dalek",
  "okra-agent-core",
  "okra-compaction",
+ "okra-computer",
  "okra-gateway",
  "okra-host",
  "okra-kernel",

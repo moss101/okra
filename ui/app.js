@@ -1077,7 +1077,14 @@ function renderToolCard(r) {
 
   const body = el('div', 'tool-body');
   const out = r.output && r.output.text ? String(r.output.text) : '';
-  if (out) {
+  if (out.startsWith('data:image/png;base64,')) {
+    // screenshot tool result: render the image (Claude Desktop parity)
+    const img = document.createElement('img');
+    img.src = out;
+    img.className = 'shot-img';
+    img.alt = 'screen capture';
+    body.appendChild(img);
+  } else if (out) {
     body.textContent = out;
   } else if (isError && r.error && r.error.message) {
     body.textContent = r.error.message;

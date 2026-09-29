@@ -12,6 +12,8 @@
 //! - **user_actively_typing** guard: input injection pauses while the user
 //!   types.
 
+pub mod backend;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,3 +182,4 @@ mod tests {
         assert!(err.contains("Re-observe"), "{err}");
     }
 }
+
