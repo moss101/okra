@@ -153,6 +153,46 @@ impl Sampler for DemoPlanner {
                         usage: Usage { input_tokens: 24, output_tokens: 12 },
                     });
                 }
+                // N0025 consent-flow branches (offline-drivable)
+                if let Some(apps) = rest.strip_prefix("grant ") {
+                    return Ok(SampleResponse {
+                        text: "Requesting app access.".into(),
+                        tool_calls: vec![mk(
+                            "computer_request_access",
+                            serde_json::json!({
+                                "apps": apps.split_whitespace().collect::<Vec<_>>(),
+                                "reason": "dogfood consent flow"
+                            }),
+                        )],
+                        stop_reason: StopReason::ToolUse,
+                        usage: Usage { input_tokens: 24, output_tokens: 12 },
+                    });
+                }
+                if let Some(rest) = rest.strip_prefix("fullclick ") {
+                    let mut parts = rest.split_whitespace();
+                    let x: i64 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let y: i64 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    return Ok(SampleResponse {
+                        text: "Taking over the screen and clicking.".into(),
+                        tool_calls: vec![
+                            mk("computer_request_full_control", serde_json::json!({})),
+                            mk("computer_left_click", serde_json::json!({ "x": x, "y": y })),
+                        ],
+                        stop_reason: StopReason::ToolUse,
+                        usage: Usage { input_tokens: 24, output_tokens: 12 },
+                    });
+                }
+                if let Some(app) = rest.strip_prefix("appwindows ") {
+                    return Ok(SampleResponse {
+                        text: "Listing windows.".into(),
+                        tool_calls: vec![mk(
+                            "computer_app_list_windows",
+                            serde_json::json!({ "app": app.trim() }),
+                        )],
+                        stop_reason: StopReason::ToolUse,
+                        usage: Usage { input_tokens: 24, output_tokens: 12 },
+                    });
+                }
                 if rest.trim() == "screenshot" {
                     return Ok(SampleResponse {
                         text: "Capturing the screen.".into(),

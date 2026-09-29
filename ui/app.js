@@ -173,7 +173,7 @@ async function loadTools() {
   } catch (_) { /* transient */ }
 }
 
-function renderTools() {
+async function renderTools() {
   const host = $('tools-list');
   host.textContent = '';
   if (!tools.data) { host.appendChild(el('div', 'tree-empty', 'loading…')); return; }
@@ -235,6 +235,23 @@ function renderTools() {
     }
     host.appendChild(row);
   }
+
+  // computer-use consent (N0025) — Claude Desktop parity visibility
+  try {
+    const cu = await fetch('/api/computer/consent').then((r) => r.json());
+    const cuHead = el('div', 'git-section', 'Computer');
+    host.appendChild(cuHead);
+    const cuRow = el('div', 'tool-entry');
+    const cuHeadRow = el('div', 'tool-entry-head');
+    cuHeadRow.appendChild(el('span', 'mcp-dot' + (cu.fullControl ? ' on' : ' off')));
+    cuHeadRow.appendChild(el('span', 'tool-entry-name',
+      'full-screen control ' + (cu.fullControl ? 'held' : 'not requested')));
+    if ((cu.granted || []).length) {
+      cuHeadRow.appendChild(el('span', 'mcp-scope', 'apps: ' + cu.granted.join(', ')));
+    }
+    cuRow.appendChild(cuHeadRow);
+    host.appendChild(cuRow);
+  } catch (_) { /* section omitted when offline */ }
 
   const servers = (tools.data.mcp && tools.data.mcp.servers) || [];
   const mcpHead = el('div', 'git-section');

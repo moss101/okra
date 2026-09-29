@@ -481,3 +481,305 @@ pub fn execute_real(
     }
     results
 }
+
+// ---------------------------------------------------------------------------
+// Claude Desktop parity surface (N0025): display-scope coordinate family,
+// app inventory, and the background app_* window family.
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::disallowed_methods)] // sanctioned site (see module docs)
+fn run_clicker(args: &[String]) -> Result<String, String> {
+    let out = Command::new(clicker())
+        .args(args)
+        .output()
+        .map_err(|e| format!("clicker spawn: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "clicker failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// One-shot point actions in the last-full-screenshot coordinate frame.
+pub fn click_point(x: i64, y: i64) -> Result<(), String> {
+    run_clicker(&[format!("c:{x},{y}")]).map(|_| ())
+}
+pub fn double_click_point(x: i64, y: i64) -> Result<(), String> {
+    run_clicker(&[format!("dc:{x},{y}")]).map(|_| ())
+}
+pub fn right_click_point(x: i64, y: i64) -> Result<(), String> {
+    run_clicker(&[format!("rc:{x},{y}")]).map(|_| ())
+}
+pub fn mouse_move(x: i64, y: i64) -> Result<(), String> {
+    run_clicker(&[format!("m:{x},{y}")]).map(|_| ())
+}
+/// Press-drag-release between two points.
+pub fn drag(from: (i64, i64), to: (i64, i64)) -> Result<(), String> {
+    run_clicker(&[
+        format!("dd:{},{}", from.0, from.1),
+        format!("dm:{},{}", to.0, to.1),
+        format!("du:{},{}", to.0, to.1),
+    ])
+    .map(|_| ())
+}
+/// Scroll `amount` ticks at a point; positive dy scrolls down.
+pub fn scroll_at(x: i64, y: i64, dy: i32) -> Result<(), String> {
+    run_clicker(&[format!("scroll {dy} 0 {x} {y}")]).map(|_| ())
+}
+/// Current cursor position (logical points).
+pub fn cursor_position() -> Result<(i64, i64), String> {
+    let out = run_clicker(&["p:".to_string()])?;
+    // cliclick prints "<x>,<y>"
+    let (x, y) = out
+        .trim()
+        .split_once(',')
+        .ok_or_else(|| format!("cursor parse: {out}"))?;
+    let xp: i64 = x.trim().parse().map_err(|e| format!("cursor x: {e}"))?;
+    let yp: i64 = y.trim().parse().map_err(|e| format!("cursor y: {e}"))?;
+    Ok((xp, yp))
+}
+
+/// Press a key COMBO like "cmd+a" / "Return" / "ctrl+shift+t".
+pub fn press_combo(combo: &str) -> Result<(), String> {
+    let parts: Vec<&str> = combo.split('+').map(str::trim).collect();
+    let (key, mods) = parts.split_last().ok_or("empty combo")?;
+    let using: Vec<String> = mods
+        .iter()
+        .map(|m| match m.to_lowercase().as_str() {
+            "cmd" | "meta" | "win" => "command down".to_string(),
+            "ctrl" | "control" => "control down".to_string(),
+            "alt" | "option" => "option down".to_string(),
+            "shift" => "shift down".to_string(),
+            other => format!("/* unknown modifier {other} */"),
+        })
+        .collect();
+    let using_list = if using.is_empty() {
+        String::new()
+    } else {
+        format!(" using {}", using.join(", "))
+    };
+    // key names the AX keystroke vocabulary understands
+    let key_ax = match key.to_lowercase().as_str() {
+        "return" | "enter" => "return".to_string(),
+        "esc" | "escape" => "escape".to_string(),
+        "delete" | "backspace" => "delete".to_string(),
+        "tab" | "space" | "up" | "down" | "left" | "right" => key.to_lowercase(),
+        single if single.chars().count() == 1 => single.to_string(),
+        other => other.to_string(),
+    };
+    let script = format!(
+        r#"
+tell application "System Events" to keystroke "{key_ax}"{using_list}
+"#
+    );
+    run_osascript(&script, &[]).map(|_| ())
+}
+
+/// Capture a REGION of the screen fresh (zoom semantics: re-inspect small
+/// text at full density; v1 re-captures rather than cropping the buffer).
+#[allow(clippy::disallowed_methods)] // sanctioned site (see module docs)
+pub fn screenshot_region(x: i64, y: i64, w: i64, h: i64) -> Result<Vec<u8>, String> {
+    let tmp = std::env::temp_dir().join(format!(
+        "okra-zoom-{}.png",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or_default()
+    ));
+    let out = Command::new(screencapture())
+        .arg("-x")
+        .arg("-R")
+        .arg(format!("{x},{y},{w},{h}"))
+        .arg(&tmp)
+        .output()
+        .map_err(|e| format!("screencapture spawn: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "screencapture failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let bytes = std::fs::read(&tmp).map_err(|e| format!("shot read: {e}"))?;
+    let _ = std::fs::remove_file(&tmp);
+    Ok(bytes)
+}
+
+/// Running applications (System Events process names), running-first.
+pub fn list_running_apps() -> Result<Vec<String>, String> {
+    let out = run_osascript(
+        r#"tell application "System Events" to get name of every process"#,
+        &[],
+    )?;
+    Ok(out
+        .trim()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Installed applications (name list from /Applications + system apps).
+pub fn list_installed_apps() -> Vec<String> {
+    let mut apps = Vec::new();
+    for dir in ["/Applications", "/System/Applications"] {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if let Some(stem) = name.strip_suffix(".app") {
+                    apps.push(stem.to_string());
+                }
+            }
+        }
+    }
+    apps.sort();
+    apps
+}
+
+/// Launch/ensure an application is running (does not force frontmost).
+#[allow(clippy::disallowed_methods)] // sanctioned site (see module docs)
+pub fn open_application(app: &str) -> Result<(), String> {
+    let out = Command::new("/usr/bin/open")
+        .arg("-a")
+        .arg(app)
+        .output()
+        .map_err(|e| format!("open spawn: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "open -a {app} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Read the clipboard (pbpaste).
+#[allow(clippy::disallowed_methods)] // sanctioned site (see module docs)
+pub fn read_clipboard() -> Result<String, String> {
+    let out = Command::new("/usr/bin/pbpaste")
+        .output()
+        .map_err(|e| format!("pbpaste: {e}"))?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Write the clipboard (pbcopy).
+#[allow(clippy::disallowed_methods)] // sanctioned site (see module docs)
+pub fn write_clipboard(text: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut child = Command::new("/usr/bin/pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("pbcopy: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(text.as_bytes());
+    }
+    let _ = child.wait();
+    Ok(())
+}
+
+/// One window of an app, as observed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AxWindow {
+    pub window_id: String,
+    pub title: String,
+    pub x: i64,
+    pub y: i64,
+    pub w: i64,
+    pub h: i64,
+}
+
+impl From<&AxElement> for AxWindow {
+    fn from(e: &AxElement) -> Self {
+        AxWindow {
+            window_id: e.id.clone(),
+            title: e.label.clone().unwrap_or_default(),
+            x: e.x,
+            y: e.y,
+            w: e.w,
+            h: e.h,
+        }
+    }
+}
+
+/// `app_list_windows`: the observed windows of an app.
+pub fn app_list_windows(tree: &AxTree) -> Vec<AxWindow> {
+    tree.elements
+        .iter()
+        .filter(|e| e.role == "window")
+        .map(AxWindow::from)
+        .collect()
+}
+
+/// `app_ax_find`: filter an observed tree by role and/or title substring.
+pub fn app_ax_find<'a>(tree: &'a AxTree, role: Option<&str>, title: Option<&str>) -> Vec<&'a AxElement> {
+    tree.elements
+        .iter()
+        .filter(|e| e.role != "window")
+        .filter(|e| role.is_none_or(|r| e.role == r))
+        .filter(|e| {
+            title.is_none_or(|t| {
+                e.label
+                    .as_deref()
+                    .is_some_and(|l| l.to_lowercase().contains(&t.to_lowercase()))
+            })
+        })
+        .collect()
+}
+
+/// `app_screenshot`: capture a WINDOW region fresh + return its AX digest
+/// (element indices from the last observe).
+pub fn app_screenshot<'a>(tree: &'a AxTree, window_id: &str) -> Result<(Vec<u8>, Vec<&'a AxElement>), String> {
+    let win = tree
+        .elements
+        .iter()
+        .find(|e| e.id == window_id && e.role == "window")
+        .ok_or_else(|| format!("window {window_id} not observed — re-observe"))?;
+    let png = screenshot_region(win.x, win.y, win.w, win.h)?;
+    let digest: Vec<&AxElement> = tree
+        .elements
+        .iter()
+        .filter(|e| e.id.starts_with(&format!("{window_id}/")))
+        .collect();
+    Ok((png, digest))
+}
+
+/// `app_focus`: set AX focus on an element WITHOUT clicking or raising.
+pub fn app_focus(app: &str, tree: &AxTree, element_id: &str) -> Result<(), String> {
+    let el = tree
+        .elements
+        .iter()
+        .find(|e| e.id == element_id)
+        .ok_or_else(|| format!("element {element_id} not in the observed tree — re-observe"))?;
+    let (w, e) = element_id
+        .strip_prefix('w')
+        .and_then(|rest| rest.split_once("/e"))
+        .ok_or("bad element id")?;
+    let _ = el;
+    run_osascript(
+        r#"
+on run argv
+  tell application "System Events" to tell process (item 1 of argv)
+    set focused of (UI element (item 3 of argv as integer) of window (item 2 of argv as integer)) to true
+  end tell
+end run
+"#,
+        &[app.to_string(), w.to_string(), e.to_string()],
+    )?;
+    Ok(())
+}
+
+/// `app_type` with `target:"focused"`: focus the element then type.
+pub fn app_type_into(
+    app: &str,
+    tree: &AxTree,
+    element_id: Option<&str>,
+    text: &str,
+) -> Result<(), String> {
+    if let Some(id) = element_id {
+        app_focus(app, tree, id)?;
+    }
+    type_text(text)
+}

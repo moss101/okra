@@ -144,6 +144,447 @@ fn computer_spec_rest() -> okra_tools::ToolSpec {
     }
 }
 
+/// Per-daemon computer-use consent (N0025): the Claude Desktop model —
+/// `request_access` grants an app set for the session (ONE card), display-
+/// scope tools need `request_full_control` (ONE card), both releasable.
+#[derive(Default)]
+pub struct ComputerConsent {
+    /// Granted app names (System Events process names, e.g. "Finder").
+    pub apps: std::collections::BTreeSet<String>,
+    /// Screen-takeover consent held for this session.
+    pub takeover: bool,
+}
+
+pub type ComputerConsentHandle = Arc<Mutex<ComputerConsent>>;
+
+/// Display-scope tool body: args → result text.
+type DisplayFn = Box<dyn Fn(&serde_json::Value) -> Result<String, String> + Send + Sync>;
+/// app_* tool body: (app, args) → result text.
+type AppFn = Box<dyn Fn(&str, &serde_json::Value) -> Result<String, String> + Send + Sync>;
+
+fn no_grant_error(app: &str) -> String {
+    format!(
+        "no app capability grant for {app} — call computer_request_access with this app and a reason first"
+    )
+}
+
+fn no_takeover_error() -> String {
+    "full-screen control not granted for this session — call computer_request_full_control first      (the user approves the screen takeover once; computer_release_full_control clears it)"
+        .to_string()
+}
+
+/// The Claude Desktop parity tool families (N0025): consent tools +
+/// display-scope coordinate family + background app_* family. The N0023
+/// trio (computer_observe/act/screenshot) stays as-is.
+#[allow(clippy::too_many_lines)]
+fn register_computer_parity_tools(
+    registry: &mut okra_tools::Registry,
+    consent: &ComputerConsentHandle,
+) {
+    use okra_tools::{ErasedTool, ResourceAccess, ToolEntry, ToolMetadata, ToolSpec};
+
+    let mut mk = |spec: ToolSpec, metadata: ToolMetadata, f: Box<dyn Fn(&serde_json::Value) -> okra_tools::ToolStream + Send + Sync>| {
+        let _ = registry.register(ErasedTool::simple(
+            ToolEntry::new(spec, metadata),
+            vec![ResourceAccess::All],
+            f,
+        ));
+    };
+    let rest = computer_spec_rest;
+    let _ = rest;
+
+    fn ok_text(t: String) -> okra_tools::ToolStream {
+        okra_tools::ToolStream::terminal_only(Ok(okra_tools::ToolOutput::text(t)))
+    }
+    fn err(m: String) -> okra_tools::ToolStream {
+        okra_tools::ToolStream::terminal_only(Err(okra_tools::ToolError::tool_failed(m)))
+    }
+
+    // ---- consent tools (the only ones that carry per-call approval cards) ----
+    let c = Arc::clone(consent);
+    mk(
+        ToolSpec {
+            name: "computer_request_access".into(),
+            description: "Request per-application automation capability for this session. ONE approval dialog lists the whole app set; granted apps stay granted until released. Required before any app_* tool. Explain the task, not the mechanism, in the reason.".into(),
+            arguments_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "apps": { "type": "array", "items": { "type": "string" },
+                        "description": "Application names, e.g. [\"Finder\",\"TextEdit\"]" },
+                    "reason": { "type": "string", "description": "One sentence shown to the user in the approval dialog" }
+                },
+                "required": ["apps", "reason"],
+            })),
+            kind: Some("computer".into()),
+            ..computer_spec_rest()
+        },
+        ToolMetadata::default(), // read_only=false → the approval card IS the dialog
+        Box::new(move |args| {
+            let reason = args["reason"].as_str().unwrap_or_default().to_string();
+            let apps: Vec<String> = args["apps"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            if apps.is_empty() {
+                return err("apps[] required".into());
+            }
+            {
+                let mut g = c.lock().unwrap();
+                for a in &apps {
+                    g.apps.insert(a.clone());
+                }
+            }
+            ok_text(format!(
+                "granted for this session: {} (reason: {reason}). Display-scope tools still need computer_request_full_control.",
+                apps.join(", ")
+            ))
+        }),
+    );
+
+    let c = Arc::clone(consent);
+    mk(
+        ToolSpec {
+            name: "computer_list_granted_applications".into(),
+            description: "List the applications currently granted for this session and whether full-screen control is held.".into(),
+            arguments_schema: Some(serde_json::json!({ "type": "object", "properties": {} })),
+            read_only: true,
+            kind: Some("computer".into()),
+            ..computer_spec_rest()
+        },
+        ToolMetadata { read_only: true, ..Default::default() },
+        Box::new(move |_| {
+            let g = c.lock().unwrap();
+            ok_text(serde_json::to_string(&serde_json::json!({
+                "granted": g.apps.iter().collect::<Vec<_>>(),
+                "fullControl": g.takeover,
+            })).unwrap_or_default())
+        }),
+    );
+
+    let c = Arc::clone(consent);
+    mk(
+        ToolSpec {
+            name: "computer_release_access".into(),
+            description: "Release per-app grants (all, or the listed apps). Always safe.".into(),
+            arguments_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": { "apps": { "type": "array", "items": { "type": "string" } } }
+            })),
+            read_only: true,
+            kind: Some("computer".into()),
+            ..computer_spec_rest()
+        },
+        ToolMetadata { read_only: true, ..Default::default() },
+        Box::new(move |args| {
+            let mut g = c.lock().unwrap();
+            let listed: Vec<String> = args["apps"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            if listed.is_empty() {
+                g.apps.clear();
+            } else {
+                for a in listed {
+                    g.apps.remove(&a);
+                }
+            }
+            ok_text("released".into())
+        }),
+    );
+
+    let c = Arc::clone(consent);
+    mk(
+        ToolSpec {
+            name: "computer_request_full_control".into(),
+            description: "Ask the user to approve full-screen control (screenshot, coordinate clicks, typing) for THIS SESSION. Used before display-scope tools. If declined, continue with background app_* tools only.".into(),
+            arguments_schema: Some(serde_json::json!({ "type": "object", "properties": {} })),
+            kind: Some("computer".into()),
+            ..computer_spec_rest()
+        },
+        ToolMetadata::default(), // approval card = takeover consent
+        Box::new(move |_| {
+            c.lock().unwrap().takeover = true;
+            ok_text("full-screen control granted for this session (computer_release_full_control clears it)".into())
+        }),
+    );
+
+    let c = Arc::clone(consent);
+    mk(
+        ToolSpec {
+            name: "computer_release_full_control".into(),
+            description: "Drop back to BACKGROUND control: clears the full-screen approval so the NEXT display-scope action asks again. Always safe.".into(),
+            arguments_schema: Some(serde_json::json!({ "type": "object", "properties": {} })),
+            read_only: true,
+            kind: Some("computer".into()),
+            ..computer_spec_rest()
+        },
+        ToolMetadata { read_only: true, ..Default::default() },
+        Box::new(move |_| {
+            c.lock().unwrap().takeover = false;
+            ok_text("full-screen control released".into())
+        }),
+    );
+
+    // ---- display-scope coordinate family (takeover-gated) ----
+    let mut display = |name: &str, desc: &str, schema: serde_json::Value, f: DisplayFn| {
+        let c = Arc::clone(consent);
+        let name = name.to_string();
+        mk(
+            ToolSpec {
+                name: name.clone(),
+                description: desc.to_string(),
+                arguments_schema: Some(schema),
+                read_only: true,
+                kind: Some("computer".into()),
+                ..computer_spec_rest()
+            },
+            ToolMetadata { read_only: true, ..Default::default() },
+            Box::new(move |args| {
+                if !c.lock().unwrap().takeover {
+                    return err(no_takeover_error());
+                }
+                match f(args) {
+                    Ok(text) => ok_text(text),
+                    Err(e) => err(e),
+                }
+            }),
+        );
+    };
+
+    display(
+        "computer_shot",
+        "Full-screen screenshot (no sound). Returns a PNG data URL. Coordinates for other display tools refer to this frame.",
+        serde_json::json!({ "type": "object", "properties": { "save_to_disk": { "type": "boolean" } } }),
+        Box::new(|args| {
+            let png = okra_computer::backend::screenshot()?;
+            if args["save_to_disk"].as_bool() == Some(true) {
+                let path = std::env::temp_dir().join(format!(
+                    "okra-cu-share-{}.png",
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis()).unwrap_or_default()
+                ));
+                std::fs::write(&path, &png).map_err(|e| format!("save: {e}"))?;
+                return Ok(format!("saved: {}", path.display()));
+            }
+            Ok(format!("data:image/png;base64,{}", b64_png(&png)))
+        }),
+    );
+    display(
+        "computer_zoom",
+        "Re-capture a REGION of the screen at full density to inspect small text. Region is in the last full-screenshot frame.",
+        serde_json::json!({ "type": "object", "properties": {
+            "x": {"type": "integer"}, "y": {"type": "integer"},
+            "w": {"type": "integer"}, "h": {"type": "integer"} },
+            "required": ["x", "y", "w", "h"] }),
+        Box::new(|args| {
+            let g = |k: &str| args[k].as_i64().unwrap_or(0);
+            let png = okra_computer::backend::screenshot_region(g("x"), g("y"), g("w"), g("h"))?;
+            Ok(format!("data:image/png;base64,{}", b64_png(&png)))
+        }),
+    );
+    display("computer_left_click", "Left-click at a coordinate in the last full-screenshot frame.",
+        serde_json::json!({ "type": "object", "properties": { "x": {"type": "integer"}, "y": {"type": "integer"} }, "required": ["x", "y"] }),
+        Box::new(|args| { okra_computer::backend::click_point(args["x"].as_i64().unwrap_or(0), args["y"].as_i64().unwrap_or(0)).map(|_| "clicked".into()) }));
+    display("computer_double_click", "Double-click (selects a word in most text editors).",
+        serde_json::json!({ "type": "object", "properties": { "x": {"type": "integer"}, "y": {"type": "integer"} }, "required": ["x", "y"] }),
+        Box::new(|args| { okra_computer::backend::double_click_point(args["x"].as_i64().unwrap_or(0), args["y"].as_i64().unwrap_or(0)).map(|_| "double-clicked".into()) }));
+    display("computer_right_click", "Right-click (opens a context menu).",
+        serde_json::json!({ "type": "object", "properties": { "x": {"type": "integer"}, "y": {"type": "integer"} }, "required": ["x", "y"] }),
+        Box::new(|args| { okra_computer::backend::right_click_point(args["x"].as_i64().unwrap_or(0), args["y"].as_i64().unwrap_or(0)).map(|_| "right-clicked".into()) }));
+    display("computer_type", "Type text into whatever has keyboard focus. Newlines supported.",
+        serde_json::json!({ "type": "object", "properties": { "text": {"type": "string"} }, "required": ["text"] }),
+        Box::new(|args| { okra_computer::backend::type_text(args["text"].as_str().unwrap_or_default()).map(|_| "typed".into()) }));
+    display("computer_key", "Press a key or combo, e.g. `Return`, `cmd+a`, `ctrl+shift+t`.",
+        serde_json::json!({ "type": "object", "properties": { "key": {"type": "string"} }, "required": ["key"] }),
+        Box::new(|args| { okra_computer::backend::press_combo(args["key"].as_str().unwrap_or_default()).map(|_| "pressed".into()) }));
+    display("computer_scroll", "Scroll at a coordinate; dy>0 scrolls down, dy<0 up.",
+        serde_json::json!({ "type": "object", "properties": { "x": {"type": "integer"}, "y": {"type": "integer"}, "dy": {"type": "integer"} }, "required": ["x", "y", "dy"] }),
+        Box::new(|args| { okra_computer::backend::scroll_at(args["x"].as_i64().unwrap_or(0), args["y"].as_i64().unwrap_or(0), args["dy"].as_i64().unwrap_or(0) as i32).map(|_| "scrolled".into()) }));
+    display("computer_mouse_move", "Move the cursor without clicking.",
+        serde_json::json!({ "type": "object", "properties": { "x": {"type": "integer"}, "y": {"type": "integer"} }, "required": ["x", "y"] }),
+        Box::new(|args| { okra_computer::backend::mouse_move(args["x"].as_i64().unwrap_or(0), args["y"].as_i64().unwrap_or(0)).map(|_| "moved".into()) }));
+    display("computer_drag", "Press-drag-release from one coordinate to another.",
+        serde_json::json!({ "type": "object", "properties": {
+            "from_x": {"type": "integer"}, "from_y": {"type": "integer"},
+            "to_x": {"type": "integer"}, "to_y": {"type": "integer"} },
+            "required": ["from_x", "from_y", "to_x", "to_y"] }),
+        Box::new(|args| {
+            let g = |k: &str| args[k].as_i64().unwrap_or(0);
+            okra_computer::backend::drag((g("from_x"), g("from_y")), (g("to_x"), g("to_y"))).map(|_| "dragged".into())
+        }));
+    display("computer_cursor_position", "Current cursor position (logical points).",
+        serde_json::json!({ "type": "object", "properties": {} }),
+        Box::new(|_| { let (x, y) = okra_computer::backend::cursor_position()?; Ok(format!("{x},{y}")) }));
+
+    // non-consent helpers
+    mk(
+        ToolSpec {
+            name: "computer_open_application".into(),
+            description: "Launch/ensure an application is running. Does not force it to the front.".into(),
+            arguments_schema: Some(serde_json::json!({
+                "type": "object", "properties": { "app": { "type": "string" } }, "required": ["app"] })),
+            read_only: true,
+            kind: Some("computer".into()),
+            ..computer_spec_rest()
+        },
+        ToolMetadata { read_only: true, ..Default::default() },
+        Box::new(|args| {
+            match okra_computer::backend::open_application(args["app"].as_str().unwrap_or_default()) {
+                Ok(()) => ok_text("launched".into()),
+                Err(e) => err(e),
+            }
+        }),
+    );
+    mk(
+        ToolSpec {
+            name: "computer_list_apps".into(),
+            description: "Running applications first, then installed ones — pick names for computer_request_access.".into(),
+            arguments_schema: Some(serde_json::json!({ "type": "object", "properties": {} })),
+            read_only: true,
+            kind: Some("computer".into()),
+            ..computer_spec_rest()
+        },
+        ToolMetadata { read_only: true, ..Default::default() },
+        Box::new(|_| {
+            let running = okra_computer::backend::list_running_apps().unwrap_or_default();
+            let installed = okra_computer::backend::list_installed_apps();
+            ok_text(serde_json::to_string(&serde_json::json!({
+                "running": running, "installed": installed,
+            })).unwrap_or_default())
+        }),
+    );
+
+    // ---- background app_* family (per-app grant gated, no per-call cards) ----
+    let mut app_tool = |name: &str, desc: &str, schema: serde_json::Value, f: AppFn| {
+        let c = Arc::clone(consent);
+        mk(
+            ToolSpec {
+                name: name.to_string(),
+                description: desc.to_string(),
+                arguments_schema: Some(schema),
+                read_only: true,
+                kind: Some("computer".into()),
+                ..computer_spec_rest()
+            },
+            ToolMetadata { read_only: true, ..Default::default() },
+            Box::new(move |args| {
+                let app = args["app"].as_str().unwrap_or_default().to_string();
+                if app.is_empty() {
+                    return err("app required".into());
+                }
+                if !c.lock().unwrap().apps.contains(&app) {
+                    return err(no_grant_error(&app));
+                }
+                match f(&app, args) {
+                    Ok(t) => ok_text(t),
+                    Err(e) => err(e),
+                }
+            }),
+        );
+    };
+
+    app_tool("computer_app_list_windows",
+        "List an app's windows (id, title, bounds) — from a fresh AX observe. Background: never raises windows.",
+        serde_json::json!({ "type": "object", "properties": { "app": {"type": "string"} }, "required": ["app"] }),
+        Box::new(|app, _| {
+            let tree = okra_computer::backend::observe(app)?;
+            let wins = okra_computer::backend::app_list_windows(&tree);
+            Ok(serde_json::to_string(&wins).unwrap_or_default())
+        }));
+    app_tool("computer_app_screenshot",
+        "Capture one window of a granted app (fresh region capture) + a digest of its interactive elements (indices for app_click). Background.",
+        serde_json::json!({ "type": "object", "properties": { "app": {"type": "string"}, "window": { "type": "string", "description": "window id from app_list_windows, e.g. w0" } }, "required": ["app", "window"] }),
+        Box::new(|app, args| {
+            let win = args["window"].as_str().unwrap_or("w0");
+            let tree = okra_computer::backend::observe(app)?;
+            let (png, digest) = okra_computer::backend::app_screenshot(&tree, win)?;
+            let digest: Vec<serde_json::Value> = digest
+                .iter()
+                .map(|e| serde_json::json!({ "id": e.id, "role": e.role, "label": e.label, "actions": e.actions }))
+                .collect();
+            Ok(format!(
+                "data:image/png;base64,{}\n\nelements: {}",
+                b64_png(&png),
+                serde_json::to_string(&digest).unwrap_or_default()
+            ))
+        }));
+    app_tool("computer_app_ax_find",
+        "Search the fresh AX tree of a granted app by role and/or title substring → element ids.",
+        serde_json::json!({ "type": "object", "properties": {
+            "app": {"type": "string"}, "role": {"type": "string"}, "title": {"type": "string"} },
+            "required": ["app"] }),
+        Box::new(|app, args| {
+            let tree = okra_computer::backend::observe(app)?;
+            let found = okra_computer::backend::app_ax_find(
+                &tree,
+                args["role"].as_str(),
+                args["title"].as_str(),
+            );
+            let out: Vec<serde_json::Value> = found
+                .iter()
+                .map(|e| serde_json::json!({ "id": e.id, "role": e.role, "label": e.label }))
+                .collect();
+            Ok(serde_json::to_string(&out).unwrap_or_default())
+        }));
+    app_tool("computer_app_click",
+        "Click an element of a granted app by element id (AXPress when it reports the action, else coordinate at its center). Background: no window raising.",
+        serde_json::json!({ "type": "object", "properties": {
+            "app": {"type": "string"}, "element": {"type": "string", "description": "element id from observe/screenshot digest, e.g. w0/e1" } },
+            "required": ["app", "element"] }),
+        Box::new(|app, args| {
+            let tree = okra_computer::backend::observe(app)?;
+            okra_computer::backend::click_element(app, &tree, args["element"].as_str().unwrap_or_default())
+                .map(|_| "clicked".to_string())
+        }));
+    app_tool("computer_app_focus",
+        "Set AX focus on an element WITHOUT clicking or bringing the app front — prepares coordinate-less typing.",
+        serde_json::json!({ "type": "object", "properties": {
+            "app": {"type": "string"}, "element": {"type": "string"} }, "required": ["app", "element"] }),
+        Box::new(|app, args| {
+            let tree = okra_computer::backend::observe(app)?;
+            okra_computer::backend::app_focus(app, &tree, args["element"].as_str().unwrap_or_default())
+                .map(|_| "focused".to_string())
+        }));
+    app_tool("computer_app_type",
+        "Type text into a granted app: focus the element first (or `focused` for the app current focus), then type.",
+        serde_json::json!({ "type": "object", "properties": {
+            "app": {"type": "string"}, "element": {"type": "string"}, "target": {"type": "string", "enum": ["focused"]},
+            "text": {"type": "string"} }, "required": ["app", "text"] }),
+        Box::new(|app, args| {
+            let tree = okra_computer::backend::observe(app)?;
+            let el = args["element"].as_str();
+            let text = args["text"].as_str().unwrap_or_default();
+            okra_computer::backend::app_type_into(app, &tree, el, text).map(|_| "typed".to_string())
+        }));
+    app_tool("computer_app_key",
+        "Send a key/combo to a granted app (focus an element first for reliable delivery).",
+        serde_json::json!({ "type": "object", "properties": {
+            "app": {"type": "string"}, "element": {"type": "string"}, "key": {"type": "string"} },
+            "required": ["app", "key"] }),
+        Box::new(|app, args| {
+            let tree = okra_computer::backend::observe(app)?;
+            if let Some(el) = args["element"].as_str() {
+                okra_computer::backend::app_focus(app, &tree, el)?;
+            }
+            okra_computer::backend::press_combo(args["key"].as_str().unwrap_or_default())
+                .map(|_| "pressed".to_string())
+        }));
+}
+
+/// Minimal base64 for PNG data URLs (no dependency added).
+fn b64_png(png: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(png.len().div_ceil(3) * 4);
+    for chunk in png.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        out.push(T[(b[0] >> 2) as usize] as char);
+        out.push(T[(((b[0] & 0x03) << 4) | (b[1] >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 { T[(((b[1] & 0x0f) << 2) | (b[2] >> 6)) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(b[2] & 0x3f) as usize] as char } else { '=' });
+    }
+    out
+}
+
 /// Register configured MCP servers' tools into the turn registry
 /// (N0019 + N0022): each enabled stdio server connects ONCE as a
 /// persistent session (initialize + tools_list over a live child), and
@@ -736,6 +1177,7 @@ pub fn run_turn_streaming(
     attachments: Vec<String>,
     questions: Option<Arc<SurfaceQuestionChannel>>,
     mcp_sessions: &Mutex<std::collections::BTreeMap<String, Arc<Mutex<okra_tools::McpClient>>>>,
+    computer_consent: &ComputerConsentHandle,
 ) -> Result<TurnOutcome, String> {
     let steering_rx = steering;
     // attachments fold BEFORE anything surfaces: model-visible means
@@ -815,6 +1257,10 @@ pub fn run_turn_streaming(
             },
         ));
     }
+    // N0025: the Claude Desktop parity families (consent + display-scope
+    // + app_*), sharing the daemon-level consent ledger
+    register_computer_parity_tools(&mut registry, computer_consent);
+
     // N0023: computer control tools (Claude Desktop parity, AX-first).
     // The approval card IS the split consent: computer_act's card grants
     // the named app for that batch; computer_screenshot's card is the
@@ -2291,6 +2737,7 @@ pub fn serve_stdio(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) ->
                             Vec::new(),
                             None,
                             &Mutex::new(std::collections::BTreeMap::new()),
+                            &Arc::new(Mutex::new(ComputerConsent::default())),
                         ) {
                             outbound.notification(
                                 "v4/error",

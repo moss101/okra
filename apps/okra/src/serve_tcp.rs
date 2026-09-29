@@ -80,6 +80,8 @@ pub struct TcpServeState {
     pub mcp_status: Mutex<BTreeMap<String, serde_json::Value>>,
     /// Persistent MCP sessions keyed by server (N0022): live across turns.
     pub mcp_sessions: Mutex<BTreeMap<String, Arc<Mutex<okra_tools::McpClient>>>>,
+    /// Computer-use consent (N0025): per-app grants + screen takeover.
+    pub computer_consent: crate::serve::ComputerConsentHandle,
     /// Per-turn sampler source (`--provider openai` → real network model;
     /// default → offline demo planner).
     pub sampler_factory: SamplerFactory,
@@ -131,6 +133,7 @@ impl TcpServeState {
             terminals: Mutex::new(BTreeMap::new()),
             mcp_status: Mutex::new(BTreeMap::new()),
             mcp_sessions: Mutex::new(BTreeMap::new()),
+            computer_consent: Arc::new(Mutex::new(crate::serve::ComputerConsent::default())),
             sampler_factory,
             sampler_label,
             next_static: std::sync::atomic::AtomicU64::new(0),
@@ -687,6 +690,19 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
                     .as_slice(),
             ),
         };
+    }
+    if path == "/api/computer/consent" {
+        let c = state.computer_consent.lock().unwrap();
+        let body = serde_json::json!({
+            "granted": c.apps.iter().collect::<Vec<_>>(),
+            "fullControl": c.takeover,
+        });
+        return write_http(
+            stream,
+            200,
+            "OK",
+            serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+        );
     }
     if path == "/api/skills" {
         let body = serve::skills_listing(&state.cwd);
@@ -1402,6 +1418,7 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
                 entry.attachments,
                 Some(Arc::clone(&qbridge)),
                 &state2.mcp_sessions,
+                &state2.computer_consent,
             );
             let queued: Vec<crate::serve::SteeredInput> = {
                 let mut q = steer_queue.lock().unwrap(); q.drain(..).collect()
