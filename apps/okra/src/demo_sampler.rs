@@ -120,6 +120,48 @@ impl Sampler for DemoPlanner {
             .unwrap_or_default();
 
         if n == 1 {
+            // interactive-flow branches (offline-drivable acceptance):
+            // "ask <question>" -> ask_user; "mcp <tool> [text]" -> a
+            // registered MCP tool (approval-gated)
+            if let Some(question) = prompt.strip_prefix("ask ") {
+                return Ok(SampleResponse {
+                    text: "I need to ask the user something first.".into(),
+                    tool_calls: vec![ToolCall {
+                        id: "demo-call-1".into(),
+                        name: "ask_user".into(),
+                        args_json: serde_json::json!({ "question": question }).to_string(),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: Usage { input_tokens: 24, output_tokens: 12 },
+                });
+            }
+            if let Some(rest) = prompt.strip_prefix("mcp ") {
+                let (token, tail) = match rest.split_once(' ') {
+                    Some((t, r)) => (t.trim(), r.trim()),
+                    None => (rest.trim(), ""),
+                };
+                let needle = format!("_{token}");
+                if let Some(tv) = request
+                    .tools
+                    .iter()
+                    .find(|t| t.name == token || t.name.ends_with(&needle))
+                {
+                    let mut args = serde_json::json!({});
+                    if !tail.is_empty() {
+                        args["text"] = serde_json::json!(tail);
+                    }
+                    return Ok(SampleResponse {
+                        text: format!("I will use the MCP tool {}.", tv.name),
+                        tool_calls: vec![ToolCall {
+                            id: "demo-call-1".into(),
+                            name: tv.name.clone(),
+                            args_json: args.to_string(),
+                        }],
+                        stop_reason: StopReason::ToolUse,
+                        usage: Usage { input_tokens: 24, output_tokens: 12 },
+                    });
+                }
+            }
             // plan: create the named file (write path — drives the approval
             // bridge offline), or read the named file, or list the directory
             let call = if let Some(name) = self.find_create_target(&prompt) {

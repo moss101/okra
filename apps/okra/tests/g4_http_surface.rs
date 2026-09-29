@@ -1455,3 +1455,195 @@ esac
         std::panic::resume_unwind(panic);
     }
 }
+
+/// N0019 — MCP tools run INSIDE turns: probed tools register per turn
+/// (`mcp__<server>__<tool>`), the call is approval-gated (unknown
+/// side-effector), and the one-shot tools/call result lands in the turn.
+#[test]
+fn g4_mcp_tools_run_inside_turns() {
+    let td = tempfile::tempdir().unwrap();
+    let server_script = r#"#!/bin/sh
+read req
+id=$(printf '%s' "$req" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+case "$req" in
+  *initialize*)
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"fake-tools","version":"1.0"}}}\n' "$id" ;;
+  *tools/list*)
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"probe-tool","description":"canned","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+  *tools/call*)
+    text=$(printf '%s' "$req" | sed -n 's/.*"text":"\([^"]*\)".*/\1/p')
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"echo: %s"}]}}\n' "$id" "$text" ;;
+  *)
+    printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+esac
+"#;
+    let fixture = td.path().join("fake-mcp.sh");
+    std::fs::write(&fixture, server_script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::create_dir_all(td.path().join(".okra")).unwrap();
+    std::fs::write(
+        td.path().join(".okra").join("config.json"),
+        serde_json::json!({
+            "mcp": { "servers": { "fake": { "command": fixture.to_string_lossy() } } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(td.path().join("notes.md"), "# notes\n").unwrap();
+
+    let (mut daemon, addr) = spawn_daemon(td.path());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let frames = std::sync::Arc::new(mutex_vec());
+        let writer = std::sync::Arc::clone(&frames);
+        let a = addr.to_string();
+        let t = std::thread::spawn(move || {
+            sse_collect(&a, "mcp-turn", &writer, &|f| {
+                f.iter().any(|f| f["params"]["control"]["phase"] == "completedSuccess")
+            })
+        });
+        std::thread::sleep(Duration::from_millis(300));
+
+        let (status, reply) = http_post_command(&addr, &serde_json::json!({
+            "commandId": "mcp-1",
+            "type": "sendText",
+            "sessionId": "mcp-turn",
+            "payload": { "text": "mcp probe-tool hello there" }
+        }));
+        assert_eq!(status, 200, "{reply}");
+
+        // the MCP call must be APPROVAL-GATED (unknown side-effector)
+        let approval_deadline = Instant::now() + Duration::from_secs(25);
+        let approval_id = loop {
+            if Instant::now() > approval_deadline {
+                panic!("MCP approval never arrived; frames: {frames:?}");
+            }
+            let pending = frames.lock().unwrap().iter().rev().find_map(|f| {
+                f["params"]["control"]["awaitingApproval"]
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|p| p["approvalId"].as_str().map(str::to_string))
+            });
+            match pending {
+                Some(id) => break id,
+                None => std::thread::sleep(Duration::from_millis(150)),
+            }
+        };
+        let (status, reply) = http_post_command(&addr, &serde_json::json!({
+            "commandId": "mcp-apr",
+            "type": "resolveApproval",
+            "sessionId": "mcp-turn",
+            "payload": { "approvalId": approval_id, "decision": "allow" }
+        }));
+        assert_eq!(status, 200, "{reply}");
+
+        // the turn completes with the tools/call result in the transcript
+        let got = wait_for(&frames, &|f| {
+            f.iter().any(|f| f["params"]["control"]["phase"] == "completedSuccess")
+        });
+        assert!(got, "turn never completed; frames: {frames:?}");
+        let _ = t.join();
+
+        let (status, rows) = http_get(&addr, "/api/sessions/mcp-turn/rows");
+        assert_eq!(status, 200, "{rows}");
+        assert!(rows.contains("mcp__fake_probe-tool"), "tool row missing: {rows}");
+        assert!(rows.contains("echo: hello there"), "tools/call result missing: {rows}");
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// N0020 — the question flow: ask_user pauses the turn on a question card
+/// (control.awaitingQuestion + the question notification class); the
+/// answer returns INTO the turn as the tool result.
+#[test]
+fn g4_ask_user_question_flow() {
+    let td = tempfile::tempdir().unwrap();
+    std::fs::write(td.path().join("notes.md"), "# notes\n").unwrap();
+    let (mut daemon, addr) = spawn_daemon(td.path());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let frames = std::sync::Arc::new(mutex_vec());
+        let writer = std::sync::Arc::clone(&frames);
+        let a = addr.to_string();
+        let t = std::thread::spawn(move || {
+            sse_collect(&a, "ask-turn", &writer, &|f| {
+                f.iter().any(|f| f["params"]["control"]["phase"] == "completedSuccess")
+            })
+        });
+        std::thread::sleep(Duration::from_millis(300));
+
+        let (status, reply) = http_post_command(&addr, &serde_json::json!({
+            "commandId": "ask-1",
+            "type": "sendText",
+            "sessionId": "ask-turn",
+            "payload": { "text": "ask what color do you prefer" }
+        }));
+        assert_eq!(status, 200, "{reply}");
+
+        // the question surfaces: control.awaitingQuestion + notification
+        let question_deadline = Instant::now() + Duration::from_secs(25);
+        let question_id = loop {
+            if Instant::now() > question_deadline {
+                panic!("question never surfaced; frames: {frames:?}");
+            }
+            let q = frames.lock().unwrap().iter().rev().find_map(|f| {
+                let q = &f["params"]["control"]["awaitingQuestion"];
+                if q.is_object() {
+                    Some(q["questionId"].as_str().map(str::to_string).unwrap_or_default())
+                } else {
+                    None
+                }
+            });
+            match q {
+                Some(id) if !id.is_empty() => break id,
+                _ => std::thread::sleep(Duration::from_millis(150)),
+            }
+        };
+        let has_question_notif = frames.lock().unwrap().iter().any(|f| {
+            f["method"] == "v4/notification" && f["params"]["class"] == "question"
+        });
+        assert!(has_question_notif, "question notification never fired");
+
+        // answer from the "workbench"
+        let (status, reply) = http_post_command(&addr, &serde_json::json!({
+            "commandId": "ask-2",
+            "type": "answerQuestion",
+            "sessionId": "ask-turn",
+            "payload": { "questionId": question_id, "answer": "blue" }
+        }));
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(reply["result"]["resolved"], true, "{reply}");
+
+        let got = wait_for(&frames, &|f| {
+            f.iter().any(|f| f["params"]["control"]["phase"] == "completedSuccess")
+        });
+        assert!(got, "turn never completed after the answer");
+        let _ = t.join();
+
+        // the answer returned INTO the turn as the ask_user tool result
+        let (status, rows) = http_get(&addr, "/api/sessions/ask-turn/rows");
+        assert_eq!(status, 200, "{rows}");
+        assert!(rows.contains("ask_user"), "{rows}");
+        assert!(rows.contains("blue"), "answer never reached the turn: {rows}");
+
+        // an unknown question id is rejected, not silently ok
+        let (status, _) = http_post_command(&addr, &serde_json::json!({
+            "commandId": "ask-3",
+            "type": "answerQuestion",
+            "sessionId": "ask-turn",
+            "payload": { "questionId": "q-nope", "answer": "x" }
+        }));
+        assert_eq!(status, 400);
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}

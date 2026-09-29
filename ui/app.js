@@ -116,6 +116,7 @@ const PHASE_LABEL = {
   draft: 'ready',
   running: 'working…',
   awaitingApproval: 'needs approval',
+  awaitingQuestion: 'waiting for your answer',
   completedSuccess: 'completed',
   completedInterrupted: 'interrupted',
   error: 'error',
@@ -759,6 +760,7 @@ function rowSig(r) {
     case 'toolCall': return [r.status, r.output && r.output.text ? r.output.text.length : 0,
       r.input && r.input.path ? r.input.path : '', r.startedAt, r.endedAt].join('|');
     case 'approval': return String(r.state || '');
+    case 'question': return (r.questionId || '') + '|' + (r.question || '');
     default: return JSON.stringify(r).slice(0, 80);
   }
 }
@@ -817,9 +819,19 @@ function buildRowNode(r) {
       div.appendChild(renderApprovalCard(r));
       break;
     }
+    case 'question': {
+      div.appendChild(renderQuestionCard(r));
+      break;
+    }
     default:
       div.textContent = JSON.stringify(r);
   }
+  return div;
+}
+
+function buildQuestionNode(q) {
+  const div = el('div', 'row row-question');
+  div.appendChild(renderQuestionCard(q));
   return div;
 }
 
@@ -923,7 +935,9 @@ function layoutWindow(anchorCompensate) {
       const r = meta[i];
       let entry = virtualizer.cache.get(key);
       if (!entry || entry.sig !== rowSig(r)) {
-        const node = r.__pending ? buildPendingApprovalNode(r) : buildRowNode(r);
+        const node = r.__pending
+            ? (r.kind === 'question' ? buildQuestionNode(r) : buildPendingApprovalNode(r))
+            : buildRowNode(r);
         entry = { sig: rowSig(r), el: node };
         virtualizer.cache.set(key, entry);
       }
@@ -941,7 +955,9 @@ function layoutWindow(anchorCompensate) {
       const r = meta[i];
       let entry = virtualizer.cache.get(key);
       if (!entry || entry.sig !== rowSig(r)) {
-        const node = r.__pending ? buildPendingApprovalNode(r) : buildRowNode(r);
+        const node = r.__pending
+            ? (r.kind === 'question' ? buildQuestionNode(r) : buildPendingApprovalNode(r))
+            : buildRowNode(r);
         if (entry && entry.el.isConnected) {
           entry.el.replaceWith(node);
         }
@@ -996,6 +1012,13 @@ function renderRows() {
   for (const a of state.control.awaitingApproval || []) {
     if (approvalRowIds.has(a.approvalId)) continue;
     meta.push({ __pending: true, rowId: 'pending-' + a.approvalId, approvalId: a.approvalId, toolName: a.toolName, args: a.args, kind: 'approval' });
+  }
+  // LIVE question (N0020): ask_user blocks until answered — the card
+  // renders straight from control.awaitingQuestion
+  const liveQ = state.control.awaitingQuestion;
+  if (liveQ && liveQ.questionId) {
+    meta.push({ __pending: true, rowId: 'question-' + liveQ.questionId,
+      questionId: liveQ.questionId, question: liveQ.question, kind: 'question' });
   }
 
   virtualizer.viewMeta = meta;
@@ -1137,6 +1160,55 @@ function prettyArgs(argsJson) {
   }
 }
 
+/* ---------- question cards (ask_user flow) ---------- */
+
+function renderQuestionCard(q) {
+  const card = el('div', 'question-card');
+  const head = el('div', 'approval-head');
+  const glyph = el('span', 'question-glyph');
+  glyph.innerHTML = '<svg viewBox="0 0 16 16" width="13" height="13"><path d="M6 4.2c.4-1.6 1.9-2.4 3.4-2 1.3.3 2.2 1.5 2.1 2.8-.1 1.4-1.2 2-2.2 2.6-.8.5-1.3 1-1.3 2v.4M8 12.6v.4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>';
+  head.appendChild(glyph);
+  head.appendChild(el('span', 'approval-title', 'okra has a question'));
+  card.appendChild(head);
+  card.appendChild(el('div', 'question-text', q.question || ''));
+  const actions = el('div', 'question-actions');
+  const input = el('input', 'question-input');
+  input.type = 'text';
+  input.placeholder = 'Your answer…';
+  input.setAttribute('aria-label', 'Your answer');
+  const submit = el('button', 'approval-btn allow', 'Answer');
+  submit.type = 'button';
+  submit.addEventListener('click', () => {
+    const answer = input.value.trim();
+    if (!answer) { input.focus(); return; }
+    answerQuestion(q.questionId, answer);
+  });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const answer = input.value.trim();
+      if (answer) answerQuestion(q.questionId, answer);
+    }
+  });
+  actions.appendChild(input);
+  actions.appendChild(submit);
+  card.appendChild(actions);
+  return card;
+}
+
+async function answerQuestion(questionId, answer) {
+  try {
+    await post('/command', {
+      commandId: 'web-q-' + Date.now(),
+      type: 'answerQuestion',
+      sessionId: state.activeId,
+      payload: { questionId, answer },
+    });
+  } catch (e) {
+    toast('error', 'Could not send the answer', String(e));
+  }
+}
+
 async function resolveApproval(approvalId, allow) {
   try {
     await post('/command', {
@@ -1157,7 +1229,8 @@ function phase() {
 }
 
 function turnActive() {
-  return phase() === 'running' || phase() === 'awaitingApproval';
+  return phase() === 'running' || phase() === 'awaitingApproval'
+    || phase() === 'awaitingQuestion';
 }
 
 function refreshComposerMode() {

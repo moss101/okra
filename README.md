@@ -175,6 +175,15 @@ anchored so content never jumps when checkpoints refine). A 2k-row
 streaming task stays bounded and smooth; verified live at 127 rows with a
 24-node window and across replay.
 
+**MCP tools in turns + the question flow (N0019/N0020):** probed MCP
+tools register into every turn as `mcp__<server>__<tool>` and are
+APPROVAL-GATED (one-shot tools/call through the sanctioned runner) —
+"mcp tool" flows through the same card as native writes. The `ask_user`
+tool lets a task ask the user mid-turn: a question card (answer input)
+blocks until answered; the answer returns into the turn as the tool
+result, and the question-class notification (the last reserved class)
+fires on ask.
+
 **MCP runtime status (N0018):** the Tools tab can now answer "does it
 connect?" — `POST /api/mcp/probe` runs initialize + tools/list against
 configured stdio servers on a bounded thread and caches the status

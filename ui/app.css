@@ -990,6 +990,55 @@ html[data-theme="light"] .icon-moon { display: none; }
   50% { border-color: color-mix(in srgb, var(--warning) 85%, transparent); }
 }
 
+/* ---------- question cards (ask_user) ---------- */
+
+.question-card {
+  border: 1px solid color-mix(in srgb, var(--info) 45%, transparent);
+  background: color-mix(in srgb, var(--info) 8%, var(--surface-raised));
+  border-radius: var(--radius-md);
+  padding-bottom: 12px;
+}
+
+.question-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--info) 16%, transparent);
+  color: var(--info);
+  flex: none;
+}
+
+.question-text {
+  font-size: var(--text-md);
+  color: var(--text-primary);
+  padding: 2px 12px 8px 43px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.question-actions {
+  display: flex;
+  gap: 8px;
+  padding: 2px 12px 0 43px;
+}
+
+.question-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--surface-base);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--text-sm);
+  padding: 6px 10px;
+  outline: none;
+}
+.question-input:focus { border-color: color-mix(in srgb, var(--info) 55%, var(--border-default)); }
+
 /* ---------- tool card path chip ---------- */
 
 .tool-path {

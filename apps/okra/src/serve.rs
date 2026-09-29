@@ -108,6 +108,201 @@ pub fn build_registry(cwd: &Path) -> Registry {
     registry
 }
 
+/// The non-essential ToolSpec fields for ask_user (the meaningful ones
+/// are set inline at the registration site).
+fn ask_user_spec_rest() -> okra_tools::ToolSpec {
+    okra_tools::ToolSpec {
+        name: String::new(),
+        namespace: None,
+        title: None,
+        description: String::new(),
+        arguments_schema: None,
+        kind: None,
+        behavior_version: None,
+        idempotent: false,
+        read_only: false,
+        timeout_ms: None,
+        max_concurrency: None,
+    }
+}
+
+/// Register configured MCP servers' tools into the turn registry
+/// (N0019): each enabled stdio server is probed (initialize + tools_list,
+/// bounded — the N0018 contract) and every tool registers under
+/// `mcp__<server>__<tool>`. MCP tools are unknown side-effectors:
+/// `ResourceAccess::All` + read_only=false, so the approval card fires
+/// before any call executes. Each call is a fresh one-shot tools/call
+/// (the transport's documented scope; persistent sessions land with the
+/// gateway at M4).
+pub fn register_mcp_tools(registry: &mut okra_tools::Registry, cwd: &Path) -> usize {
+    use std::sync::mpsc;
+    let home = okra_host::fsutil::home_dir().unwrap_or_else(|| cwd.to_path_buf());
+    let svc = okra_host::mcp_sync::McpSyncService::new(home);
+    let Ok(servers) = svc.load(Some(cwd)) else { return 0 };
+    let mut registered = 0usize;
+    for r in servers {
+        if !r.enabled {
+            continue;
+        }
+        let Some(command) = r.config["command"].as_str().map(str::to_string) else {
+            continue;
+        };
+        let args: Vec<String> = r.config["args"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        let tools = {
+            let (tx, rx) = mpsc::channel();
+            let srv = r.name.clone();
+            let cmd = command.clone();
+            let argv = args.clone();
+            std::thread::spawn(move || {
+                let mut c = okra_tools::McpClient::stdio(&srv, &cmd, &argv);
+                if c.initialize().is_err() {
+                    return;
+                }
+                let _ = tx.send(c.tools_list().unwrap_or_default());
+            });
+            match rx.recv_timeout(std::time::Duration::from_secs(8)) {
+                Ok(t) => t,
+                Err(_) => continue,
+            }
+        };
+        for t in tools {
+            let srv = r.name.clone();
+            let tool = t.name.clone();
+            let cmd = command.clone();
+            let argv = args.clone();
+            let spec = okra_tools::ToolSpec {
+                name: format!("mcp__{srv}_{tool}"),
+                namespace: Some("mcp".into()),
+                title: Some(tool.clone()),
+                description: format!("[{srv}] {}", t.description),
+                arguments_schema: Some(t.input_schema.clone()),
+                kind: Some("mcp".into()),
+                behavior_version: None,
+                idempotent: false,
+                read_only: false,
+                timeout_ms: Some(30_000),
+                max_concurrency: Some(1),
+            };
+            let metadata = okra_tools::ToolMetadata {
+                read_only: false,
+                ..Default::default()
+            };
+            let entry = okra_tools::ToolEntry::new(spec, metadata);
+            let _ = registry.register(okra_tools::ErasedTool::simple(
+                entry,
+                vec![okra_tools::ResourceAccess::All],
+                move |args: &serde_json::Value| {
+                    let mut c = okra_tools::McpClient::stdio(&srv, &cmd, &argv);
+                    match c.tools_call(&tool, args.clone()) {
+                        Ok((text, is_error)) => {
+                            if is_error {
+                                okra_tools::ToolStream::terminal_only(Err(
+                                    okra_tools::ToolError::tool_failed(text),
+                                ))
+                            } else {
+                                okra_tools::ToolStream::terminal_only(Ok(
+                                    okra_tools::ToolOutput::text(text),
+                                ))
+                            }
+                        }
+                        Err(e) => okra_tools::ToolStream::terminal_only(Err(
+                            okra_tools::ToolError::tool_failed(e),
+                        )),
+                    }
+                },
+            ));
+            registered += 1;
+        }
+    }
+    registered
+}
+
+/// One live question from the task to the user (N0020).
+#[derive(Debug, Clone)]
+pub struct PendingQuestion {
+    pub id: String,
+    pub question: String,
+    pub asked_at: f64,
+}
+
+/// The surface-side ask/answer channel (mirrors SurfaceApprovalChannel):
+/// the `ask_user` tool blocks on `ask` (bounded waits) until
+/// `answerQuestion` resolves it or the stop flag flips (→ a cancelled
+/// marker returns to the model as the tool result).
+pub struct SurfaceQuestionChannel {
+    pending: Mutex<Option<PendingQuestion>>,
+    answers: Mutex<std::collections::HashMap<String, String>>,
+    wake: std::sync::Condvar,
+    stop: Arc<AtomicBool>,
+}
+
+impl SurfaceQuestionChannel {
+    pub fn new(stop: Arc<AtomicBool>) -> Self {
+        SurfaceQuestionChannel {
+            pending: Mutex::new(None),
+            answers: Mutex::new(std::collections::HashMap::new()),
+            wake: std::sync::Condvar::new(),
+            stop,
+        }
+    }
+
+    /// Tool-side ask: block for the answer; stop-flag aware.
+    pub fn ask(&self, question: String) -> String {
+        let id = format!("q-{}", uuid_v4());
+        *self.pending.lock().unwrap() = Some(PendingQuestion {
+            id: id.clone(),
+            question,
+            asked_at: now_ms(),
+        });
+        loop {
+            let answers = self.answers.lock().unwrap();
+            let (mut answers, _) = self
+                .wake
+                .wait_timeout(answers, std::time::Duration::from_millis(250))
+                .unwrap();
+            if let Some(a) = answers.remove(&id) {
+                drop(answers);
+                *self.pending.lock().unwrap() = None;
+                self.wake.notify_all();
+                return a;
+            }
+            drop(answers);
+            if self.stop.load(Ordering::Relaxed) {
+                *self.pending.lock().unwrap() = None;
+                self.wake.notify_all();
+                return "(question cancelled — the turn was stopped)".to_string();
+            }
+        }
+    }
+
+    /// A surface answered. Returns whether the id matched a live ask.
+    pub fn resolve(&self, question_id: &str, answer: String) -> bool {
+        let known = matches!(self.pending.lock().unwrap().as_ref(), Some(p) if p.id == question_id);
+        if known {
+            self.answers
+                .lock()
+                .unwrap()
+                .insert(question_id.to_string(), answer);
+            self.wake.notify_all();
+        }
+        known
+    }
+
+    /// The `control.awaitingQuestion` payload, when a live ask exists.
+    pub fn pending_snapshot(&self) -> Option<serde_json::Value> {
+        self.pending.lock().unwrap().as_ref().map(|p| {
+            serde_json::json!({
+                "questionId": p.id,
+                "question": p.question,
+                "askedAt": p.asked_at,
+            })
+        })
+    }
+}
+
 /// One steered input waiting in the serve-level queue: text plus its
 /// attachment paths (N0017 follow-up — steering no longer drops files).
 #[derive(Debug, Clone)]
@@ -478,6 +673,7 @@ pub fn run_turn_streaming(
     approvals: Arc<SurfaceApprovalChannel>,
     unattended: bool,
     attachments: Vec<String>,
+    questions: Option<Arc<SurfaceQuestionChannel>>,
 ) -> Result<TurnOutcome, String> {
     let steering_rx = steering;
     // attachments fold BEFORE anything surfaces: model-visible means
@@ -525,7 +721,38 @@ pub fn run_turn_streaming(
 
     // 2. build the agent (full CLI tool plane + policy ceiling, sampler
     // from the state's factory — real provider when `--provider` was given)
-    let registry = build_registry(&cwd);
+    let mut registry = build_registry(&cwd);
+    // N0019: probed MCP tools join the turn (approval-gated: unknown
+    // side-effectors); N0020: ask_user joins ATTENDED surfaces only (an
+    // unattended bridge would block the turn forever).
+    let _mcp_tools = register_mcp_tools(&mut registry, &cwd);
+    if let Some(bridge) = questions.as_ref() {
+        let bridge = Arc::clone(bridge);
+        let spec = okra_tools::ToolSpec {
+            name: "ask_user".into(),
+            description: "Ask the user a clarifying question mid-turn; the tool returns their answer.".into(),
+            arguments_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": { "question": { "type": "string" } },
+                "required": ["question"],
+            })),
+            read_only: true,
+            idempotent: false,
+            kind: Some("interaction".into()),
+            ..ask_user_spec_rest()
+        };
+        let metadata = okra_tools::ToolMetadata { read_only: true, ..Default::default() };
+        let entry = okra_tools::ToolEntry::new(spec, metadata);
+        let _ = registry.register(okra_tools::ErasedTool::simple(
+            entry,
+            vec![okra_tools::ResourceAccess::All],
+            move |args: &serde_json::Value| {
+                let q = args["question"].as_str().unwrap_or_default().to_string();
+                let answer = bridge.ask(q);
+                okra_tools::ToolStream::terminal_only(Ok(okra_tools::ToolOutput::text(answer)))
+            },
+        ));
+    }
     let mut approval_service = ApprovalService::new(ApprovalPolicy::Ask);
     if !unattended {
         // attended surfaces: the bridge IS the approval waterfall — the
@@ -636,6 +863,58 @@ pub fn run_turn_streaming(
         });
     }
 
+    let mut q_teardown_flag: Option<Arc<AtomicBool>> = None;
+    // question watchdog (N0020): a live ask surfaces as
+    // control.awaitingQuestion + the question-class notification; clearing
+    // restores the running phase
+    if let Some(qb) = questions.as_ref() {
+        let qb = Arc::clone(qb);
+        let q_proj = Arc::clone(&turn_row_lock);
+        let q_topic = topic.clone();
+        let q_session = session_id.clone();
+        let q_broadcast = Arc::clone(&broadcast);
+        let q_done = Arc::new(AtomicBool::new(false));
+        let q_done_inner = Arc::clone(&q_done);
+        std::thread::spawn(move || {
+            let emit = |m: &str, p: serde_json::Value| q_broadcast(m, p);
+            let mut last_asked = false;
+            while !q_done_inner.load(Ordering::Relaxed) {
+                let snap = qb.pending_snapshot();
+                let is_asked = snap.is_some();
+                if is_asked != last_asked {
+                    last_asked = is_asked;
+                    let mut proj = q_proj.lock().unwrap();
+                    if let Some(q) = &snap {
+                        let n = classify(
+                            NotificationClass::Question,
+                            &format!("Question: {}", q["question"].as_str().unwrap_or_default()),
+                            &q_session,
+                        );
+                        emit(
+                            "v4/notification",
+                            serde_json::json!({
+                                "class": n.class,
+                                "label": n.label,
+                                "sessionId": n.session_id,
+                            }),
+                        );
+                        proj.control["awaitingQuestion"] = q.clone();
+                        proj.control["phase"] = serde_json::json!("awaitingQuestion");
+                    } else {
+                        proj.control["awaitingQuestion"] = serde_json::Value::Null;
+                        proj.control["phase"] = serde_json::json!("running");
+                    }
+                    emit(
+                        "v4/projection",
+                        projection_notification(&q_topic, &proj)["params"].clone(),
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+        });
+        q_teardown_flag = Some(q_done);
+    }
+
     let outcome = agent.run_turn(&input_text, &mut |ev: LoopEvent| {
         let mut p = row_lock.lock().unwrap();
         match ev {
@@ -719,12 +998,16 @@ pub fn run_turn_streaming(
     wd_done.store(true, Ordering::Relaxed);
     let _ = wd_handle.join();
     fwd_done.store(true, Ordering::Relaxed);
+    if let Some(f) = q_teardown_flag.take() {
+        f.store(true, Ordering::Relaxed);
+    }
 
     // 4. finalize rows + control (honest states: a user stop is an
     // interrupted turn, not an error)
     {
         let mut p = turn_row_lock.lock().unwrap();
         p.control["awaitingApproval"] = serde_json::json!([]);
+        p.control["awaitingQuestion"] = serde_json::Value::Null;
         let (assistant_state, header_state) = match &outcome {
             Ok(TurnOutcome::Completed { stop: okra_agent_core::turn::CompletedStop::MaxTokens, .. })
                 | Ok(TurnOutcome::Cancelled { category: Some(CancellationCategory::UserRequested) }) => {
@@ -1696,6 +1979,7 @@ pub fn serve_stdio(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) ->
                             bridge,
                             true,
                             Vec::new(),
+                            None,
                         ) {
                             outbound.notification(
                                 "v4/error",

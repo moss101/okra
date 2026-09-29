@@ -15,7 +15,7 @@ use okra_host::terminal::TerminalSession;
 
 use crate::serve::{
     self, starter_scene_catalog, run_turn_streaming, uuid_v4, SamplerFactory,
-    SessionProjection, SurfaceApprovalChannel,
+    SessionProjection, SurfaceApprovalChannel, SurfaceQuestionChannel,
 };
 
 pub struct SurfaceWriter {
@@ -66,6 +66,9 @@ pub struct TcpServeState {
     /// Live stop flags keyed by session: the `stop` command flips the flag
     /// the turn thread installed; cancelled at the next step boundary.
     pub stop_flags: Mutex<BTreeMap<String, Arc<AtomicBool>>>,
+    /// Live question bridges keyed by session (N0020): `answerQuestion`
+    /// resolves the ask the question card is showing.
+    pub question_bridges: Mutex<BTreeMap<String, Arc<SurfaceQuestionChannel>>>,
     /// Live approval bridges keyed by session: `resolveApproval` answers
     /// the ask the workbench UI is showing.
     pub approval_bridges: Mutex<BTreeMap<String, Arc<SurfaceApprovalChannel>>>,
@@ -122,6 +125,7 @@ impl TcpServeState {
             running_turns: Mutex::new(std::collections::BTreeSet::new()),
             stop_flags: Mutex::new(BTreeMap::new()),
             approval_bridges: Mutex::new(BTreeMap::new()),
+            question_bridges: Mutex::new(BTreeMap::new()),
             terminals: Mutex::new(BTreeMap::new()),
             mcp_status: Mutex::new(BTreeMap::new()),
             sampler_factory,
@@ -1211,6 +1215,26 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
         });
     }
 
+    // ---- answerQuestion: resolve the live ask_user question ----
+    if cmd_type == "answerQuestion" {
+        let question_id = envelope["payload"]["questionId"].as_str().unwrap_or_default();
+        let answer = envelope["payload"]["answer"].as_str().unwrap_or_default().to_string();
+        let resolved = state
+            .question_bridges
+            .lock()
+            .unwrap()
+            .get(&session_id)
+            .map(|b| b.resolve(question_id, answer))
+            .unwrap_or(false);
+        eprintln!("[serve-tcp] answerQuestion: session={session_id} id={question_id} known={resolved}");
+        return serde_json::json!({
+            "commandId": command_id,
+            "status": if resolved { "accepted" } else { "rejected" },
+            "revisionAtDecision": 0,
+            "result": { "type": "questionAnswered", "resolved": resolved }
+        });
+    }
+
     let text = envelope["payload"]["text"].as_str().unwrap_or_default().to_string();
     let attachments: Vec<String> = envelope["payload"]["attachments"]
         .as_array()
@@ -1292,6 +1316,12 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
         .lock()
         .unwrap()
         .insert(session_id.clone(), Arc::clone(&bridge));
+    let qbridge = Arc::new(SurfaceQuestionChannel::new(Arc::clone(&stop_flag)));
+    state
+        .question_bridges
+        .lock()
+        .unwrap()
+        .insert(session_id.clone(), Arc::clone(&qbridge));
     // spawn the turn: projections broadcast to ALL surfaces (NDJSON + SSE)
     let state2 = Arc::clone(state);
     let turn_session = session_id.clone();
@@ -1321,6 +1351,7 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
                 Arc::clone(&stop_flag), &factory,
                 Arc::clone(&bridge), false,
                 entry.attachments,
+                Some(Arc::clone(&qbridge)),
             );
             let queued: Vec<crate::serve::SteeredInput> = {
                 let mut q = steer_queue.lock().unwrap(); q.drain(..).collect()
@@ -1337,6 +1368,7 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
         state2.running_turns.lock().unwrap().remove(&turn_session);
         state2.stop_flags.lock().unwrap().remove(&turn_session);
         state2.approval_bridges.lock().unwrap().remove(&turn_session);
+        state2.question_bridges.lock().unwrap().remove(&turn_session);
     });
     accepted
 }
