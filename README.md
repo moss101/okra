@@ -193,6 +193,12 @@ act, screen-takeover for screenshot); read-only marking was deliberately
 avoided so observing the screen prompts too. Binaries env-overridable
 (`OKRA_OSASCRIPT`/`OKRA_CLICKER`/`OKRA_SCREENCAPTURE`) for hermetic tests.
 
+**Skills management (N0024):** the Tools tab manages skills — install
+(writes `.okra/skills/SKILL-<name>.md` with sanitized names), disable /
+enable (`.disabled` suffix rename — disabled skills leave the activation
+path with zero extra state), and delete. Files are the database:
+inspectable and git-committable with the workspace.
+
 **Persistent MCP sessions (N0022):** one live child process per MCP
 server for the daemon's lifetime (spawn-once piped stdio in the
 sanctioned module, reader thread, bounded requests) — stateful servers

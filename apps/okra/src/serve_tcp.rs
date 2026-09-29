@@ -642,6 +642,52 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
             ),
         };
     }
+    // ---- skills management (N0024): install / disable / enable / delete ----
+    if method == "POST" && path.starts_with("/api/skills/") {
+        let action = path.trim_start_matches("/api/skills/");
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 {
+            reader.read_exact(&mut body)?;
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        let result = match action {
+            "install" => serve::skills_install(
+                &state.cwd,
+                parsed["name"].as_str().unwrap_or_default(),
+                parsed["description"].as_str().unwrap_or_default(),
+                &parsed["match"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect::<Vec<String>>()
+                    })
+                    .unwrap_or_default(),
+                parsed["body"].as_str().unwrap_or_default(),
+            ),
+            "disable" => serve::skills_set_disabled(&state.cwd, parsed["name"].as_str().unwrap_or_default(), true),
+            "enable" => serve::skills_set_disabled(&state.cwd, parsed["name"].as_str().unwrap_or_default(), false),
+            "delete" => serve::skills_delete(&state.cwd, parsed["name"].as_str().unwrap_or_default()),
+            _ => Err((404, format!("unknown skills action {action}"))),
+        };
+        return match result {
+            Ok(body) => write_http(
+                stream,
+                200,
+                "OK",
+                serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+            ),
+            Err((code, msg)) => write_http(
+                stream,
+                code,
+                "error",
+                serde_json::to_vec(&serde_json::json!({ "error": msg }))
+                    .unwrap_or_default()
+                    .as_slice(),
+            ),
+        };
+    }
     if path == "/api/skills" {
         let body = serve::skills_listing(&state.cwd);
         return write_http(

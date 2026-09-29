@@ -1314,6 +1314,8 @@ html[data-theme="light"] .icon-moon { display: none; }
 .mcp-status.st-timeout { color: var(--warning); background: color-mix(in srgb, var(--warning) 14%, transparent); }
 .mcp-status.st-error, .mcp-status.st-no-command { color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
 
+.skill-del:hover { background: color-mix(in srgb, var(--danger) 14%, transparent); color: var(--danger); border-color: var(--danger); }
+
 /* ---------- commit box ---------- */
 
 .git-section {

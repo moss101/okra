@@ -1853,11 +1853,28 @@ pub fn file_search(cwd: &Path, query_raw: &str) -> Result<serde_json::Value, (u1
     Ok(serde_json::json!({ "matches": results, "capped": false }))
 }
 
-/// GET /api/skills — the workspace's installed skills (`.okra/skills/*.md`)
-/// with their path-conditional activation patterns (disclosure layer 1).
+fn skills_dir(cwd: &Path) -> PathBuf {
+    cwd.join(".okra").join("skills")
+}
+
+/// The skill FILE name for a skill name (sanitized): `SKILL-<name>.md`.
+fn skill_file_name(name: &str) -> Result<String, (u16, String)> {
+    let clean: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if clean.is_empty() {
+        return Err((400, "skill name has no usable characters".to_string()));
+    }
+    Ok(format!("SKILL-{clean}.md"))
+}
+
+/// GET /api/skills — installed (`.okra/skills/*.md`) + disabled
+/// (`*.md.disabled`) skills with their path-conditional patterns
+/// (disclosure layer 1).
 pub fn skills_listing(cwd: &Path) -> serde_json::Value {
-    let catalog = okra_memory::SkillCatalog::load_dir(&cwd.join(".okra").join("skills"));
-    let skills: Vec<serde_json::Value> = catalog
+    let catalog = okra_memory::SkillCatalog::load_dir(&skills_dir(cwd));
+    let mut skills: Vec<serde_json::Value> = catalog
         .skills
         .iter()
         .map(|s| {
@@ -1865,10 +1882,98 @@ pub fn skills_listing(cwd: &Path) -> serde_json::Value {
                 "name": s.name,
                 "description": s.description,
                 "patterns": s.match_patterns,
+                "disabled": false,
             })
         })
         .collect();
+    // disabled skills: `*.md.disabled` — name recovered from the frontmatter
+    let dir = skills_dir(cwd);
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let mut files: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+        files.sort();
+        for path in files {
+            let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            if !name.ends_with(".md.disabled") {
+                continue;
+            }
+            if let Ok(src) = std::fs::read_to_string(&path)
+                && let Ok(skill) = okra_memory::SkillDef::parse(&src)
+            {
+                skills.push(serde_json::json!({
+                    "name": skill.name,
+                    "description": skill.description,
+                    "patterns": skill.match_patterns,
+                    "disabled": true,
+                }));
+            }
+        }
+    }
     serde_json::json!({ "dir": ".okra/skills", "skills": skills })
+}
+
+/// POST /api/skills/install — write a new skill file (fails on duplicate).
+#[allow(clippy::too_many_arguments)]
+pub fn skills_install(
+    cwd: &Path,
+    name: &str,
+    description: &str,
+    patterns: &[String],
+    body: &str,
+) -> Result<serde_json::Value, (u16, String)> {
+    let file = skill_file_name(name)?;
+    let dir = skills_dir(cwd);
+    std::fs::create_dir_all(&dir).map_err(|e| (500, format!("skills dir: {e}")))?;
+    let path = dir.join(&file);
+    if path.exists() {
+        return Err((409, format!("skill {name} already installed")));
+    }
+    let mut src = String::from("---\n");
+    src.push_str(&format!("name: {name}\n"));
+    src.push_str(&format!("description: {description}\n"));
+    if !patterns.is_empty() {
+        src.push_str(&format!("match: {}\n", patterns.join(" ")));
+    }
+    src.push_str("---\n");
+    src.push_str(body);
+    src.push('\n');
+    std::fs::write(&path, src).map_err(|e| (500, format!("write: {e}")))?;
+    Ok(serde_json::json!({ "installed": name, "file": format!(".okra/skills/{file}") }))
+}
+
+/// POST /api/skills/disable|enable — rename to/from the `.disabled` suffix.
+pub fn skills_set_disabled(
+    cwd: &Path,
+    name: &str,
+    disabled: bool,
+) -> Result<serde_json::Value, (u16, String)> {
+    let file = skill_file_name(name)?;
+    let dir = skills_dir(cwd);
+    let (from, to) = if disabled {
+        (dir.join(&file), dir.join(format!("{file}.disabled")))
+    } else {
+        (dir.join(format!("{file}.disabled")), dir.join(&file))
+    };
+    if !from.exists() {
+        return Err((404, format!("skill file not found: {file}")));
+    }
+    std::fs::rename(&from, &to).map_err(|e| (500, format!("rename: {e}")))?;
+    Ok(serde_json::json!({ "name": name, "disabled": disabled }))
+}
+
+/// POST /api/skills/delete — remove the skill file (enabled or disabled).
+pub fn skills_delete(cwd: &Path, name: &str) -> Result<serde_json::Value, (u16, String)> {
+    let file = skill_file_name(name)?;
+    let dir = skills_dir(cwd);
+    for candidate in [dir.join(&file), dir.join(format!("{file}.disabled"))] {
+        if candidate.exists() {
+            std::fs::remove_file(&candidate)
+                .map_err(|e| (500, format!("remove: {e}")))?;
+            return Ok(serde_json::json!({ "deleted": name }));
+        }
+    }
+    Err((404, format!("skill file not found: {file}")))
 }
 
 /// POST /api/mcp/probe — connect to one (or all) configured stdio MCP

@@ -1819,3 +1819,71 @@ done
         std::panic::resume_unwind(panic);
     }
 }
+
+/// N0024 — skills management: install / disable / enable / delete over
+/// `.okra/skills`, reflected in the listing; duplicates conflict; unknown
+/// skills 404; traversal-proof filenames.
+#[test]
+fn g4_skills_management_lifecycle() {
+    let td = tempfile::tempdir().unwrap();
+    let (mut daemon, addr) = spawn_daemon(td.path());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // 1. install
+        let (status, reply) = http_post(&addr, "/api/skills/install", &serde_json::json!({
+            "name": "rust-review",
+            "description": "Review Rust changes idiomatically",
+            "match": ["src/**"],
+            "body": "Review for idiomatic Rust."
+        }));
+        assert_eq!(status, 200, "{reply}");
+        assert!(td.path().join(".okra/skills/SKILL-rust-review.md").is_file());
+
+        // 2. duplicate → 409
+        let (status, _) = http_post(&addr, "/api/skills/install", &serde_json::json!({
+            "name": "rust-review", "description": "dup"
+        }));
+        assert_eq!(status, 409);
+
+        // 3. listing shows it enabled with patterns
+        let (status, body) = http_get(&addr, "/api/skills");
+        assert!(body.contains("rust-review"), "{body}");
+        assert!(body.contains("src/**"), "{body}");
+        assert!(body.contains("\"disabled\":false"), "{body}");
+
+        // 4. disable → listing shows disabled; the enabled file is gone
+        let (status, reply) = http_post(&addr, "/api/skills/disable", &serde_json::json!({ "name": "rust-review" }));
+        assert_eq!(status, 200, "{reply}");
+        assert!(!td.path().join(".okra/skills/SKILL-rust-review.md").exists());
+        assert!(td.path().join(".okra/skills/SKILL-rust-review.md.disabled").is_file());
+        let (status, body) = http_get(&addr, "/api/skills");
+        assert!(body.contains("\"disabled\":true"), "{body}");
+
+        // 5. enable → back
+        let (status, reply) = http_post(&addr, "/api/skills/enable", &serde_json::json!({ "name": "rust-review" }));
+        assert_eq!(status, 200, "{reply}");
+        assert!(td.path().join(".okra/skills/SKILL-rust-review.md").is_file());
+
+        // 6. delete
+        let (status, reply) = http_post(&addr, "/api/skills/delete", &serde_json::json!({ "name": "rust-review" }));
+        assert_eq!(status, 200, "{reply}");
+        let (status, body) = http_get(&addr, "/api/skills");
+        assert!(body.contains("\"skills\":[]"), "{body}");
+
+        // 7. honest failures: unknown name → 404; unsanitizable name → 400
+        let (status, _) = http_post(&addr, "/api/skills/delete", &serde_json::json!({ "name": "ghost" }));
+        assert_eq!(status, 404);
+        let (status, _) = http_post(&addr, "/api/skills/install", &serde_json::json!({ "name": "..." }));
+        assert_eq!(status, 400);
+        // a name with a path separator cannot escape the skills dir
+        let (status, _) = http_post(&addr, "/api/skills/install", &serde_json::json!({ "name": "../evil" }));
+        assert_eq!(status, 200); // sanitized to letters/digits/-/_ only
+        assert!(td.path().join(".okra/skills/SKILL-evil.md").is_file(),
+            "path separators and dots are stripped from the name");
+        assert!(!td.path().join("evil").exists());
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}

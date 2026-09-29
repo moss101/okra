@@ -179,15 +179,53 @@ function renderTools() {
   if (!tools.data) { host.appendChild(el('div', 'tree-empty', 'loading…')); return; }
 
   const skills = (tools.data.skills && tools.data.skills.skills) || [];
-  host.appendChild(el('div', 'git-section', 'Skills · ' + (tools.data.skills.dir || '')));
+  const skillsHead = el('div', 'git-section');
+  skillsHead.appendChild(el('span', null, 'Skills · ' + (tools.data.skills.dir || '')));
+  const addBtn = el('button', 'stage-btn', '+');
+  addBtn.type = 'button';
+  addBtn.title = 'Install a skill';
+  addBtn.style.marginLeft = 'auto';
+  addBtn.style.textTransform = 'none';
+  addBtn.style.letterSpacing = 'normal';
+  addBtn.addEventListener('click', () => {
+    const name = prompt('Skill name (letters/digits/-/_):');
+    if (!name) return;
+    const description = prompt('Description:');
+    if (description === null) return;
+    const match = prompt('Path patterns (space-separated globs, e.g. src/**):') || '';
+    const body = prompt('Instructions (the body the model reads when active):') || '';
+    post('/api/skills/install', {
+      name, description,
+      match: match.split(/\s+/).filter(Boolean), body,
+    }).then(() => loadTools()).catch(() => {});
+  });
+  skillsHead.appendChild(addBtn);
+  host.appendChild(skillsHead);
   if (!skills.length) {
     host.appendChild(el('div', 'tree-empty',
-      'None installed — add *.md files with name/description/match frontmatter.'));
+      'None installed — use + to add one (name/description/match frontmatter).'));
   }
   for (const sk of skills) {
     const row = el('div', 'tool-entry');
     const head = el('div', 'tool-entry-head');
     head.appendChild(el('span', 'tool-entry-name', sk.name));
+    if (sk.disabled) head.appendChild(el('span', 'mcp-scope', 'disabled'));
+    // toggle + delete (management actions; the list reloads after each)
+    const toggle = el('button', 'stage-btn', sk.disabled ? 'enable' : 'disable');
+    toggle.type = 'button';
+    toggle.addEventListener('click', async () => {
+      await post(sk.disabled ? '/api/skills/enable' : '/api/skills/disable', { name: sk.name });
+      loadTools();
+    });
+    const del = el('button', 'stage-btn skill-del', '×');
+    del.type = 'button';
+    del.title = 'Delete skill';
+    del.addEventListener('click', async () => {
+      await post('/api/skills/delete', { name: sk.name });
+      loadTools();
+    });
+    head.appendChild(toggle);
+    head.appendChild(del);
     row.appendChild(head);
     row.appendChild(el('div', 'tool-entry-desc', sk.description || ''));
     if ((sk.patterns || []).length) {
