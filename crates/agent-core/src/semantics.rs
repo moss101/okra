@@ -99,6 +99,12 @@ impl SemanticJudge for JevSemanticJudge {
     }
 }
 
+/// The explicit policy gate: class primary (calibrated on live Jev —
+/// see N0021), shared by the governor and its observability.
+fn class_matches(config: &WanderConfig, verdict: &JevWanderVerdict) -> bool {
+    config.nudge_activities.iter().any(|c| *c == verdict.activity)
+}
+
 /// Governance constants (explicit policy — tune here, not in the loop).
 #[derive(Debug, Clone, Copy)]
 pub struct WanderConfig {
@@ -191,14 +197,16 @@ impl WanderGovernor {
             return None;
         }
         self.judgments += 1;
-        // fail-open: any error/ambiguity → no nudge
+        // fail-open: any error/ambiguity → no nudge (verdict logged either
+        // way — a silent semantic signal can't be tuned or trusted)
         let verdict = self.judge.judge_wander(recent_activity, latest_user_text)?;
-        let class_matches = self
-            .config
-            .nudge_activities
-            .iter()
-            .any(|c| *c == verdict.activity);
-        if class_matches {
+        eprintln!(
+            "[wander] step {step}: progressing={:.2} activity={} -> {}",
+            verdict.progressing_probability,
+            verdict.activity,
+            if class_matches(&self.config, &verdict) { "NUDGE" } else { "quiet" },
+        );
+        if class_matches(&self.config, &verdict) {
             self.nudges += 1;
             Some(format!(
                 "A semantic progress check suggests you may be going in circles \

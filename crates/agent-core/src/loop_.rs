@@ -844,6 +844,16 @@ impl<S: Sampler + ?Sized> Agent<S> {
                             &mut out,
                             LoopEvent::Nudge { reason: "semantic wander check".into() },
                         );
+                        // model-visible means logged: the nudge enters the
+                        // history, so it enters the log (ignorable, tagged)
+                        self.log(vec![kernel::make_event(
+                            "user/message",
+                            serde_json::json!({
+                                "text": reminder,
+                                "origin": "semantic-wander",
+                            }),
+                            clock,
+                        )])?;
                         history.push(Message::user(reminder));
                     }
                 }
