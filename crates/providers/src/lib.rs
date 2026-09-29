@@ -9,6 +9,7 @@
 //!   killAtPhase harness (`sampler.rs`, §3 #63)
 
 pub mod messages;
+pub mod jev;
 pub mod openai;
 pub mod sampler;
 

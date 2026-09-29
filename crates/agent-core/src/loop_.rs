@@ -36,7 +36,32 @@ use okra_compaction::OriginTag;
 use crate::turn::{CancellationCategory, CompletedStop, TurnOutcome, TurnPhase, TurnMachine};
 
 /// Configuration for one agent.
-#[derive(Debug, Clone)]
+impl std::fmt::Debug for AgentConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentConfig")
+            .field("max_steps", &self.max_steps)
+            .field("stationarity", &self.stationarity)
+            .field("salvage_budget", &self.salvage_budget)
+            .field("backstops", &self.backstops)
+            .field("unattended", &self.unattended)
+            .field("semantic_judge", &self.semantic_judge.is_some())
+            .finish()
+    }
+}
+
+impl Clone for AgentConfig {
+    fn clone(&self) -> Self {
+        AgentConfig {
+            max_steps: self.max_steps,
+            stationarity: self.stationarity.clone(),
+            salvage_budget: self.salvage_budget,
+            backstops: self.backstops.clone(),
+            unattended: self.unattended,
+            semantic_judge: self.semantic_judge.clone(),
+        }
+    }
+}
+
 pub struct AgentConfig {
     pub max_steps: usize,
     pub stationarity: crate::governors::StationarityConfig,
@@ -44,6 +69,8 @@ pub struct AgentConfig {
     pub backstops: BackstopConfig,
     /// Structured callables: whether the agent runs unattended (yolo-capable).
     pub unattended: bool,
+    /// Semantic wander governor (TypeSafe Jev). None → pure-code path.
+    pub semantic_judge: Option<std::sync::Arc<dyn crate::semantics::SemanticJudge>>,
 }
 
 impl Default for AgentConfig {
@@ -54,6 +81,7 @@ impl Default for AgentConfig {
             salvage_budget: 2,
             backstops: Default::default(),
             unattended: false,
+            semantic_judge: None,
         }
     }
 }
@@ -382,15 +410,25 @@ pub struct Agent<S: Sampler + ?Sized> {
     /// every step boundary. A stopped turn is Cancelled(UserRequested) and
     /// recovers through the standard repair path on the next turn.
     stop: Arc<AtomicBool>,
+    /// Semantic wander governor (N0021): Jev-judged progress signals at
+    /// step boundaries, fail-open, inert when unconfigured.
+    wander: crate::semantics::WanderGovernor,
 }
 
 impl<S: Sampler + ?Sized> Agent<S> {
     pub fn new(
-        config: AgentConfig,
+        mut config: AgentConfig,
         sampler: Arc<S>,
         executor: Box<dyn ToolExecutor>,
         session: kernel::SessionHandle,
     ) -> Self {
+        let wander = {
+            let judge = config.semantic_judge.take()
+                .unwrap_or_else(|| std::sync::Arc::new(
+                    crate::semantics::JevSemanticJudge::inert(),
+                ));
+            crate::semantics::WanderGovernor::new(judge)
+        };
         Agent {
             config,
             sampler,
@@ -400,6 +438,7 @@ impl<S: Sampler + ?Sized> Agent<S> {
             machine: TurnMachine::new(),
             turn_counter: 0,
             stop: Arc::new(AtomicBool::new(false)),
+            wander,
         }
     }
 
@@ -769,6 +808,44 @@ impl<S: Sampler + ?Sized> Agent<S> {
                 // doom-loop guard on identical responses
                 if !doom.observe(&response) {
                     break TurnOutcome::StationarityEnded;
+                }
+
+                // semantic wander check (N0021): a Jev judgment over the
+                // recent activity at step boundaries; fail-open, bounded
+                if self.wander.is_active() {
+                    let recent = call_tuples
+                        .iter()
+                        .rev()
+                        .take(6)
+                        .rev()
+                        .map(|(name, args)| {
+                            format!(
+                                "- {name} {}",
+                                args.chars().take(120).collect::<String>()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let user_text = history
+                        .iter()
+                        .rev()
+                        .find_map(|m| {
+                            if m.role == okra_providers::Role::User {
+                                Some(m.text_content())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default();
+                    if let Some(reminder) =
+                        self.wander.observe_step(steps, &recent, &user_text)
+                    {
+                        Self::emit(
+                            &mut out,
+                            LoopEvent::Nudge { reason: "semantic wander check".into() },
+                        );
+                        history.push(Message::user(reminder));
+                    }
                 }
 
                 let mut results: Vec<Message> = Vec::new();

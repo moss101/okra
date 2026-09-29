@@ -793,7 +793,12 @@ pub fn run_turn_streaming(
     if clamped {
         eprintln!("[pin] max-turns clamped to {max_steps}");
     }
-    let config = okra_agent_core::loop_::AgentConfig { max_steps, unattended: true, ..Default::default() };
+    let config = okra_agent_core::loop_::AgentConfig {
+        max_steps,
+        unattended: true,
+        semantic_judge: okra_agent_core::semantics::from_env_config(),
+        ..Default::default()
+    };
     let sampler = (sampler_factory)();
     let mut agent = Agent::new(config, sampler, Box::new(executor), kernel_session);
     agent.set_stop_flag(stop);

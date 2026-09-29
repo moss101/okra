@@ -407,3 +407,168 @@ fn request_stop_from_another_flag_clone_is_observed() {
         TurnOutcome::Cancelled { category: Some(core::turn::CancellationCategory::UserRequested) }
     ));
 }
+
+/// N0021 — the semantic wander governor: a turn whose tool activity never
+/// converges gets a Jev-judged nudge at step boundaries; a healthy turn
+/// does not; the hook is fail-open.
+#[test]
+fn semantic_wander_governor_nudges_a_circling_turn() {
+    use okra_agent_core::semantics::{JevWanderVerdict, SemanticJudge};
+    use std::sync::Mutex;
+
+    struct StubWander {
+        verdicts: Mutex<Vec<Option<JevWanderVerdict>>>,
+    }
+    impl SemanticJudge for StubWander {
+        fn judge_wander(&self, _a: &str, _u: &str) -> Option<JevWanderVerdict> {
+            let mut v = self.verdicts.lock().unwrap();
+            if v.is_empty() { None } else { v.remove(0) }
+        }
+    }
+
+    let td = tempfile::tempdir().unwrap();
+    for i in 0..8 {
+        std::fs::write(td.path().join(format!("f{i}.txt")), format!("file {i}")).unwrap();
+    }
+    // seven DIFFERENT reads (stationarity stays quiet), then end the turn
+    let mut steps = Vec::new();
+    for i in 0..7 {
+        steps.push(ScriptedStep {
+            text: format!("checking f{i}"),
+            tool_calls: vec![ToolCall {
+                id: format!("c{i}"),
+                name: "read_file".into(),
+                args_json: serde_json::json!({ "path": format!("f{i}.txt") }).to_string(),
+            }],
+            ..Default::default()
+        });
+    }
+    steps.push(ScriptedStep { text: "done".into(), ..Default::default() });
+
+    let session_id = "wander-e2e";
+    let mut registry = Registry::new();
+    let rf = okra_tools::builtins::read_file_tool(td.path().to_path_buf());
+    let entry = rf.entry();
+    registry
+        .register(okra_tools::ErasedTool::simple(
+            entry,
+            vec![okra_tools::ResourceAccess::read_file("*")],
+            move |args| rf.execute(args, None),
+        ))
+        .unwrap();
+    let mut approvals = ApprovalService::new(ApprovalPolicy::Never);
+    approvals.add_channel(Box::new(AllowChannel));
+    let executor = PolicyToolExecutor::new(registry, approvals);
+    let header = kernel::SessionHeader {
+        version: kernel::SESSION_FORMAT_VERSION,
+        id: session_id.into(),
+        created_at: 1.0,
+        cwd: td.path().to_string_lossy().into_owned(),
+        parent_session: None,
+        is_seeded: false,
+    };
+    let session = kernel::SessionHandle::create(
+        &td.path().join(".okra-sessions"),
+        &header,
+    )
+    .unwrap();
+
+    // two wandering verdicts, then healthy: judgments happen at steps 4
+    // and (had calls continued) 7 — step 4 nudges, the rest are quiet
+    let mut agent = Agent::new(
+        AgentConfig {
+            unattended: true,
+            semantic_judge: Some(std::sync::Arc::new(StubWander {
+                verdicts: Mutex::new(vec![
+                    Some(JevWanderVerdict { progressing_probability: 0.05, activity: "repeating".into() }),
+                    Some(JevWanderVerdict { progressing_probability: 0.9, activity: "exploring".into() }),
+                ]),
+            })),
+            ..Default::default()
+        },
+        Arc::new(ScriptedModel::new(steps)),
+        Box::new(executor),
+        session,
+    );
+    let mut events = Vec::new();
+    let outcome = agent.run_turn("review these files", &mut collect(&mut events)).unwrap();
+    assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+    let semantic_nudges: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, LoopEvent::Nudge { reason } if reason.contains("semantic")))
+        .collect();
+    assert_eq!(semantic_nudges.len(), 1, "exactly one semantic nudge; events: {events:?}");
+}
+
+#[test]
+fn semantic_governor_stays_quiet_when_healthy() {
+    use okra_agent_core::semantics::{JevWanderVerdict, SemanticJudge};
+    use std::sync::Mutex;
+
+    struct Healthy;
+    impl SemanticJudge for Healthy {
+        fn judge_wander(&self, _a: &str, _u: &str) -> Option<JevWanderVerdict> {
+            Some(JevWanderVerdict { progressing_probability: 0.95, activity: "delivering".into() })
+        }
+    }
+
+    let td = tempfile::tempdir().unwrap();
+    std::fs::write(td.path().join("a.txt"), "a").unwrap();
+    std::fs::write(td.path().join("b.txt"), "b").unwrap();
+    let steps = vec![
+        ScriptedStep {
+            text: "reading a".into(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                args_json: r#"{"path":"a.txt"}"#.into(),
+            }],
+            ..Default::default()
+        },
+        ScriptedStep {
+            text: "reading b".into(),
+            tool_calls: vec![ToolCall {
+                id: "c2".into(),
+                name: "read_file".into(),
+                args_json: r#"{"path":"b.txt"}"#.into(),
+            }],
+            ..Default::default()
+        },
+        ScriptedStep { text: "done".into(), ..Default::default() },
+    ];
+    let mut registry = Registry::new();
+    let rf = okra_tools::builtins::read_file_tool(td.path().to_path_buf());
+    let entry = rf.entry();
+    registry
+        .register(okra_tools::ErasedTool::simple(
+            entry,
+            vec![okra_tools::ResourceAccess::read_file("*")],
+            move |args| rf.execute(args, None),
+        ))
+        .unwrap();
+    let approvals = ApprovalService::new(ApprovalPolicy::Never);
+    let executor = PolicyToolExecutor::new(registry, approvals);
+    let header = kernel::SessionHeader {
+        version: kernel::SESSION_FORMAT_VERSION,
+        id: "wander-healthy".into(),
+        created_at: 1.0,
+        cwd: td.path().to_string_lossy().into_owned(),
+        parent_session: None,
+        is_seeded: false,
+    };
+    let session = kernel::SessionHandle::create(&td.path().join(".okra-sessions"), &header).unwrap();
+    let mut agent = Agent::new(
+        AgentConfig {
+            unattended: true,
+            semantic_judge: Some(std::sync::Arc::new(Healthy)),
+            ..Default::default()
+        },
+        Arc::new(ScriptedModel::new(steps)),
+        Box::new(executor),
+        session,
+    );
+    let mut events = Vec::new();
+    let outcome = agent.run_turn("read two files", &mut collect(&mut events)).unwrap();
+    assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+    assert!(!events.iter().any(|e| matches!(e, LoopEvent::Nudge { .. })));
+}

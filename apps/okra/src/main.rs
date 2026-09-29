@@ -136,7 +136,11 @@ fn print_help() {
          --task SPEC.json        run a scripted multi-file coding task\n  \
          --fork-session          fork instead of reusing the last session\n  \
          --worktree PATH         run against an isolated worktree\n  \
-         --help                  this text"
+         --help                  this text
+         
+         ENV:
+         TYPESAFE_API_KEY        enables the semantic wander governor (Jev);
+                                 OKRA_SEMANTIC_WATCH=off disables"
     );
 }
 
@@ -954,7 +958,12 @@ fn main() {
             None => Arc::new(demo_sampler),
         }
     };
-    let config = AgentConfig { max_steps: args.max_turns, unattended: true, ..Default::default() };
+    let config = AgentConfig {
+        max_steps: args.max_turns,
+        unattended: true,
+        semantic_judge: okra_agent_core::semantics::from_env_config(),
+        ..Default::default()
+    };
     let mut agent = Agent::new(config, sampler, Box::new(executor), session);
 
     // ---- run the turn, streaming NDJSON ----

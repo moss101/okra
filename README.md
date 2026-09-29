@@ -175,6 +175,13 @@ anchored so content never jumps when checkpoints refine). A 2k-row
 streaming task stays bounded and smooth; verified live at 127 rows with a
 24-node window and across replay.
 
+**Semantic wander governor (N0021):** with `TYPESAFE_API_KEY` set, the
+turn loop asks TypeSafe's Jev (every 3rd step from step 4, max 6
+judgments) whether the agent is progressing or going in circles; the
+verdict feeds the existing nudge path. Class-gated (`repeating`/
+`offtrack` — calibrated live), fail-open, inert without the key
+(`OKRA_SEMANTIC_WATCH=off` disables).
+
 **MCP tools in turns + the question flow (N0019/N0020):** probed MCP
 tools register into every turn as `mcp__<server>__<tool>` and are
 APPROVAL-GATED (one-shot tools/call through the sanctioned runner) —
