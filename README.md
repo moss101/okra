@@ -182,6 +182,12 @@ verdict feeds the existing nudge path. Class-gated (`repeating`/
 `offtrack` — calibrated live), fail-open, inert without the key
 (`OKRA_SEMANTIC_WATCH=off` disables).
 
+**Persistent MCP sessions (N0022):** one live child process per MCP
+server for the daemon's lifetime (spawn-once piped stdio in the
+sanctioned module, reader thread, bounded requests) — stateful servers
+keep state and stateless ones pay startup once. Proven by an
+initialize-exactly-once assertion and a cross-turn stateful counter.
+
 **MCP tools in turns + the question flow (N0019/N0020):** probed MCP
 tools register into every turn as `mcp__<server>__<tool>` and are
 APPROVAL-GATED (one-shot tools/call through the sanctioned runner) —

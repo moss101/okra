@@ -1462,20 +1462,27 @@ esac
 #[test]
 fn g4_mcp_tools_run_inside_turns() {
     let td = tempfile::tempdir().unwrap();
+    // a PERSISTENT responder: loops until EOF (stdin close), counting
+    // initialize lines to a file — the persistent-session proof
     let server_script = r#"#!/bin/sh
-read req
-id=$(printf '%s' "$req" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
-case "$req" in
-  *initialize*)
-    printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"fake-tools","version":"1.0"}}}\n' "$id" ;;
-  *tools/list*)
-    printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"probe-tool","description":"canned","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
-  *tools/call*)
-    text=$(printf '%s' "$req" | sed -n 's/.*"text":"\([^"]*\)".*/\1/p')
-    printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"echo: %s"}]}}\n' "$id" "$text" ;;
-  *)
-    printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
-esac
+count_file=/tmp/okra-mcp-init-count
+echo 0 > "$count_file" 2>/dev/null
+while IFS= read -r req; do
+  id=$(printf '%s' "$req" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$req" in
+    *initialize*)
+      n=$(cat "$count_file" 2>/dev/null || echo 0)
+      echo $((n + 1)) > "$count_file" 2>/dev/null
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"fake-tools","version":"1.0"}}}\n' "$id" ;;
+    *tools/list*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"probe-tool","description":"canned","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+    *tools/call*)
+      text=$(printf '%s' "$req" | sed -n 's/.*"text":"\([^"]*\)".*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"echo: %s"}]}}\n' "$id" "$text" ;;
+    *)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+  esac
+done
 "#;
     let fixture = td.path().join("fake-mcp.sh");
     std::fs::write(&fixture, server_script).unwrap();
@@ -1551,6 +1558,16 @@ esac
         assert_eq!(status, 200, "{rows}");
         assert!(rows.contains("mcp__fake_probe-tool"), "tool row missing: {rows}");
         assert!(rows.contains("echo: hello there"), "tools/call result missing: {rows}");
+
+        // PERSISTENT-SESSION PROOF: initialize ran exactly ONCE even though
+        // the session did initialize + tools/list + tools/call
+        let count_file = "/tmp/okra-mcp-init-count";
+        let count = std::fs::read_to_string(count_file)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        assert_eq!(count, "1", "initialize must run once per session, got {count}");
+        let _ = std::fs::remove_file(count_file);
     }));
     let _ = daemon.kill();
     let _ = daemon.wait();

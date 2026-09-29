@@ -16,9 +16,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use crate::process;
+use crate::process::{self, PersistentChild};
 use crate::stream::{ToolError, ToolOutput, ToolStream};
 
 // ---- transport ----
@@ -130,6 +131,20 @@ impl McpClient {
         }
     }
 
+    /// Connect over a PERSISTENT stdio session (N0022): one child process
+    /// for the session's lifetime — stateful servers keep state, stateless
+    /// ones pay startup once. Callers keep the client (or share it via
+    /// `SharedMcpSession`) and `kill` it on teardown.
+    pub fn stdio_persistent(server_name: &str, program: &str, args: &[String]) -> Result<McpClient, String> {
+        let transport = PersistentTransport::spawn(program, args)?;
+        Ok(McpClient {
+            transport: Box::new(transport),
+            server_name: server_name.to_string(),
+            protocol_version: "2024-11-05".into(),
+            server_info: Value::Null,
+        })
+    }
+
     pub fn in_process(
         server_name: &str,
         handler: Box<McpHandlerFn>,
@@ -210,6 +225,45 @@ struct ServerEntry {
 
 /// The funnel: owns MCP server connections; builds the two model-facing
 /// tools (`use_tool` + `tool_directory`) as erased registry tools.
+/// Persistent stdio transport: one child process for the whole session
+/// (N0022). The client holds the child; every request reuses it, so
+/// stateful servers keep their state and stateless ones pay startup once.
+pub struct PersistentTransport {
+    child: Arc<PersistentChild>,
+    timeout: Duration,
+}
+
+impl PersistentTransport {
+    pub fn spawn(program: &str, args: &[String]) -> Result<PersistentTransport, String> {
+        Ok(PersistentTransport {
+            child: Arc::new(PersistentChild::spawn(program, args)?),
+            timeout: Duration::from_secs(30),
+        })
+    }
+
+    pub fn is_dead(&self) -> bool {
+        self.child.is_dead()
+    }
+
+    pub fn kill(&self) {
+        self.child.kill();
+    }
+}
+
+impl Transport for PersistentTransport {
+    /// Same contract as the one-shot transport: the FULL response envelope
+    /// (rpc extracts result/error).
+    fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.child.request(method, &params, self.timeout)
+    }
+}
+
+/// A shared persistent client: one child per server, Arc'd across that
+/// server's tools (the registry closure clones the Arc).
+pub struct SharedMcpSession {
+    pub client: Mutex<McpClient>,
+}
+
 pub struct McpFunnel {
     servers: Vec<(String, ServerEntry)>,
 }

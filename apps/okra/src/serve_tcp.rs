@@ -78,6 +78,8 @@ pub struct TcpServeState {
     pub terminals: Mutex<BTreeMap<String, Arc<TermEntry>>>,
     /// Runtime MCP status from explicit probes (Tools tab).
     pub mcp_status: Mutex<BTreeMap<String, serde_json::Value>>,
+    /// Persistent MCP sessions keyed by server (N0022): live across turns.
+    pub mcp_sessions: Mutex<BTreeMap<String, Arc<Mutex<okra_tools::McpClient>>>>,
     /// Per-turn sampler source (`--provider openai` → real network model;
     /// default → offline demo planner).
     pub sampler_factory: SamplerFactory,
@@ -128,6 +130,7 @@ impl TcpServeState {
             question_bridges: Mutex::new(BTreeMap::new()),
             terminals: Mutex::new(BTreeMap::new()),
             mcp_status: Mutex::new(BTreeMap::new()),
+            mcp_sessions: Mutex::new(BTreeMap::new()),
             sampler_factory,
             sampler_label,
             next_static: std::sync::atomic::AtomicU64::new(0),
@@ -1352,6 +1355,7 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
                 Arc::clone(&bridge), false,
                 entry.attachments,
                 Some(Arc::clone(&qbridge)),
+                &state2.mcp_sessions,
             );
             let queued: Vec<crate::serve::SteeredInput> = {
                 let mut q = steer_queue.lock().unwrap(); q.drain(..).collect()

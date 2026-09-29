@@ -127,14 +127,18 @@ fn ask_user_spec_rest() -> okra_tools::ToolSpec {
 }
 
 /// Register configured MCP servers' tools into the turn registry
-/// (N0019): each enabled stdio server is probed (initialize + tools_list,
-/// bounded — the N0018 contract) and every tool registers under
-/// `mcp__<server>__<tool>`. MCP tools are unknown side-effectors:
-/// `ResourceAccess::All` + read_only=false, so the approval card fires
-/// before any call executes. Each call is a fresh one-shot tools/call
-/// (the transport's documented scope; persistent sessions land with the
-/// gateway at M4).
-pub fn register_mcp_tools(registry: &mut okra_tools::Registry, cwd: &Path) -> usize {
+/// (N0019 + N0022): each enabled stdio server connects ONCE as a
+/// persistent session (initialize + tools_list over a live child), and
+/// every tool registers under `mcp__<server>__<tool>` sharing that
+/// session — stateful servers keep state, stateless ones pay startup
+/// once. MCP tools are unknown side-effectors: `ResourceAccess::All` +
+/// read_only=false, so the approval card fires before any call executes.
+/// Failed/timeout servers degrade to absent (fail-open, N0018 contract).
+pub fn register_mcp_tools(
+    registry: &mut okra_tools::Registry,
+    cwd: &Path,
+    sessions: &Mutex<std::collections::BTreeMap<String, Arc<Mutex<okra_tools::McpClient>>>>,
+) -> usize {
     use std::sync::mpsc;
     let home = okra_host::fsutil::home_dir().unwrap_or_else(|| cwd.to_path_buf());
     let svc = okra_host::mcp_sync::McpSyncService::new(home);
@@ -151,28 +155,66 @@ pub fn register_mcp_tools(registry: &mut okra_tools::Registry, cwd: &Path) -> us
             .as_array()
             .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
             .unwrap_or_default();
-        let tools = {
+        // ONE persistent session per server PER DAEMON: cached across
+        // turns; a dead cached session respawns once
+        let cached = sessions.lock().unwrap().get(&r.name).cloned();
+        let (session, tools) = if let Some(shared) = &cached {
+            // reuse: refresh the tool list over the live session
+            let (tx, rx) = mpsc::channel();
+            let shared = Arc::clone(shared);
+            std::thread::spawn(move || {
+                let tools = shared.lock().unwrap().tools_list().unwrap_or_default();
+                let _ = tx.send(tools);
+            });
+            match rx.recv_timeout(std::time::Duration::from_secs(8)) {
+                Ok(tools) if !tools.is_empty() => (cached.clone(), tools),
+                _ => {
+                    // dead session: drop and respawn below
+                    sessions.lock().unwrap().remove(&r.name);
+                    (None, Vec::new())
+                }
+            }
+        } else {
+            (None, Vec::new())
+        };
+        let (session, tools) = if session.is_some() {
+            (session, tools)
+        } else {
             let (tx, rx) = mpsc::channel();
             let srv = r.name.clone();
             let cmd = command.clone();
             let argv = args.clone();
             std::thread::spawn(move || {
-                let mut c = okra_tools::McpClient::stdio(&srv, &cmd, &argv);
-                if c.initialize().is_err() {
-                    return;
-                }
-                let _ = tx.send(c.tools_list().unwrap_or_default());
+                let outcome = match okra_tools::McpClient::stdio_persistent(&srv, &cmd, &argv) {
+                    Ok(mut c) => {
+                        if c.initialize().is_err() {
+                            None
+                        } else {
+                            let tools = c.tools_list().unwrap_or_default();
+                            Some((c, tools))
+                        }
+                    }
+                    Err(_) => None,
+                };
+                let _ = tx.send(outcome);
             });
             match rx.recv_timeout(std::time::Duration::from_secs(8)) {
-                Ok(t) => t,
-                Err(_) => continue,
+                Ok(Some((c, tools))) => {
+                    let shared = Arc::new(Mutex::new(c));
+                    sessions
+                        .lock()
+                        .unwrap()
+                        .insert(r.name.clone(), Arc::clone(&shared));
+                    (Some(shared), tools)
+                }
+                _ => (None, Vec::new()),
             }
         };
+        let Some(session) = session else { continue };
         for t in tools {
             let srv = r.name.clone();
             let tool = t.name.clone();
-            let cmd = command.clone();
-            let argv = args.clone();
+            let session = Arc::clone(&session);
             let spec = okra_tools::ToolSpec {
                 name: format!("mcp__{srv}_{tool}"),
                 namespace: Some("mcp".into()),
@@ -195,7 +237,8 @@ pub fn register_mcp_tools(registry: &mut okra_tools::Registry, cwd: &Path) -> us
                 entry,
                 vec![okra_tools::ResourceAccess::All],
                 move |args: &serde_json::Value| {
-                    let mut c = okra_tools::McpClient::stdio(&srv, &cmd, &argv);
+                    // the shared persistent session: no per-call spawn
+                    let mut c = session.lock().unwrap();
                     match c.tools_call(&tool, args.clone()) {
                         Ok((text, is_error)) => {
                             if is_error {
@@ -674,6 +717,7 @@ pub fn run_turn_streaming(
     unattended: bool,
     attachments: Vec<String>,
     questions: Option<Arc<SurfaceQuestionChannel>>,
+    mcp_sessions: &Mutex<std::collections::BTreeMap<String, Arc<Mutex<okra_tools::McpClient>>>>,
 ) -> Result<TurnOutcome, String> {
     let steering_rx = steering;
     // attachments fold BEFORE anything surfaces: model-visible means
@@ -725,7 +769,7 @@ pub fn run_turn_streaming(
     // N0019: probed MCP tools join the turn (approval-gated: unknown
     // side-effectors); N0020: ask_user joins ATTENDED surfaces only (an
     // unattended bridge would block the turn forever).
-    let _mcp_tools = register_mcp_tools(&mut registry, &cwd);
+    let _mcp_tools = register_mcp_tools(&mut registry, &cwd, mcp_sessions);
     if let Some(bridge) = questions.as_ref() {
         let bridge = Arc::clone(bridge);
         let spec = okra_tools::ToolSpec {
@@ -1985,6 +2029,7 @@ pub fn serve_stdio(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) ->
                             true,
                             Vec::new(),
                             None,
+                            &Mutex::new(std::collections::BTreeMap::new()),
                         ) {
                             outbound.notification(
                                 "v4/error",
