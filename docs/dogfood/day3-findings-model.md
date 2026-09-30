@@ -62,3 +62,30 @@ opencode/1.0` and `x-opencode-session` headers, which okra's
   (same-activity + falling progress across 2+ judgments → nudge) vs the
   current static class gate. Not changed yet — one session is not
   calibration data.
+
+---
+
+## Day 4 (2026-09-30) — real-model consent review + a live bug fixed
+
+Task: "read day3-findings.md once, write day4-consent.md in your own
+words." The model complied exactly (1 read, 1 approved write — governor
+correctly silent: 2 steps < first_step 4). Its summary was accurate, and
+it surfaced a REAL product risk worth tracking:
+
+> grants are bundled and sticky — a single dialog approves a whole batch
+> of apps at once with no per-app choice, and those grants persist all
+> session. A user intending "just Finder" may have waved through the
+> entire set, and declining screen takeover still leaves background app
+> automation running — so "no" on one prompt is not "no" overall.
+
+(This matches Claude Desktop's own dialog property — but the critique is
+the dogfood signal we wanted: the model reads the consent model as a
+user would.)
+
+**Bug found live and fixed during the session:** reloading the page
+during an approval pause LOST the card — the watchdog emitted only on
+change, so a fresh subscriber never learned the pending approval and the
+turn wedged. Fixed: pending approvals/questions now heartbeat (re-emit
+every ~4 ticks while pending); `g4_late_subscriber_recovers_pending_approval`
+pins the flow (subscribe mid-pause → learn the card → resolve → turn
+completes).

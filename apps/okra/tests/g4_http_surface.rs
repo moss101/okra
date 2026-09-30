@@ -2228,3 +2228,89 @@ echo "cliclick $*" >> "$OKRA_AX_LOG"
         std::panic::resume_unwind(panic);
     }
 }
+
+/// Dogfood day-4 finding: a page reload during an approval pause must not
+/// lose the card — pending approvals/questions re-emit periodically so a
+/// subscriber attaching mid-pause learns them and can resolve.
+#[test]
+fn g4_late_subscriber_recovers_pending_approval() {
+    let td = tempfile::tempdir().unwrap();
+    std::fs::write(td.path().join("notes.md"), "# notes\n").unwrap();
+    let (mut daemon, addr) = spawn_daemon_env(td.path(), &[("OKRA_DEMO_DELAY_MS", "1500")]);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // first subscriber starts the turn
+        let f1 = std::sync::Arc::new(mutex_vec());
+        let w1 = std::sync::Arc::clone(&f1);
+        let a = addr.to_string();
+        let t1 = std::thread::spawn(move || {
+            sse_collect(&a, "late-sub", &w1, &|f| {
+                f.iter().any(|f| f["params"]["control"]["phase"] == "completedSuccess")
+            })
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let (status, reply) = http_post_command(&addr, &serde_json::json!({
+            "commandId": "ls-1",
+            "type": "sendText",
+            "sessionId": "late-sub",
+            "payload": { "text": "create late.md" }
+        }));
+        assert_eq!(status, 200, "{reply}");
+        // wait for the approval to appear on the FIRST subscriber
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if Instant::now() > deadline {
+                panic!("approval never surfaced on f1");
+            }
+            if f1.lock().unwrap().iter().any(|f| {
+                f["params"]["control"]["awaitingApproval"].as_array().is_some_and(|a| !a.is_empty())
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        // NOW a second subscriber attaches mid-pause (the "reloaded page").
+        // With the heartbeat it must learn the pending card within ~1s.
+        let f2 = std::sync::Arc::new(mutex_vec());
+        let w2 = std::sync::Arc::clone(&f2);
+        let a2 = addr.to_string();
+        let t2 = std::thread::spawn(move || {
+            sse_collect(&a2, "late-sub", &w2, &|f| {
+                f.iter().any(|f| f["params"]["control"]["awaitingApproval"].as_array().is_some_and(|a| !a.is_empty()))
+            })
+        });
+        let learned = wait_for(&f2, &|f| {
+            f.iter().any(|f| {
+                f["params"]["control"]["awaitingApproval"].as_array().is_some_and(|a| !a.is_empty())
+            })
+        });
+        assert!(learned, "late subscriber never learned the pending card");
+
+        // resolve from the LATE subscriber's view; the turn completes
+        let id = f2.lock().unwrap().iter().rev().find_map(|f| {
+            f["params"]["control"]["awaitingApproval"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|p| p["approvalId"].as_str().map(str::to_string))
+        }).expect("approval id");
+        let (status, reply) = http_post_command(&addr, &serde_json::json!({
+            "commandId": "ls-2",
+            "type": "resolveApproval",
+            "sessionId": "late-sub",
+            "payload": { "approvalId": id, "decision": "allow" }
+        }));
+        assert_eq!(status, 200, "{reply}");
+        let done = wait_for(&f1, &|f| {
+            f.iter().any(|f| f["params"]["control"]["phase"] == "completedSuccess")
+        });
+        assert!(done, "turn never completed after late resolution");
+        assert!(td.path().join("late.md").is_file());
+        let _ = t1.join();
+        let _ = t2.join();
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}

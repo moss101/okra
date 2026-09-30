@@ -1406,7 +1406,15 @@ fn emit_approval_state(
 ) {
     let snapshot = approvals.pending_snapshot();
     if snapshot.len() == *last_len {
-        return; // unchanged — no frame churn
+        // unchanged — but a PENDING ask re-emits periodically so late
+        // subscribers (page reload, a new surface attaching mid-pause)
+        // learn the card exists instead of wedging the turn (dogfood
+        // day-4 finding: change-only emission loses the card on reload)
+        if snapshot.is_empty() {
+            return;
+        }
+        *last_len = snapshot.len().wrapping_sub(1);
+        return;
     }
     // new asks surface the permission-request class (redacted label: the
     // tool name is metadata, the args are never sent to a lock screen)
@@ -1815,10 +1823,12 @@ pub fn run_turn_streaming(
         std::thread::spawn(move || {
             let emit = |m: &str, p: serde_json::Value| q_broadcast(m, p);
             let mut last_asked = false;
+            let mut ticks_since_emit = 0u32;
             while !q_done_inner.load(Ordering::Relaxed) {
                 let snap = qb.pending_snapshot();
                 let is_asked = snap.is_some();
-                if is_asked != last_asked {
+                if is_asked != last_asked || (is_asked && ticks_since_emit >= 4) {
+                    ticks_since_emit = 0;
                     last_asked = is_asked;
                     let mut proj = q_proj.lock().unwrap();
                     if let Some(q) = &snap {
@@ -1847,6 +1857,7 @@ pub fn run_turn_streaming(
                     );
                 }
                 std::thread::sleep(std::time::Duration::from_millis(150));
+                ticks_since_emit += 1;
             }
         });
         q_teardown_flag = Some(q_done);
