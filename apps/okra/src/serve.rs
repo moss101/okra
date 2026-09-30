@@ -153,6 +153,39 @@ pub struct ComputerConsent {
     pub apps: std::collections::BTreeSet<String>,
     /// Screen-takeover consent held for this session.
     pub takeover: bool,
+    /// clipboard grants (separate checkboxes on request_access).
+    pub clipboard_read: bool,
+    pub clipboard_write: bool,
+    /// The session currently DRIVING the computer (session lock): only
+    /// one at a time — Claude Desktop's rule, verbatim error and all.
+    /// Acquired by the first computer tool of a turn, released at turn
+    /// end (see run_turn_streaming finalize).
+    pub driving: Option<String>,
+}
+
+impl ComputerConsent {
+    /// Acquire the driving lock for `session`. Errors with Claude's
+    /// vocabulary when another session holds it.
+    pub fn acquire_driving(&mut self, session: &str) -> Result<(), String> {
+        match &self.driving {
+            Some(h) if h != session => Err(
+                "Another okra session is currently using the computer. Press stop in that \
+                 session or wait for its turn to end before driving the computer from here."
+                    .to_string(),
+            ),
+            _ => {
+                self.driving = Some(session.to_string());
+                Ok(())
+            }
+        }
+    }
+
+    /// Release the lock when `session`'s turn ends (no-op if re-holder).
+    pub fn release_driving(&mut self, session: &str) {
+        if self.driving.as_deref() == Some(session) {
+            self.driving = None;
+        }
+    }
 }
 
 pub type ComputerConsentHandle = Arc<Mutex<ComputerConsent>>;
@@ -180,6 +213,7 @@ fn no_takeover_error() -> String {
 fn register_computer_parity_tools(
     registry: &mut okra_tools::Registry,
     consent: &ComputerConsentHandle,
+    session_id: &str,
 ) {
     use okra_tools::{ErasedTool, ResourceAccess, ToolEntry, ToolMetadata, ToolSpec};
 
@@ -201,6 +235,7 @@ fn register_computer_parity_tools(
     }
 
     // ---- consent tools (the only ones that carry per-call approval cards) ----
+    let session = session_id.to_string();
     let c = Arc::clone(consent);
     mk(
         ToolSpec {
@@ -211,7 +246,9 @@ fn register_computer_parity_tools(
                 "properties": {
                     "apps": { "type": "array", "items": { "type": "string" },
                         "description": "Application names, e.g. [\"Finder\",\"TextEdit\"]" },
-                    "reason": { "type": "string", "description": "One sentence shown to the user in the approval dialog" }
+                    "reason": { "type": "string", "description": "One sentence shown to the user in the approval dialog" },
+                    "clipboardRead": { "type": "boolean", "description": "Also grant clipboard reading" },
+                    "clipboardWrite": { "type": "boolean", "description": "Also grant clipboard writing (fast path for multi-line type)" }
                 },
                 "required": ["apps", "reason"],
             })),
@@ -230,8 +267,17 @@ fn register_computer_parity_tools(
             }
             {
                 let mut g = c.lock().unwrap();
+                if let Err(lock_err) = g.acquire_driving(&session) {
+                    return err(lock_err);
+                }
                 for a in &apps {
                     g.apps.insert(a.clone());
+                }
+                if args["clipboardRead"].as_bool() == Some(true) {
+                    g.clipboard_read = true;
+                }
+                if args["clipboardWrite"].as_bool() == Some(true) {
+                    g.clipboard_write = true;
                 }
             }
             ok_text(format!(
@@ -329,6 +375,7 @@ fn register_computer_parity_tools(
     let mut display = |name: &str, desc: &str, schema: serde_json::Value, f: DisplayFn| {
         let c = Arc::clone(consent);
         let name = name.to_string();
+        let session = session_id.to_string();
         mk(
             ToolSpec {
                 name: name.clone(),
@@ -340,8 +387,14 @@ fn register_computer_parity_tools(
             },
             ToolMetadata { read_only: true, ..Default::default() },
             Box::new(move |args| {
-                if !c.lock().unwrap().takeover {
-                    return err(no_takeover_error());
+                {
+                    let mut g = c.lock().unwrap();
+                    if let Err(lock_err) = g.acquire_driving(&session) {
+                        return err(lock_err);
+                    }
+                    if !g.takeover {
+                        return err(no_takeover_error());
+                    }
                 }
                 match f(args) {
                     Ok(text) => ok_text(text),
@@ -454,9 +507,236 @@ fn register_computer_parity_tools(
         }),
     );
 
+    // ---- clipboard tools (grant checkboxes from request_access) ----
+    let session = session_id.to_string();
+    let cr = Arc::clone(consent);
+    mk(
+        ToolSpec {
+            name: "computer_read_clipboard".into(),
+            description: "Read the system clipboard. Requires the clipboardRead grant on computer_request_access.".into(),
+            arguments_schema: Some(serde_json::json!({ "type": "object", "properties": {} })),
+            read_only: true,
+            kind: Some("computer".into()),
+            ..computer_spec_rest()
+        },
+        ToolMetadata { read_only: true, ..Default::default() },
+        {
+            let session = session.clone();
+            Box::new(move |_| {
+            let mut g = cr.lock().unwrap();
+            if let Err(lock_err) = g.acquire_driving(&session) {
+                return err(lock_err);
+            }
+            if !g.clipboard_read {
+                return err("clipboard reading not granted — request it via computer_request_access {clipboardRead: true}".into());
+            }
+            match okra_computer::backend::read_clipboard() {
+                Ok(t) => ok_text(t),
+                Err(e) => err(e),
+            }
+        })
+        },
+    );
+    let cw = Arc::clone(consent);
+    mk(
+        ToolSpec {
+            name: "computer_write_clipboard".into(),
+            description: "Write text to the system clipboard. Requires the clipboardWrite grant.".into(),
+            arguments_schema: Some(serde_json::json!({
+                "type": "object", "properties": { "text": {"type": "string"} }, "required": ["text"] })),
+            read_only: true,
+            kind: Some("computer".into()),
+            ..computer_spec_rest()
+        },
+        ToolMetadata { read_only: true, ..Default::default() },
+        {
+            let session = session.clone();
+            Box::new(move |args| {
+            let mut g = cw.lock().unwrap();
+            if let Err(lock_err) = g.acquire_driving(&session) {
+                return err(lock_err);
+            }
+            if !g.clipboard_write {
+                return err("clipboard writing not granted — request it via computer_request_access {clipboardWrite: true}".into());
+            }
+            match okra_computer::backend::write_clipboard(args["text"].as_str().unwrap_or_default()) {
+                Ok(()) => ok_text("written".into()),
+                Err(e) => err(e),
+            }
+        })
+        },
+    );
+
+    // ---- computer_batch: display-scope actions, sequential, stop on first error ----
+    let session = session_id.to_string();
+    let cb = Arc::clone(consent);
+    mk(
+        ToolSpec {
+            name: "computer_batch".into(),
+            description: "Run display-scope actions sequentially, stopping at the first error. Each individual tool call requires a model round trip (seconds) — batch instead. Actions refer to the full screenshot taken before the batch.".into(),
+            arguments_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "actions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": { "type": "string", "enum": ["left_click", "double_click", "right_click", "type", "key", "scroll", "mouse_move", "drag", "shot"] },
+                                "x": {"type": "integer"}, "y": {"type": "integer"},
+                                "to_x": {"type": "integer"}, "to_y": {"type": "integer"},
+                                "text": {"type": "string"}, "key": {"type": "string"},
+                                "dy": {"type": "integer"}
+                            },
+                            "required": ["kind"]
+                        }
+                    }
+                },
+                "required": ["actions"],
+            })),
+            read_only: true,
+            kind: Some("computer".into()),
+            ..computer_spec_rest()
+        },
+        ToolMetadata { read_only: true, ..Default::default() },
+        Box::new(move |args| {
+            {
+                let mut g = cb.lock().unwrap();
+                if let Err(lock_err) = g.acquire_driving(&session) {
+                    return err(lock_err);
+                }
+                if !g.takeover {
+                    return err(no_takeover_error());
+                }
+            }
+            let actions = args["actions"].as_array().cloned().unwrap_or_default();
+            let mut out_lines: Vec<String> = Vec::new();
+            for (i, a) in actions.iter().enumerate() {
+                let g = |k: &str| a[k].as_i64().unwrap_or(0);
+                let r: Result<String, String> = match a["kind"].as_str().unwrap_or_default() {
+                    "left_click" => okra_computer::backend::click_point(g("x"), g("y")).map(|_| "clicked".into()),
+                    "double_click" => okra_computer::backend::double_click_point(g("x"), g("y")).map(|_| "double-clicked".into()),
+                    "right_click" => okra_computer::backend::right_click_point(g("x"), g("y")).map(|_| "right-clicked".into()),
+                    "type" => okra_computer::backend::type_text(a["text"].as_str().unwrap_or_default()).map(|_| "typed".into()),
+                    "key" => okra_computer::backend::press_combo(a["key"].as_str().unwrap_or_default()).map(|_| "pressed".into()),
+                    "scroll" => okra_computer::backend::scroll_at(g("x"), g("y"), a["dy"].as_i64().unwrap_or(0) as i32).map(|_| "scrolled".into()),
+                    "mouse_move" => okra_computer::backend::mouse_move(g("x"), g("y")).map(|_| "moved".into()),
+                    "drag" => okra_computer::backend::drag((g("x"), g("y")), (g("to_x"), g("to_y"))).map(|_| "dragged".into()),
+                    "shot" => okra_computer::backend::screenshot()
+                        .map(|p| format!("data:image/png;base64,{}", b64_png(&p))),
+                    other => Err(format!("unknown action kind {other}")),
+                };
+                match r {
+                    Ok(t) => out_lines.push(format!("[{i}] ok: {t}")),
+                    Err(e) => {
+                        out_lines.push(format!("[{i}] ERROR: {e}"));
+                        out_lines.push("batch stopped at first error".into());
+                        break;
+                    }
+                }
+            }
+            ok_text(out_lines.join("\n"))
+        }),
+    );
+
+    // ---- app_batch: app actions on ONE granted app, sequential, stop on first error ----
+    let session = session_id.to_string();
+    let ab = Arc::clone(consent);
+    mk(
+        ToolSpec {
+            name: "computer_app_batch".into(),
+            description: "Run app_* actions on ONE granted application sequentially (observe/click/type/focus/ax_find), stopping at the first error. One observe is shared by the whole batch.".into(),
+            arguments_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "app": { "type": "string" },
+                    "actions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": { "type": "string", "enum": ["click", "type", "focus", "key", "ax_find"] },
+                                "element": {"type": "string"}, "text": {"type": "string"},
+                                "key": {"type": "string"}, "role": {"type": "string"}, "title": {"type": "string"}
+                            },
+                            "required": ["kind"]
+                        }
+                    }
+                },
+                "required": ["app", "actions"],
+            })),
+            read_only: true,
+            kind: Some("computer".into()),
+            ..computer_spec_rest()
+        },
+        ToolMetadata { read_only: true, ..Default::default() },
+        Box::new(move |args| {
+            let app = args["app"].as_str().unwrap_or_default().to_string();
+            {
+                let mut g = ab.lock().unwrap();
+                if let Err(lock_err) = g.acquire_driving(&session) {
+                    return err(lock_err);
+                }
+                if !g.apps.contains(&app) {
+                    return err(no_grant_error(&app));
+                }
+            }
+            let actions = args["actions"].as_array().cloned().unwrap_or_default();
+            let mut out_lines: Vec<String> = Vec::new();
+            for (i, a) in actions.iter().enumerate() {
+                // one observe per action keeps element ids fresh (Claude's
+                // re-observe rule); v1 simplicity over round-trip savings
+                let tree = match okra_computer::backend::observe(&app) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        out_lines.push(format!("[{i}] ERROR observe: {e}"));
+                        out_lines.push("batch stopped at first error".into());
+                        break;
+                    }
+                };
+                let r: Result<String, String> = match a["kind"].as_str().unwrap_or_default() {
+                    "click" => okra_computer::backend::click_element(
+                        &app, &tree, a["element"].as_str().unwrap_or_default(),
+                    )
+                    .map(|_| "clicked".into()),
+                    "type" => okra_computer::backend::app_type_into(
+                        &app, &tree, a["element"].as_str(), a["text"].as_str().unwrap_or_default(),
+                    )
+                    .map(|_| "typed".into()),
+                    "focus" => okra_computer::backend::app_focus(
+                        &app, &tree, a["element"].as_str().unwrap_or_default(),
+                    )
+                    .map(|_| "focused".into()),
+                    "key" => okra_computer::backend::press_combo(a["key"].as_str().unwrap_or_default())
+                        .map(|_| "pressed".into()),
+                    "ax_find" => {
+                        let found = okra_computer::backend::app_ax_find(
+                            &tree, a["role"].as_str(), a["title"].as_str(),
+                        );
+                        Ok(serde_json::to_string(
+                            &found.iter().map(|e| &e.id).collect::<Vec<_>>(),
+                        )
+                        .unwrap_or_default())
+                    }
+                    other => Err(format!("unknown action kind {other}")),
+                };
+                match r {
+                    Ok(t) => out_lines.push(format!("[{i}] ok: {t}")),
+                    Err(e) => {
+                        out_lines.push(format!("[{i}] ERROR: {e}"));
+                        out_lines.push("batch stopped at first error".into());
+                        break;
+                    }
+                }
+            }
+            ok_text(out_lines.join("\n"))
+        }),
+    );
+
     // ---- background app_* family (per-app grant gated, no per-call cards) ----
     let mut app_tool = |name: &str, desc: &str, schema: serde_json::Value, f: AppFn| {
         let c = Arc::clone(consent);
+        let session = session_id.to_string();
         mk(
             ToolSpec {
                 name: name.to_string(),
@@ -472,8 +752,14 @@ fn register_computer_parity_tools(
                 if app.is_empty() {
                     return err("app required".into());
                 }
-                if !c.lock().unwrap().apps.contains(&app) {
-                    return err(no_grant_error(&app));
+                {
+                    let mut g = c.lock().unwrap();
+                    if let Err(lock_err) = g.acquire_driving(&session) {
+                        return err(lock_err);
+                    }
+                    if !g.apps.contains(&app) {
+                        return err(no_grant_error(&app));
+                    }
                 }
                 match f(&app, args) {
                     Ok(t) => ok_text(t),
@@ -625,7 +911,7 @@ pub fn register_mcp_tools(
                 let tools = shared.lock().unwrap().tools_list().unwrap_or_default();
                 let _ = tx.send(tools);
             });
-            match rx.recv_timeout(std::time::Duration::from_secs(8)) {
+            match rx.recv_timeout(std::time::Duration::from_secs(20)) {
                 Ok(tools) if !tools.is_empty() => (cached.clone(), tools),
                 _ => {
                     // dead session: drop and respawn below
@@ -657,7 +943,7 @@ pub fn register_mcp_tools(
                 };
                 let _ = tx.send(outcome);
             });
-            match rx.recv_timeout(std::time::Duration::from_secs(8)) {
+            match rx.recv_timeout(std::time::Duration::from_secs(20)) {
                 Ok(Some((c, tools))) => {
                     let shared = Arc::new(Mutex::new(c));
                     sessions
@@ -1259,7 +1545,7 @@ pub fn run_turn_streaming(
     }
     // N0025: the Claude Desktop parity families (consent + display-scope
     // + app_*), sharing the daemon-level consent ledger
-    register_computer_parity_tools(&mut registry, computer_consent);
+    register_computer_parity_tools(&mut registry, computer_consent, &session_id);
 
     // N0023: computer control tools (Claude Desktop parity, AX-first).
     // The approval card IS the split consent: computer_act's card grants
@@ -1649,6 +1935,11 @@ pub fn run_turn_streaming(
     wd_done.store(true, Ordering::Relaxed);
     let _ = wd_handle.join();
     fwd_done.store(true, Ordering::Relaxed);
+    // session lock: this session's turn is over — the computer is free
+    computer_consent
+        .lock()
+        .unwrap()
+        .release_driving(&session_id);
     if let Some(f) = q_teardown_flag.take() {
         f.store(true, Ordering::Relaxed);
     }
@@ -2469,7 +2760,7 @@ pub fn mcp_probe(
                     "toolCount": tools.len(),
                 }));
             });
-            match rx.recv_timeout(std::time::Duration::from_secs(8)) {
+            match rx.recv_timeout(std::time::Duration::from_secs(20)) {
                 Ok(mut result) => {
                     result["name"] = serde_json::json!(r.name);
                     result["enabled"] = serde_json::json!(r.enabled);

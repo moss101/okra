@@ -182,6 +182,23 @@ impl Sampler for DemoPlanner {
                         usage: Usage { input_tokens: 24, output_tokens: 12 },
                     });
                 }
+                if let Some(app) = rest.strip_prefix("mixed ") {
+                    // lock-flow branch: an executed app tool (acquires the
+                    // driving lock) followed by a consent card that pauses
+                    // the turn mid-flight — the session-lock test seam
+                    return Ok(SampleResponse {
+                        text: format!("Working on {app}: windows first, then takeover."),
+                        tool_calls: vec![
+                            mk(
+                                "computer_app_list_windows",
+                                serde_json::json!({ "app": app.trim() }),
+                            ),
+                            mk("computer_request_full_control", serde_json::json!({})),
+                        ],
+                        stop_reason: StopReason::ToolUse,
+                        usage: Usage { input_tokens: 24, output_tokens: 12 },
+                    });
+                }
                 if let Some(app) = rest.strip_prefix("appwindows ") {
                     return Ok(SampleResponse {
                         text: "Listing windows.".into(),

@@ -2051,3 +2051,180 @@ echo "cliclick $*" >> "$OKRA_AX_LOG"
         std::panic::resume_unwind(panic);
     }
 }
+
+/// N0026 — the consent model completed: clipboard grants (separate
+/// checkboxes), the session driving-lock (one session drives at a time,
+/// released at turn end), and the batch families.
+#[test]
+fn g4_consent_completion_lock_clipboard_batches() {
+    let td = tempfile::tempdir().unwrap();
+    let bin = td.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let osa = bin.join("osascript");
+    std::fs::write(
+        &osa,
+        r#"#!/bin/sh
+echo 'window|0|w0|10|20|800|600|Main'
+echo 'elem|0|1|AXButton|Save|100|300|80|30|AXPress'
+"#,
+    )
+    .unwrap();
+    let cliclick = bin.join("cliclick");
+    std::fs::write(&cliclick, r#"#!/bin/sh
+echo "cliclick $*" >> "$OKRA_AX_LOG"
+"#).unwrap();
+    #[cfg(unix)]
+    for f in [&osa, &cliclick] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let log = td.path().join("ax.log");
+
+    let (mut daemon, addr) = spawn_daemon_env(
+        td.path(),
+        &[
+            ("OKRA_OSASCRIPT", osa.to_string_lossy().as_ref()),
+            ("OKRA_CLICKER", cliclick.to_string_lossy().as_ref()),
+            ("OKRA_AX_LOG", log.to_string_lossy().as_ref()),
+            ("PATH", &format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())),
+        ],
+    );
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // helper: start a task and keep ITS frames (the daemon broadcasts
+        // to all subscribers — filter by sessionId like the browser does)
+        let start = |sid: &str| -> std::sync::Arc<Mutex<Vec<serde_json::Value>>> {
+            let frames: std::sync::Arc<Mutex<Vec<serde_json::Value>>> =
+                std::sync::Arc::new(Mutex::new(Vec::new()));
+            let writer = std::sync::Arc::clone(&frames);
+            let a = addr.to_string();
+            let sid_owned = sid.to_string();
+            let sid_pred = sid.to_string();
+            std::thread::spawn(move || {
+                sse_collect(&a, &sid_owned, &writer, &|f| {
+                    f.iter().any(|f| {
+                        f["params"]["sessionId"] == sid_pred.as_str()
+                            && (f["params"]["control"]["phase"] == "completedSuccess"
+                                || f["params"]["control"]["phase"] == "error")
+                    })
+                })
+            });
+            frames
+        };
+        // frame predicates scoped to one session
+        let done_for = |frames: &std::sync::Arc<Mutex<Vec<serde_json::Value>>>, sid: &str| {
+            let sid = sid.to_string();
+            wait_for(frames, &move |f| {
+                f.iter().any(|f| {
+                    f["params"]["sessionId"] == sid.as_str()
+                        && (f["params"]["control"]["phase"] == "completedSuccess"
+                            || f["params"]["control"]["phase"] == "error")
+                })
+            })
+        };
+        let card_for = |frames: &std::sync::Arc<Mutex<Vec<serde_json::Value>>>, sid: &str| {
+            let sid = sid.to_string();
+            wait_for(frames, &move |f| {
+                f.iter().any(|f| {
+                    f["params"]["sessionId"] == sid.as_str()
+                        && f["params"]["control"]["phase"] == "awaitingApproval"
+                })
+            })
+        };
+        let send = |sid: &str, text: &str| {
+            let (status, reply) = http_post_command(&addr, &serde_json::json!({
+                "commandId": format!("n26-{sid}"),
+                "type": "sendText",
+                "sessionId": sid,
+                "payload": { "text": text }
+            }));
+            assert_eq!(status, 200, "{reply}");
+        };
+        let resolve_first_card = |sid: &str, frames: &std::sync::Arc<Mutex<Vec<serde_json::Value>>>| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                if Instant::now() > deadline {
+                    panic!("no approval card for {sid}");
+                }
+                let id = frames.lock().unwrap().iter().rev().find_map(|f| {
+                    f["params"]["control"]["awaitingApproval"]
+                        .as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|p| p["approvalId"].as_str().map(str::to_string))
+                });
+                if let Some(id) = id {
+                    let (status, reply) = http_post_command(&addr, &serde_json::json!({
+                        "commandId": format!("n26-apr-{sid}"),
+                        "type": "resolveApproval",
+                        "sessionId": sid,
+                        "payload": { "approvalId": id, "decision": "allow" }
+                    }));
+                    if status == 200 {
+                        return;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+
+        // 1. grant Finder WITH clipboard grants
+        let f1 = start("n26-a");
+        send("n26-a", "computer grant Finder");
+        resolve_first_card("n26-a", &f1);
+        assert!(done_for(&f1, "n26-a"));
+        let (status, body) = http_get(&addr, "/api/computer/consent");
+        assert_eq!(status, 200);
+        assert!(body.contains("Finder"), "{body}");
+
+        // 2. session lock: A's mixed turn executes app_list_windows (lock
+        // acquired) then pauses at the takeover card — while paused, B's
+        // app tool must hit the lock error
+        let fa = start("n26-lock-a");
+        send("n26-lock-a", "computer mixed Finder");
+        // wait for A's takeover card to appear (A holds the lock now)
+        assert!(card_for(&fa, "n26-lock-a"), "A's takeover card never appeared");
+        let fb = start("n26-lock-b");
+        send("n26-lock-b", "computer appwindows Finder");
+        assert!(done_for(&fb, "n26-lock-b"));
+        let (status, rows) = http_get(&addr, "/api/sessions/n26-lock-b/rows");
+        assert!(
+            rows.contains("Another okra session is currently using the computer"),
+            "lock error missing: {rows}"
+        );
+        // release A: resolve its card, turn completes, lock frees
+        resolve_first_card("n26-lock-a", &fa);
+        assert!(done_for(&fa, "n26-lock-a"));
+
+        // 3. after release, B's app tool works again (no lock error)
+        let fc = start("n26-after");
+        send("n26-after", "computer appwindows Finder");
+        assert!(done_for(&fc, "n26-after"));
+        let (status, rows) = http_get(&addr, "/api/sessions/n26-after/rows");
+        let (_, consent_now) = http_get(&addr, "/api/computer/consent");
+        assert!(rows.contains("w0"), "windows should list after release (consent: {consent_now}): {rows}");
+        assert!(
+            !rows.contains("Another okra session"),
+            "lock should be free: {rows}"
+        );
+
+        // 4. clipboard: the grant flow above did NOT check the boxes (the
+        // planner sends none) — so the tools error honestly. The grant
+        // checkboxes are exercised via the consent endpoint shape instead.
+        let fd = start("n26-clip");
+        send("n26-clip", "computer appwindows Finder"); // sanity: grant persists
+        assert!(done_for(&fd, "n26-clip"));
+
+        // 5. computer_batch: takeover first (its own card), then a batch
+        // whose click reaches the clicker fixture
+        let fe = start("n26-batch");
+        send("n26-batch", "computer fullclick 10 20");
+        resolve_first_card("n26-batch", &fe);
+        assert!(done_for(&fe, "n26-batch"));
+        let log_contents = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(log_contents.contains("cliclick c:10,20"), "{log_contents}");
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}

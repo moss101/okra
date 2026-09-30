@@ -696,6 +696,7 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
         let body = serde_json::json!({
             "granted": c.apps.iter().collect::<Vec<_>>(),
             "fullControl": c.takeover,
+            "driving": c.driving,
         });
         return write_http(
             stream,
