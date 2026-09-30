@@ -82,6 +82,10 @@ struct AcpSession {
     /// client provides a real directory (ACP: all paths absolute), else the
     /// daemon cwd.
     session_cwd: std::path::PathBuf,
+    /// n0028: the continuation context — consecutive prompts on one ACP
+    /// session chain (compaction + world state + skills), like the daemon's
+    /// per-session contexts.
+    context: Arc<Mutex<okra_compaction::SessionContext>>,
 }
 
 /// `okra serve --acp`: JSON-RPC/ACP loop over stdin/stdout.
@@ -160,15 +164,19 @@ pub fn serve_acp(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) -> !
                 }
                 state.sessions.lock().unwrap().insert(
                     session_id.clone(),
-                    AcpSession { kernel_id, session_cwd },
+                    AcpSession {
+                        kernel_id,
+                        session_cwd,
+                        context: Arc::new(Mutex::new(okra_compaction::SessionContext::default())),
+                    },
                 );
                 outbound.result(&id, serde_json::json!({ "sessionId": session_id }));
             }
             "session/prompt" => {
                 let session_id = params["sessionId"].as_str().unwrap_or_default().to_string();
                 let session = state.sessions.lock().unwrap().get(&session_id)
-                    .map(|s| (s.kernel_id.clone(), s.session_cwd.clone()));
-                let Some((kernel_id, session_cwd)) = session else {
+                    .map(|s| (s.kernel_id.clone(), s.session_cwd.clone(), Arc::clone(&s.context)));
+                let Some((kernel_id, session_cwd, session_ctx)) = session else {
                     outbound.error(&id, -32002, &format!("unknown session: {session_id}"));
                     continue;
                 };
@@ -209,6 +217,7 @@ pub fn serve_acp(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) -> !
                 let sessions_dir_t = sessions_dir.clone();
                 let kernel_id_t = kernel_id.clone();
                 let text_t = text.clone();
+                let ctx_t = Arc::clone(&session_ctx);
                 std::thread::spawn(move || {
                     let (oc_n, sid_n) = (Arc::clone(&oc), sid.clone());
                     let mut notify = move |update: serde_json::Value| {
@@ -221,6 +230,7 @@ pub fn serve_acp(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) -> !
                         &session_cwd_t,
                         &sessions_dir_t,
                         &kernel_id_t,
+                        &ctx_t,
                         &text_t,
                         &stop_flag,
                         &mut notify,
@@ -283,6 +293,7 @@ fn acp_turn(
     cwd: &std::path::Path,
     sessions_dir: &std::path::Path,
     kernel_id: &str,
+    context: &Arc<Mutex<okra_compaction::SessionContext>>,
     input_text: &str,
     stop: &Arc<std::sync::atomic::AtomicBool>,
     notify: &mut dyn FnMut(serde_json::Value),
@@ -331,7 +342,21 @@ fn acp_turn(
     let mut agent = Agent::new(config, Arc::new(sampler), Box::new(executor), kernel_session);
     agent.set_stop_flag(Arc::clone(stop));
 
-    let outcome = agent.run_turn(input_text, &mut |ev: LoopEvent| {
+    let outcome = {
+        // n0028: ACP turns chain through the session context (memory +
+        // skills + world head), like every other surface
+        let home = okra_host::fsutil::home_dir().unwrap_or_else(|| cwd.to_path_buf());
+        let memory_reader = okra_memory::TieredReader::new(home, cwd.to_path_buf());
+        let skill_catalog =
+            okra_memory::SkillCatalog::load_dir(&cwd.join(".okra").join("skills"));
+        let mut ctx = context.lock().unwrap();
+        agent.run_turn_continuation(
+            &mut ctx,
+            &okra_compaction::ScriptedCompactor,
+            Some(&memory_reader),
+            Some(&skill_catalog),
+            input_text,
+            &mut |ev: LoopEvent| {
         match ev {
             LoopEvent::TextDelta { text } => notify(serde_json::json!({
                 "sessionUpdate": "agent_message_chunk",
@@ -359,7 +384,9 @@ fn acp_turn(
             }
             _ => {}
         }
-    });
+            },
+        )
+    };
 
     Ok(match outcome {
         Ok(TurnOutcome::Completed { .. }) | Ok(TurnOutcome::StationarityEnded) => "end_turn".to_string(),

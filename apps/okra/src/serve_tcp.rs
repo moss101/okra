@@ -82,6 +82,12 @@ pub struct TcpServeState {
     pub mcp_sessions: Mutex<BTreeMap<String, Arc<Mutex<okra_tools::McpClient>>>>,
     /// Computer-use consent (N0025): per-app grants + screen takeover.
     pub computer_consent: crate::serve::ComputerConsentHandle,
+    /// Per-session continuation contexts (n0028): turn N+1 seeds from turn
+    /// N (compaction + world state + skill activation). Daemon-lifetime
+    /// state like `mcp_sessions`; the kernel log stays the durable truth
+    /// (UI replay) and a restarted daemon starts a fresh context.
+    pub contexts:
+        Mutex<std::collections::BTreeMap<String, Arc<Mutex<okra_compaction::SessionContext>>>>,
     /// Per-turn sampler source (`--provider openai` → real network model;
     /// default → offline demo planner).
     pub sampler_factory: SamplerFactory,
@@ -134,6 +140,7 @@ impl TcpServeState {
             mcp_status: Mutex::new(BTreeMap::new()),
             mcp_sessions: Mutex::new(BTreeMap::new()),
             computer_consent: Arc::new(Mutex::new(crate::serve::ComputerConsent::default())),
+            contexts: Mutex::new(BTreeMap::new()),
             sampler_factory,
             sampler_label,
             next_static: std::sync::atomic::AtomicU64::new(0),
@@ -1388,6 +1395,14 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
         .lock()
         .unwrap()
         .insert(session_id.clone(), Arc::clone(&qbridge));
+    // n0028: the per-session continuation context (created on first send;
+    // later sends chain through the same one)
+    let session_ctx = {
+        let mut contexts = state.contexts.lock().unwrap();
+        Arc::clone(contexts.entry(session_id.clone()).or_insert_with(|| {
+            Arc::new(Mutex::new(okra_compaction::SessionContext::default()))
+        }))
+    };
     // spawn the turn: projections broadcast to ALL surfaces (NDJSON + SSE)
     let state2 = Arc::clone(state);
     let turn_session = session_id.clone();
@@ -1420,6 +1435,7 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
                 Some(Arc::clone(&qbridge)),
                 &state2.mcp_sessions,
                 &state2.computer_consent,
+                Some(Arc::clone(&session_ctx)),
             );
             let queued: Vec<crate::serve::SteeredInput> = {
                 let mut q = steer_queue.lock().unwrap(); q.drain(..).collect()

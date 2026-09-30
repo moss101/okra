@@ -30,14 +30,19 @@ M1  agent + CLI parity          ✔ multi-file coding tasks via `--task`
                                   OpenAI-compatible provider (`--provider
                                   openai`); kernel sandbox via nono
                                   (`--sandbox`, Seatbelt/Landlock)
-M2  context / memory / skills   ◐ #28 microcompaction, #29 hydration,
+M2  context / memory / skills   ✔ #28 microcompaction, #29 hydration,
                                   #33 memory recall, compaction (prefire
                                   two-pass + validated install + byte-stable
                                   head), #45 hooks (20 events, deny>ask>
                                   allow), #47 MCP client + use_tool funnel
                                   — benchmark green in BOTH compaction
                                   profiles (layered + summary-only);
-                                  remaining: skills, agent-quality bench
+                                  skills + memory wired into EVERY live
+                                  surface (n0028: daemon/stdio/CLI/ACP
+                                  turns are continuations — world head
+                                  seeded pre-install, path-conditional
+                                  skill activation live, turns chain);
+                                  agent-quality bench (#65) green 5/5
 M3  host services + alpha       ◐ strangler: SQLite session/task index
                                   (`okra sessions`), terminal/PTY domain
                                   (real PTY, TTY-verified), git domain

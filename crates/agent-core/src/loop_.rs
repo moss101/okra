@@ -545,7 +545,23 @@ impl<S: Sampler + ?Sized> Agent<S> {
                 }
             }
         }
-        let seed = context.messages().to_vec();
+        // Pre-first-install turns carry no materialized head in `messages()`
+        // (`install()` is what folds `prefix_head` into a System message),
+        // so seed it synthetically: EVERY turn sees the world state + skill
+        // index + memory recall, not just post-compaction ones. The
+        // synthetic copy is never folded back — `new_messages` starts past
+        // it, and the installed head (identical bytes) takes over at
+        // install time, keeping the prefix byte-stable across the seam.
+        let mut seed = context.messages().to_vec();
+        if !seed.first().is_some_and(|m| m.role == okra_providers::Role::System) {
+            let head = String::from_utf8_lossy(context.prefix_head()).into_owned();
+            if !head.trim().is_empty() {
+                seed.insert(
+                    0,
+                    okra_providers::Message::text(okra_providers::Role::System, head),
+                );
+            }
+        }
         let seed_len = seed.len();
         let events_before_compactions = context.events().len();
         let (outcome, history) = self.run_turn_core(seed, input, events)?;
@@ -735,8 +751,17 @@ impl<S: Sampler + ?Sized> Agent<S> {
             while let Some(delta) = ts.next_delta() {
                 Self::emit(&mut out, LoopEvent::TextDelta { text: delta });
             }
-            if !response.text.is_empty() {
-                let mut assistant = Message::assistant_text(response.text.clone());
+            // a response may be text, tool calls, or BOTH — a pure
+            // tool-call response still needs its assistant message in
+            // history, or the results orphan and pair_tool_calls drops
+            // them on the next sample (found by continuation_head: noting
+            // paths saw no calls when the scripted step carried no text)
+            if !response.text.is_empty() || !response.tool_calls.is_empty() {
+                let mut assistant = if response.text.is_empty() {
+                    Message { role: okra_providers::Role::Assistant, content: Vec::new() }
+                } else {
+                    Message::assistant_text(response.text.clone())
+                };
                 for call in &response.tool_calls {
                     assistant
                         .content

@@ -1523,6 +1523,7 @@ pub fn run_turn_streaming(
     questions: Option<Arc<SurfaceQuestionChannel>>,
     mcp_sessions: &Mutex<std::collections::BTreeMap<String, Arc<Mutex<okra_tools::McpClient>>>>,
     computer_consent: &ComputerConsentHandle,
+    session_context: Option<Arc<Mutex<okra_compaction::SessionContext>>>,
 ) -> Result<TurnOutcome, String> {
     let steering_rx = steering;
     // attachments fold BEFORE anything surfaces: model-visible means
@@ -1914,8 +1915,22 @@ pub fn run_turn_streaming(
         q_teardown_flag = Some(q_done);
     }
 
-    let outcome = agent.run_turn(&input_text, &mut |ev: LoopEvent| {
-        let mut p = row_lock.lock().unwrap();
+    let outcome = {
+        // M2 wiring (n0028): daemon turns are CONTINUATIONS — the
+        // per-session SessionContext chains turns (compaction, world
+        // state), tiered memory recall folds into the head, and the
+        // project skill catalog activates path-conditionally with
+        // progressive disclosure. Both load per turn (fail-open: absent
+        // dirs are empty), so Tools-tab installs take effect on the next
+        // send without daemon state.
+        let memory_reader = okra_memory::TieredReader::new(
+            okra_host::fsutil::home_dir().unwrap_or_else(|| cwd.clone()),
+            cwd.clone(),
+        );
+        let skill_catalog =
+            okra_memory::SkillCatalog::load_dir(&cwd.join(".okra").join("skills"));
+        let mut handle_ev = |ev: LoopEvent| {
+            let mut p = row_lock.lock().unwrap();
         match ev {
             LoopEvent::TextDelta { text } => {
                 let mut slot = assistant_slot.lock().unwrap();
@@ -1988,11 +2003,26 @@ pub fn run_turn_streaming(
             }
             _ => {}
         }
-        (broadcast)(
-            "v4/projection",
-            projection_notification(&topic_for_events, &p)["params"].clone(),
-        );
-    });
+            (broadcast)(
+                "v4/projection",
+                projection_notification(&topic_for_events, &p)["params"].clone(),
+            );
+        };
+        match session_context {
+            Some(ctx_lock) => {
+                let mut ctx = ctx_lock.lock().unwrap();
+                agent.run_turn_continuation(
+                    &mut ctx,
+                    &okra_compaction::ScriptedCompactor,
+                    Some(&memory_reader),
+                    Some(&skill_catalog),
+                    &input_text,
+                    &mut handle_ev,
+                )
+            }
+            None => agent.run_turn(&input_text, &mut handle_ev),
+        }
+    };
 
     wd_done.store(true, Ordering::Relaxed);
     let _ = wd_handle.join();
@@ -2194,6 +2224,13 @@ pub fn rows_from_kernel_events(
                 rows.push(row);
             }
             "assistant/message" => {
+                // pure tool-call responses log an assistant/message with
+                // empty text (n0028 fix); live turns render no assistant
+                // row for those — replay must match
+                let text = data["text"].as_str().unwrap_or_default();
+                if text.is_empty() {
+                    continue;
+                }
                 let row_id = next_row_id;
                 next_row_id += 1;
                 rows.push(serde_json::json!({
@@ -2202,7 +2239,7 @@ pub fn rows_from_kernel_events(
                     "createdAt": ev.time,
                     "createdAtSeq": ev.seq,
                     "kind": "assistantText",
-                    "text": data["text"].as_str().unwrap_or_default(),
+                    "text": text,
                     "state": "complete",
                 }));
             }
@@ -2953,6 +2990,9 @@ pub fn serve_stdio(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) ->
     });
     let sessions: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<SessionProjection>>>>> =
         Arc::new(Mutex::new(std::collections::HashMap::new()));
+    // n0028: per-session continuation contexts (chained turns over stdio)
+    let contexts: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<okra_compaction::SessionContext>>>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
@@ -3074,6 +3114,12 @@ pub fn serve_stdio(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) ->
                         let factory = demo_sampler_factory(cwd.clone());
                         let stop = Arc::new(AtomicBool::new(false));
                         let bridge = Arc::new(SurfaceApprovalChannel::new(Arc::clone(&stop)));
+                        let session_ctx = {
+                            let mut guard = contexts.lock().unwrap();
+                            Arc::clone(guard.entry(session_id.clone()).or_insert_with(|| {
+                                Arc::new(Mutex::new(okra_compaction::SessionContext::default()))
+                            }))
+                        };
                         if let Err(e) = run_turn_streaming(
                             broadcast,
                             topic,
@@ -3091,6 +3137,7 @@ pub fn serve_stdio(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) ->
                             None,
                             &Mutex::new(std::collections::BTreeMap::new()),
                             &Arc::new(Mutex::new(ComputerConsent::default())),
+                            Some(session_ctx),
                         ) {
                             outbound.notification(
                                 "v4/error",

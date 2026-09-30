@@ -989,7 +989,24 @@ fn main() {
         }
     };
 
-    let result = agent.run_turn(&args.prompt, &mut |ev| write_event(&ev, &mut sink, args.json));
+    // n0028: CLI turns are continuations too — tiered memory recall, the
+    // project skill catalog (path-conditional activation + progressive
+    // disclosure), and the world-state head reach the model on every CLI
+    // turn, not only in the benchmark harness. Fail-open: absent dirs are
+    // simply empty.
+    let home = okra_host::fsutil::home_dir().unwrap_or_else(|| args.cwd.clone());
+    let memory_reader = okra_memory::TieredReader::new(home, args.cwd.clone());
+    let skill_catalog =
+        okra_memory::SkillCatalog::load_dir(&args.cwd.join(".okra").join("skills"));
+    let mut continuation_ctx = okra_compaction::SessionContext::default();
+    let result = agent.run_turn_continuation(
+        &mut continuation_ctx,
+        &okra_compaction::ScriptedCompactor,
+        Some(&memory_reader),
+        Some(&skill_catalog),
+        &args.prompt,
+        &mut |ev| write_event(&ev, &mut sink, args.json),
+    );
     let _ = sink.flush();
 
     // M3 strangler: fold the session into the SQLite task/session index

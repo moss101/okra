@@ -301,6 +301,11 @@ impl SessionContext {
             name,
             format!("ACTIVE — {body_digest}"),
         );
+        // the activation is head-rendered — refresh or it stays invisible
+        // until an unrelated refresh trigger fires (found by
+        // continuation_head: the bench masked this via per-turn memory
+        // recall refreshes)
+        self.refresh_world_head();
     }
 
     /// Set the disclosure-layer-1 skill index text (head fold).
@@ -333,6 +338,7 @@ impl SessionContext {
                 path,
                 "touched (state refreshed at compaction)",
             );
+            self.refresh_world_head();
         }
     }
 
