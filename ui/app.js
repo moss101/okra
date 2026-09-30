@@ -1178,8 +1178,11 @@ function renderApprovalCard(r) {
   const glyph = el('span', 'approval-glyph');
   glyph.innerHTML = '<svg viewBox="0 0 16 16" width="13" height="13"><path d="M8 5.5v3.4M8 11.2v.4M8 2.2 14.5 13H1.5L8 2.2Z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
   head.appendChild(glyph);
-  head.appendChild(el('span', 'approval-title',
-    'okra wants to use ' + (r.toolName || 'a tool')));
+  // per-app grant cards read as consent dialogs (N0027)
+  const title = r.toolName === 'computer_app_grant'
+    ? ('Approve control of ' + (prettyArgs(r.args || r.argsJson || '').split('\n')[0].replace('app: ', '') || 'this app'))
+    : ('okra wants to use ' + (r.toolName || 'a tool'));
+  head.appendChild(el('span', 'approval-title', title));
   card.appendChild(head);
 
   // the approved bytes, inline (the proposed action)

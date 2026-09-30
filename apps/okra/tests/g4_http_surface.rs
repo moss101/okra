@@ -2314,3 +2314,123 @@ fn g4_late_subscriber_recovers_pending_approval() {
         std::panic::resume_unwind(panic);
     }
 }
+
+/// N0027 — per-app consent choice: a multi-app request_access raises ONE
+/// CARD PER APP; denying one grants only the others (the day-4 dogfood
+/// critique of the bundled whole-set dialog, fixed — this EXCEEDS the
+/// Claude reference).
+#[test]
+fn g4_per_app_consent_partial_grant() {
+    let td = tempfile::tempdir().unwrap();
+    let bin = td.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let osa = bin.join("osascript");
+    std::fs::write(
+        &osa,
+        r#"#!/bin/sh
+echo 'window|0|w0|10|20|800|600|Main'
+echo 'elem|0|1|AXButton|Save|100|300|80|30|AXPress'
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&osa, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let (mut daemon, addr) = spawn_daemon_env(
+        td.path(),
+        &[
+            ("OKRA_OSASCRIPT", osa.to_string_lossy().as_ref()),
+            ("PATH", &format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())),
+        ],
+    );
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let frames = std::sync::Arc::new(mutex_vec());
+        let writer = std::sync::Arc::clone(&frames);
+        let a = addr.to_string();
+        let t = std::thread::spawn(move || {
+            sse_collect(&a, "per-app", &writer, &|f| {
+                f.iter().any(|f| {
+                    f["params"]["sessionId"] == "per-app"
+                        && f["params"]["control"]["phase"] == "completedSuccess"
+                })
+            })
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let (status, reply) = http_post_command(&addr, &serde_json::json!({
+            "commandId": "pa-1",
+            "type": "sendText",
+            "sessionId": "per-app",
+            "payload": { "text": "computer grant Finder TextEdit" }
+        }));
+        assert_eq!(status, 200, "{reply}");
+
+        // BOTH per-app cards surface (registered together)
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if Instant::now() > deadline {
+                panic!("per-app cards never surfaced; frames: {frames:?}");
+            }
+            let pendings: Vec<(String, String)> = frames
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find_map(|f| {
+                    let arr = f["params"]["control"]["awaitingApproval"].as_array()?;
+                    Some(
+                        arr.iter()
+                            .filter_map(|p| {
+                                Some((
+                                    p["approvalId"].as_str()?.to_string(),
+                                    p["args"].as_str()?.to_string(),
+                                ))
+                            })
+                            .collect(),
+                    )
+                })
+                .unwrap_or_default();
+            let ids: Vec<&str> = pendings.iter().map(|(i, _)| i.as_str()).collect();
+            if ids.contains(&"apr-app-Finder") && ids.contains(&"apr-app-TextEdit") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        // deny Finder, allow TextEdit — per-app choice
+        for (id, decision) in [("apr-app-Finder", "deny"), ("apr-app-TextEdit", "allow")] {
+            let (status, reply) = http_post_command(&addr, &serde_json::json!({
+                "commandId": format!("pa-{id}"),
+                "type": "resolveApproval",
+                "sessionId": "per-app",
+                "payload": { "approvalId": id, "decision": decision }
+            }));
+            assert_eq!(status, 200, "{reply}");
+        }
+
+        let done = wait_for(&frames, &|f| {
+            f.iter().any(|f| {
+                f["params"]["sessionId"] == "per-app"
+                    && f["params"]["control"]["phase"] == "completedSuccess"
+            })
+        });
+        assert!(done, "turn never completed");
+        let _ = t.join();
+
+        // the tool result reports the split
+        let (status, rows) = http_get(&addr, "/api/sessions/per-app/rows");
+        assert!(rows.contains("granted: [TextEdit]"), "{rows}");
+        assert!(rows.contains("denied: [Finder]"), "{rows}");
+
+        // the consent ledger holds ONLY the allowed app
+        let (status, body) = http_get(&addr, "/api/computer/consent");
+        assert!(body.contains("TextEdit"), "{body}");
+        assert!(!body.contains("Finder"), "denied app must not be granted: {body}");
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}

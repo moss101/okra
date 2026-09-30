@@ -214,6 +214,7 @@ fn register_computer_parity_tools(
     registry: &mut okra_tools::Registry,
     consent: &ComputerConsentHandle,
     session_id: &str,
+    bridge: &Arc<SurfaceApprovalChannel>,
 ) {
     use okra_tools::{ErasedTool, ResourceAccess, ToolEntry, ToolMetadata, ToolSpec};
 
@@ -237,10 +238,11 @@ fn register_computer_parity_tools(
     // ---- consent tools (the only ones that carry per-call approval cards) ----
     let session = session_id.to_string();
     let c = Arc::clone(consent);
+    let ra_bridge = Arc::clone(bridge);
     mk(
         ToolSpec {
             name: "computer_request_access".into(),
-            description: "Request per-application automation capability for this session. ONE approval dialog lists the whole app set; granted apps stay granted until released. Required before any app_* tool. Explain the task, not the mechanism, in the reason.".into(),
+            description: "Request per-application automation capability for this session. Each requested application gets its OWN approval card — the user decides per app; only allowed apps are granted. Grants persist until released. Required before any app_* tool. Explain the task, not the mechanism, in the reason.".into(),
             arguments_schema: Some(serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -255,7 +257,10 @@ fn register_computer_parity_tools(
             kind: Some("computer".into()),
             ..computer_spec_rest()
         },
-        ToolMetadata::default(), // read_only=false → the approval card IS the dialog
+        // read_only=true: the executor-level card is skipped — the tool
+        // raises ONE CARD PER APP itself (per-app choice: the day-4 dogfood
+        // critique of the bundled whole-set dialog)
+        ToolMetadata { read_only: true, ..Default::default() },
         Box::new(move |args| {
             let reason = args["reason"].as_str().unwrap_or_default().to_string();
             let apps: Vec<String> = args["apps"]
@@ -270,19 +275,46 @@ fn register_computer_parity_tools(
                 if let Err(lock_err) = g.acquire_driving(&session) {
                     return err(lock_err);
                 }
-                for a in &apps {
+            }
+            // register ALL cards first: the user sees the whole request at
+            // once and decides per app (allow/deny each)
+            let card_args = |app: &str| {
+                serde_json::json!({ "app": app, "reason": reason }).to_string()
+            };
+            for app in &apps {
+                ra_bridge.register(
+                    &format!("apr-app-{app}"),
+                    "computer_app_grant",
+                    &format!("grant-{app}"),
+                    &card_args(app),
+                );
+            }
+            let mut granted: Vec<String> = Vec::new();
+            let mut denied: Vec<String> = Vec::new();
+            for app in &apps {
+                let outcome = ra_bridge.wait_for(&format!("apr-app-{app}"));
+                if outcome.grants() {
+                    granted.push(app.clone());
+                } else {
+                    denied.push(app.clone());
+                }
+            }
+            {
+                let mut g = c.lock().unwrap();
+                for a in &granted {
                     g.apps.insert(a.clone());
                 }
-                if args["clipboardRead"].as_bool() == Some(true) {
+                if args["clipboardRead"].as_bool() == Some(true) && !granted.is_empty() {
                     g.clipboard_read = true;
                 }
-                if args["clipboardWrite"].as_bool() == Some(true) {
+                if args["clipboardWrite"].as_bool() == Some(true) && !granted.is_empty() {
                     g.clipboard_write = true;
                 }
             }
             ok_text(format!(
-                "granted for this session: {} (reason: {reason}). Display-scope tools still need computer_request_full_control.",
-                apps.join(", ")
+                "granted: [{}] denied: [{}] (reason: {reason}). Display-scope tools still need computer_request_full_control.",
+                granted.join(", "),
+                denied.join(", "),
             ))
         }),
     );
@@ -1345,15 +1377,28 @@ impl ApprovalChannel for SharedBridge {
     }
 }
 
-impl ApprovalChannel for SurfaceApprovalChannel {
-    fn answer(&self, request: &ApprovalRequest) -> Option<ApprovalOutcome> {
+impl SurfaceApprovalChannel {
+    /// Register a pending ask WITHOUT waiting (batch consent: register all,
+    /// then wait for each — every card is on screen at once).
+    pub fn register(
+        &self,
+        id: &str,
+        tool_name: &str,
+        call_id: &str,
+        args_json: &str,
+    ) {
         self.pending.lock().unwrap().push(PendingApproval {
-            id: request.id.clone(),
-            tool_name: request.tool_name.clone(),
-            call_id: request.call_id.clone(),
-            args_json: request.args_json.clone(),
+            id: id.to_string(),
+            tool_name: tool_name.to_string(),
+            call_id: call_id.to_string(),
+            args_json: args_json.to_string(),
             asked_at: now_ms(),
         });
+        self.wake.notify_all();
+    }
+
+    /// Block until `id` is answered (stop-flag aware). Fails closed.
+    pub fn wait_for(&self, id: &str) -> ApprovalOutcome {
         loop {
             // bounded waits so a stop flip is honoured mid-approval
             let answers = self.answers.lock().unwrap();
@@ -1361,26 +1406,32 @@ impl ApprovalChannel for SurfaceApprovalChannel {
                 .wake
                 .wait_timeout(answers, std::time::Duration::from_millis(250))
                 .unwrap();
-            if let Some(outcome) = answers.remove(&request.id) {
+            if let Some(outcome) = answers.remove(id) {
                 drop(answers);
-                self.pending
-                    .lock()
-                    .unwrap()
-                    .retain(|p| p.id != request.id);
+                self.pending.lock().unwrap().retain(|p| p.id != id);
                 self.wake.notify_all();
-                return Some(outcome);
+                return outcome;
             }
             drop(answers);
             if self.stop.load(Ordering::Relaxed) {
-                self.pending
-                    .lock()
-                    .unwrap()
-                    .retain(|p| p.id != request.id);
+                self.pending.lock().unwrap().retain(|p| p.id != id);
                 self.wake.notify_all();
-                return Some(ApprovalOutcome::Cancelled);
+                return ApprovalOutcome::Cancelled;
             }
             let _ = timeout;
         }
+    }
+}
+
+impl ApprovalChannel for SurfaceApprovalChannel {
+    fn answer(&self, request: &ApprovalRequest) -> Option<ApprovalOutcome> {
+        self.register(
+            &request.id,
+            &request.tool_name,
+            &request.call_id,
+            &request.args_json,
+        );
+        Some(self.wait_for(&request.id))
     }
 }
 
@@ -1553,7 +1604,7 @@ pub fn run_turn_streaming(
     }
     // N0025: the Claude Desktop parity families (consent + display-scope
     // + app_*), sharing the daemon-level consent ledger
-    register_computer_parity_tools(&mut registry, computer_consent, &session_id);
+    register_computer_parity_tools(&mut registry, computer_consent, &session_id, &approvals);
 
     // N0023: computer control tools (Claude Desktop parity, AX-first).
     // The approval card IS the split consent: computer_act's card grants
