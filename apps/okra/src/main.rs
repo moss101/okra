@@ -37,6 +37,9 @@ struct Args {
     /// `--minimal`: plain scrollback lines (okra_tui::minimal_line) instead
     /// of inline streaming text — the pager's no-alt-screen sibling.
     minimal: bool,
+    /// `--tools PATTERNS` (#56): comma-separated allowlist (exact or `*`)
+    /// filtering the tool registry for this run.
+    tools_filter: Option<String>,
     cwd: PathBuf,
     max_turns: usize,
     kill_at_phase: Option<String>,
@@ -50,6 +53,45 @@ struct Args {
     prompt: String,
 }
 
+/// The NDJSON event schema (grok headless `--json-schema` analog): the
+/// `--json` stream's wire contract, one object per line, tagged `event`.
+fn ndjson_event_schema() -> serde_json::Value {
+    let variant = |name: &str, fields: &[(&str, &str)]| {
+        let mut props = serde_json::Map::new();
+        props.insert("event".into(), serde_json::json!({ "const": name }));
+        for (field, ty) in fields {
+            props.insert((*field).into(), serde_json::json!({ "type": ty }));
+        }
+        let required: Vec<&str> = std::iter::once("event")
+            .chain(fields.iter().map(|(f, _)| *f))
+            .collect();
+        serde_json::json!({
+            "type": "object",
+            "properties": props,
+            "required": required,
+            "additionalProperties": false,
+        })
+    };
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "okra NDJSON event stream (--json)",
+        "description": "One JSON object per line; every variant carries the `event` tag (snake_case).",
+        "oneOf": [
+            variant("turn_started", &[("turn", "integer")]),
+            variant("phase", &[("phase", "string")]),
+            variant("text_delta", &[("text", "string")]),
+            variant("tool_call_started", &[("id", "string"), ("name", "string"), ("args_json", "string")]),
+            variant("tool_call_progress", &[("id", "string"), ("text", "string")]),
+            variant("tool_call_finished", &[("id", "string"), ("name", "string"), ("is_error", "boolean"), ("output", "string")]),
+            variant("steering_injected", &[("text", "string")]),
+            variant("nudge", &[("reason", "string")]),
+            variant("compaction_notice", &[("note", "string")]),
+            variant("turn_finished", &[("outcome", "string")]),
+            variant("error", &[("message", "string")]),
+        ],
+    })
+}
+
 fn parse_args() -> Result<Args, String> {
     // `--version` must never be mistaken for a prompt: the dogfood harness
     // probes it, and a whole agent turn per probe is the bug it prevents
@@ -58,9 +100,19 @@ fn parse_args() -> Result<Args, String> {
         println!("okra {}", env!("CARGO_PKG_VERSION"));
         std::process::exit(0);
     }
+    // `--json-schema` (#56): print the NDJSON LoopEvent schema — the
+    // machine-readable output contract for CI consumers — and exit.
+    if argv.iter().any(|a| a == "--json-schema") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&ndjson_event_schema()).unwrap_or_default()
+        );
+        std::process::exit(0);
+    }
     let mut args = argv.into_iter();
     let mut json = false;
     let mut minimal = false;
+    let mut tools_filter: Option<String> = None;
     let mut cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut max_turns = 32usize;
     let mut kill_at_phase = None;
@@ -77,6 +129,9 @@ fn parse_args() -> Result<Args, String> {
         match arg.as_str() {
             "--json" => json = true,
             "--minimal" => minimal = true,
+            "--tools" => {
+                tools_filter = Some(args.next().ok_or("--tools needs a pattern list")?);
+            }
             "--cwd" => {
                 cwd = PathBuf::from(args.next().ok_or("--cwd needs a value")?);
             }
@@ -123,6 +178,7 @@ fn parse_args() -> Result<Args, String> {
         prompt.ok_or("missing prompt (try: okra --json \"read hello.txt\")")?
     };
     Ok(Args { json,
+        tools_filter,
         minimal, cwd, max_turns, kill_at_phase, kill_at_boundary, fork_session, worktree, task_spec, sandbox, provider, model, prompt })
 }
 
@@ -903,16 +959,53 @@ fn main() {
         eprintln!("error: --cwd {:?} is not a directory", args.cwd);
         std::process::exit(2);
     }
-    // --worktree: M3 lands real worktrees (grok worktree crate); M0 records
-    // the flag and refuses a missing path instead of silently ignoring it.
-    if let Some(wt) = &args.worktree
-        && !wt.is_dir() {
-            eprintln!("error: --worktree {:?} is not a directory (worktree isolation lands in M3)", wt);
-            std::process::exit(2);
+    // #56 --worktree: the headless task runs INSIDE an isolated worktree.
+    // An existing directory is used as-is; a missing path is CREATED as a
+    // real git worktree of the current repo (branch worktree-<id>, shared
+    // object store). The turn's whole world (tools, session, memory,
+    // skills) is the worktree.
+    let effective_cwd: PathBuf = match &args.worktree {
+        None => args.cwd.clone(),
+        Some(wt) if wt.is_dir() => wt.clone(),
+        Some(wt) => {
+            let repo = okra_host::git::GitRepository::open(&args.cwd)
+                .unwrap_or_else(|e| {
+                    eprintln!(
+                        "error: --worktree {} needs the cwd to be a git repository (to create it): {e}",
+                        wt.display()
+                    );
+                    std::process::exit(2);
+                });
+            let branch = format!("worktree-{}", serve::uuid_v4());
+            repo.worktree_add(&branch, wt)
+                .unwrap_or_else(|e| {
+                    eprintln!("error: creating worktree {}: {e}", wt.display());
+                    std::process::exit(2);
+                });
+            eprintln!("[worktree] created {} (branch {branch})", wt.display());
+            wt.clone()
         }
+    };
 
     // ---- agent assembly (the daemon core, in-process for M0) ----
-    let registry = build_registry(&args.cwd);
+    let mut registry = build_registry(&effective_cwd);
+    // #56 tool globs: filter the plane for this run; drops are REPORTED,
+    // never silent (a typo'd pattern that keeps nothing is caught below)
+    if let Some(patterns) = &args.tools_filter {
+        let list: Vec<String> = patterns
+            .split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        let dropped = registry.retain_matching(&list);
+        if !dropped.is_empty() {
+            eprintln!("[tools] filtered out: {}", dropped.join(", "));
+        }
+        if registry.entries().is_empty() {
+            eprintln!("error: --tools {patterns} matched no tools");
+            std::process::exit(2);
+        }
+    }
     let approvals = ApprovalService::new(ApprovalPolicy::Ask);
     let mut executor = PolicyToolExecutor::new(registry, approvals);
     // Headless/CI runs unattended: the UnattendedAllowed ceiling lets the
@@ -922,7 +1015,7 @@ fn main() {
     // The interactive demo planner remains available for prompt mode; task
     // mode (--task) replaces it with the spec-driven TaskPlanner below.
     #[allow(unused_variables)]
-    let demo_sampler = demo_sampler::DemoPlanner::new(args.cwd.clone());
+    let demo_sampler = demo_sampler::DemoPlanner::new(effective_cwd.clone());
 
     // kernel session: <cwd>/.okra-sessions/cli
     let sessions_root = args.cwd.join(".okra-sessions");
@@ -941,7 +1034,8 @@ fn main() {
         version: kernel::SESSION_FORMAT_VERSION,
         id: session_id.clone(),
         created_at: kernel::wall_clock(),
-        cwd: args.cwd.to_string_lossy().into_owned(),
+        // the turn's world is the worktree when --worktree is given
+        cwd: effective_cwd.to_string_lossy().into_owned(),
         parent_session: if args.fork_session { Some("cli".into()) } else { None },
         is_seeded: false,
     };
@@ -1054,7 +1148,7 @@ fn main() {
         {
             let policy = okra_policy::SandboxExecutionPolicy {
                 mode,
-                workspace_root: args.cwd.clone(),
+                workspace_root: effective_cwd.clone(),
                 session_id: Some(session_id.clone()),
             };
             // network follows the mode: blocked under read-only/strict,
@@ -1147,10 +1241,10 @@ fn main() {
     // disclosure), and the world-state head reach the model on every CLI
     // turn, not only in the benchmark harness. Fail-open: absent dirs are
     // simply empty.
-    let home = okra_host::fsutil::home_dir().unwrap_or_else(|| args.cwd.clone());
-    let memory_reader = okra_memory::TieredReader::new(home, args.cwd.clone());
+    let home = okra_host::fsutil::home_dir().unwrap_or_else(|| effective_cwd.clone());
+    let memory_reader = okra_memory::TieredReader::new(home, effective_cwd.clone());
     let skill_catalog =
-        okra_memory::SkillCatalog::load_dir(&args.cwd.join(".okra").join("skills"));
+        okra_memory::SkillCatalog::load_dir(&effective_cwd.join(".okra").join("skills"));
     let mut continuation_ctx = okra_compaction::SessionContext::default();
     let result = agent.run_turn_continuation(
         &mut continuation_ctx,

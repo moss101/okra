@@ -86,6 +86,10 @@ struct AcpSession {
     /// session chain (compaction + world state + skills), like the daemon's
     /// per-session contexts.
     context: Arc<Mutex<okra_compaction::SessionContext>>,
+    /// n0040: this session's next turn ordinal — kernels `turn/start`
+    /// stays monotonic across prompts (a fresh Agent per prompt would
+    /// restart at 1 and replay would collapse every turn into t1).
+    turn_ordinal: usize,
 }
 
 /// `okra serve --acp`: JSON-RPC/ACP loop over stdin/stdout.
@@ -168,6 +172,7 @@ pub fn serve_acp(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) -> !
                         kernel_id,
                         session_cwd,
                         context: Arc::new(Mutex::new(okra_compaction::SessionContext::default())),
+                        turn_ordinal: 0,
                     },
                 );
                 outbound.result(&id, serde_json::json!({ "sessionId": session_id }));
@@ -175,8 +180,8 @@ pub fn serve_acp(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) -> !
             "session/prompt" => {
                 let session_id = params["sessionId"].as_str().unwrap_or_default().to_string();
                 let session = state.sessions.lock().unwrap().get(&session_id)
-                    .map(|s| (s.kernel_id.clone(), s.session_cwd.clone(), Arc::clone(&s.context)));
-                let Some((kernel_id, session_cwd, session_ctx)) = session else {
+                    .map(|s| (s.kernel_id.clone(), s.session_cwd.clone(), Arc::clone(&s.context), s.turn_ordinal));
+                let Some((kernel_id, session_cwd, session_ctx, turn_ordinal)) = session else {
                     outbound.error(&id, -32002, &format!("unknown session: {session_id}"));
                     continue;
                 };
@@ -218,6 +223,7 @@ pub fn serve_acp(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) -> !
                 let kernel_id_t = kernel_id.clone();
                 let text_t = text.clone();
                 let ctx_t = Arc::clone(&session_ctx);
+                let ordinal_t = turn_ordinal;
                 std::thread::spawn(move || {
                     let (oc_n, sid_n) = (Arc::clone(&oc), sid.clone());
                     let mut notify = move |update: serde_json::Value| {
@@ -231,6 +237,7 @@ pub fn serve_acp(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) -> !
                         &sessions_dir_t,
                         &kernel_id_t,
                         &ctx_t,
+                        ordinal_t,
                         &text_t,
                         &stop_flag,
                         &mut notify,
@@ -240,6 +247,9 @@ pub fn serve_acp(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) -> !
                             serde_json::json!({ "stopReason": stop_reason }),
                         ),
                         Err(e) => oc.error(&id, -32000, &format!("turn failed: {e}")),
+                    }
+                    if let Some(sess) = st.sessions.lock().unwrap().get_mut(&sid) {
+                        sess.turn_ordinal += 1;
                     }
                     st.stop_flags.lock().unwrap().remove(&sid);
                     st.running.lock().unwrap().remove(&sid);
@@ -289,11 +299,13 @@ fn tool_kind(name: &str) -> &'static str {
 /// the policy pipeline, kernel-backed session, demo planner) with LoopEvents
 /// mapped to ACP `session/update` notifications. `stop` is the surface-held
 /// flag session/cancel flips; the loop observes it at every step boundary.
+#[allow(clippy::too_many_arguments)] // the turn context expanded with the seams it carries
 fn acp_turn(
     cwd: &std::path::Path,
     sessions_dir: &std::path::Path,
     kernel_id: &str,
     context: &Arc<Mutex<okra_compaction::SessionContext>>,
+    turn_ordinal: usize,
     input_text: &str,
     stop: &Arc<std::sync::atomic::AtomicBool>,
     notify: &mut dyn FnMut(serde_json::Value),
@@ -341,6 +353,9 @@ fn acp_turn(
     let sampler = DemoPlanner::new(cwd.to_path_buf());
     let mut agent = Agent::new(config, Arc::new(sampler), Box::new(executor), kernel_session);
     agent.set_stop_flag(Arc::clone(stop));
+    // one Agent per prompt on a shared kernel session: seed the counter
+    // so turn/start (and replay numbering) stays monotonic per session
+    agent.set_turn_counter(turn_ordinal as u64);
 
     let outcome = {
         // n0028: ACP turns chain through the session context (memory +

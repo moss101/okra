@@ -112,6 +112,21 @@ impl Registry {
         self.hooks.iter().map(|b| b.as_ref())
     }
 
+    /// Keep only tools whose name matches one of `patterns` (exact or
+    /// `*` wildcard — the headless `--tools` filter, MASTER-PLAN #56).
+    /// Returns the dropped names (for honest CLI reporting).
+    pub fn retain_matching(&mut self, patterns: &[String]) -> Vec<String> {
+        let matches = |n: &str| patterns.iter().any(|p| star_match(p, n));
+        let dropped: Vec<String> = self
+            .tools
+            .keys()
+            .filter(|n| !matches(n))
+            .cloned()
+            .collect();
+        self.tools.retain(|n, _| matches(n));
+        dropped
+    }
+
     pub fn entries(&self) -> Vec<&ToolEntry> {
         let mut v: Vec<&ToolEntry> = self.tools.values().map(|t| &t.entry).collect();
         v.sort_by(|a, b| a.spec.name.cmp(&b.spec.name));
@@ -217,5 +232,84 @@ impl Registry {
         let approved =
             normalize_before_hooks(&tool.entry, raw_args, &normalizers, &hooks)?;
         Ok(approved.approved_by)
+    }
+}
+
+/// `*`-only wildcard match (existence semantics: `a*bc` matches any text
+/// starting with `a` and ending with `bc`).
+fn star_match(pattern: &str, text: &str) -> bool {
+    fn rec(p: &[u8], t: &[u8]) -> bool {
+        if p.is_empty() {
+            return t.is_empty();
+        }
+        if p[0] == b'*' {
+            let mut rest = 1;
+            while rest < p.len() && p[rest] == b'*' {
+                rest += 1;
+            }
+            if rest == p.len() {
+                return true;
+            }
+            return (0..=t.len()).any(|j| rec(&p[rest..], &t[j..]));
+        }
+        !t.is_empty() && p[0] == t[0] && rec(&p[1..], &t[1..])
+    }
+    rec(pattern.as_bytes(), text.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{ToolMetadata, ToolSpec};
+
+    fn named_registry(names: &[&str]) -> Registry {
+        let mut r = Registry::new();
+        for n in names {
+            let spec = ToolSpec {
+                name: (*n).into(),
+                description: String::new(),
+                arguments_schema: None,
+                namespace: None,
+                title: None,
+                kind: None,
+                behavior_version: None,
+                idempotent: true,
+                read_only: true,
+                timeout_ms: None,
+                max_concurrency: None,
+            };
+            r.register(ErasedTool::simple(
+                ToolEntry::new(spec, ToolMetadata::default()),
+                vec![],
+                |_| ToolStream::terminal_only(Ok(crate::ToolOutput::text(""))),
+            ))
+            .unwrap();
+        }
+        r
+    }
+
+    #[test]
+    fn star_match_semantics() {
+        assert!(star_match("read_file", "read_file"));
+        assert!(!star_match("read_file", "write_file"));
+        assert!(star_match("read_*", "read_file"));
+        assert!(star_match("*_file", "read_file"));
+        assert!(star_match("a*bc", "abcbc"), "ends-with anchoring");
+        assert!(!star_match("*_file", "read_dir"));
+        assert!(star_match("*", "anything"));
+    }
+
+    #[test]
+    fn retain_matching_filters_and_reports_drops() {
+        let mut r = named_registry(&["read_file", "list_dir", "write_file", "edit_file"]);
+        let dropped = r.retain_matching(&["read_*".to_string(), "list_dir".to_string()]);
+        assert_eq!(drobed_sorted(dropped), vec!["edit_file", "write_file"]);
+        let names: Vec<String> = r.entries().iter().map(|e| e.spec.name.clone()).collect();
+        assert_eq!(names, vec!["list_dir", "read_file"]);
+    }
+
+    fn drobed_sorted(mut v: Vec<String>) -> Vec<String> {
+        v.sort();
+        v
     }
 }

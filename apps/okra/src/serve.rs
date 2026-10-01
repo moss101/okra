@@ -1719,6 +1719,29 @@ fn emit_approval_state(
 /// from whichever surface submitted it. `stop` (G4): a surface can flip
 /// this flag mid-turn; the turn cancels at the next step boundary
 /// (Cancelled(UserRequested)) and recovers through the standard path.
+/// The network embedding tier, only when the user opted in
+/// (`OKRA_EMBEDDINGS=on`) AND a credential exists. Any failure at use
+/// time falls back offline inside `rank_relevant`.
+fn embeddings_network_tier() -> Option<Box<okra_memory::retrieval::NetworkEmbed>> {
+    let on = std::env::var("OKRA_EMBEDDINGS")
+        .map(|v| {
+            let v = v.to_lowercase();
+            v == "on" || v == "1" || v == "true"
+        })
+        .unwrap_or(false);
+    if !on {
+        return None;
+    }
+    let client = okra_providers::embeddings::EmbeddingClient::from_env(
+        std::env::var("OKRA_EMBEDDINGS_MODEL").unwrap_or_else(|_| "text-embedding-3-small".into()),
+    )?;
+    Some(Box::new(move |texts: &[&str]| {
+        client
+            .embed(texts)
+            .map_err(|e| format!("embeddings tier: {e:?}"))
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_turn_streaming(
     broadcast: BroadcastFn,
@@ -2188,9 +2211,8 @@ pub fn run_turn_streaming(
                     )
                 })
                 .collect();
-            let index = okra_memory::retrieval::EmbeddingIndex::build_offline(items);
-            let query = okra_memory::retrieval::EmbeddingIndex::offline_query(&input_text);
-            index.rank(&query, 3)
+            let network = embeddings_network_tier();
+            okra_memory::retrieval::rank_relevant(items, &input_text, network.as_deref(), 3)
         };
         let mut handle_ev = |ev: LoopEvent| {
             let mut p = row_lock.lock().unwrap();
@@ -3271,6 +3293,17 @@ pub fn serve_stdio(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) ->
     // n0028: per-session continuation contexts (chained turns over stdio)
     let contexts: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<okra_compaction::SessionContext>>>>> =
         Arc::new(Mutex::new(std::collections::HashMap::new()));
+    // n0040: stdio rewind checkpoints — the same capture/restore surface
+    // the TCP daemon has (writes record per-prompt; a manager per daemon,
+    // durable mirror under the workspace, loaded at startup)
+    let checkpoint_mirror = cwd.join(".okra").join("checkpoints.jsonl");
+    let mut checkpoint_mgr = okra_host::checkpoints::CheckpointManager::new(cwd.clone())
+        .with_durable_mirror(checkpoint_mirror.clone());
+    let _ = checkpoint_mgr.load_durable_mirror(checkpoint_mirror);
+    let checkpoints: Arc<Mutex<okra_host::checkpoints::CheckpointManager>> =
+        Arc::new(Mutex::new(checkpoint_mgr));
+    let session_turn_ordinals: Arc<Mutex<std::collections::HashMap<String, usize>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
@@ -3398,6 +3431,13 @@ pub fn serve_stdio(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) ->
                                 Arc::new(Mutex::new(okra_compaction::SessionContext::default()))
                             }))
                         };
+                        let turn_ordinal = {
+                            let mut ordinals = session_turn_ordinals.lock().unwrap();
+                            let next = ordinals.get(&session_id).copied().unwrap_or(0);
+                            ordinals.insert(session_id.clone(), next + 1);
+                            next
+                        };
+                        let session_checkpoints = Arc::clone(&checkpoints);
                         if let Err(e) = run_turn_streaming(
                             broadcast,
                             topic,
@@ -3416,8 +3456,8 @@ pub fn serve_stdio(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) ->
                             &Mutex::new(std::collections::BTreeMap::new()),
                             &Arc::new(Mutex::new(ComputerConsent::default())),
                             Some(session_ctx),
-                            None,
-                            0,
+                            Some(session_checkpoints),
+                            turn_ordinal,
                             (okra_policy::lattice::MediationPolicy::FirstResponder, None),
                             None,
                         ) {

@@ -119,6 +119,11 @@ M4  surfaces                  ◐ NDJSON two-surface + cross-surface steering,
                                   fail-closed). **Sessions page** (n0038:
                                   full-canvas searchable sessions surface —
                                   a peer of the transcript, Devin-style).
+                                  #56 headless set COMPLETE (n0040:
+                                  --json-schema contract, --tools globs,
+                                  --worktree runs in a REAL created
+                                  worktree); #58 apps/web CLOSED as
+                                  superseded by the served workbench.
 M5  differentiators ✔ in-turn `subagent` tool (n0034: REAL git worktree,
                                   confined child turn, inherit-nothing,
                                   grants never inherited, work collected

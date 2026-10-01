@@ -190,3 +190,89 @@ mod tests {
         assert!(cosine(&a, &b) < 0.3, "disjoint vocabularies score low");
     }
 }
+
+/// The network embedder seam (injected so callers/tests choose the tier
+/// — `okra-providers`' client is wired in at the app layer).
+pub type NetworkEmbed = dyn Fn(&[&str]) -> Result<Vec<Vec<f32>>, String>;
+
+/// Two-tier retrieval: use the network embedder when provided and
+/// healthy; fall back to the offline hashed tier on ANY failure
+/// (retrieval must never fail a turn). The last text in the batch is
+/// the query.
+pub fn rank_relevant(
+    items: Vec<(String, String)>,
+    query_text: &str,
+    network: Option<&NetworkEmbed>,
+    k: usize,
+) -> Vec<(String, f32)> {
+    if let Some(embed) = network {
+        let mut texts: Vec<&str> = items.iter().map(|(_, t)| t.as_str()).collect();
+        texts.push(query_text);
+        if let Ok(vectors) = embed(&texts)
+            && vectors.len() == texts.len()
+        {
+            let query_vector = vectors.last().cloned().unwrap_or_default();
+            let vectored: Vec<(String, String, Vec<f32>)> = items
+                .into_iter()
+                .zip(vectors)
+                .map(|((id, text), vector)| (id, text, vector))
+                .collect();
+            return EmbeddingIndex::build(vectored).rank(&query_vector, k);
+        }
+        // any error or shape mismatch: offline, never a failed turn
+    }
+    let index = EmbeddingIndex::build_offline(items);
+    let query_vector = EmbeddingIndex::offline_query(query_text);
+    index.rank(&query_vector, k)
+}
+
+#[cfg(test)]
+mod tier_tests {
+    use super::*;
+
+    fn items() -> Vec<(String, String)> {
+        vec![
+            ("docker-build".into(), "container dockerfile buildkit".into()),
+            ("rust-testing".into(), "rust unit tests cargo".into()),
+        ]
+    }
+
+    #[test]
+    fn offline_tier_is_the_default() {
+        let hits = rank_relevant(items(), "how do I write rust unit tests", None, 3);
+        assert_eq!(hits.first().map(|(id, _)| id.as_str()), Some("rust-testing"));
+    }
+
+    #[test]
+    fn network_tier_is_used_when_healthy() {
+        // a fake embedder that "knows" docker: near-parallel vectors
+        let embed = |texts: &[&str]| -> Result<Vec<Vec<f32>>, String> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    if t.contains("docker") || t.contains("ship containers") {
+                        vec![1.0, 0.0]
+                    } else {
+                        vec![0.0, 1.0]
+                    }
+                })
+                .collect())
+        };
+        let hits = rank_relevant(items(), "ship containers for me", Some(&embed), 3);
+        assert_eq!(hits.first().map(|(id, _)| id.as_str()), Some("docker-build"));
+    }
+
+    #[test]
+    fn network_failure_falls_back_offline() {
+        let broken = |_texts: &[&str]| -> Result<Vec<Vec<f32>>, String> { Err("503".into()) };
+        let hits = rank_relevant(items(), "how do I write rust unit tests", Some(&broken), 3);
+        assert_eq!(hits.first().map(|(id, _)| id.as_str()), Some("rust-testing"));
+    }
+
+    #[test]
+    fn malformed_network_output_falls_back_offline() {
+        let short = |_texts: &[&str]| -> Result<Vec<Vec<f32>>, String> { Ok(vec![vec![1.0]]) };
+        let hits = rank_relevant(items(), "how do I write rust unit tests", Some(&short), 3);
+        assert_eq!(hits.first().map(|(id, _)| id.as_str()), Some("rust-testing"));
+    }
+}
