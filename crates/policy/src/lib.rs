@@ -19,6 +19,7 @@ pub mod approval;
 pub mod confine;
 pub mod grants;
 pub mod lattice;
+pub mod mediation;
 pub mod nono_backend;
 pub mod profiles;
 

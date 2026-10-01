@@ -679,6 +679,11 @@ fn main() {
         let addr = String::from("127.0.0.1:0");
         let mut provider: Option<String> = None;
         let mut model: Option<String> = None;
+        // n0033: multi-client permission mediation — who answers an ask
+        // when several clients are attached (one today; the seam is live
+        // and fail-closed tested)
+        let mut mediation = okra_policy::lattice::MediationPolicy::FirstResponder;
+        let mut designated: Option<String> = None;
         let mut i = 1;
         while i < argv.len() {
             match argv[i].as_str() {
@@ -686,6 +691,23 @@ fn main() {
                 "--cwd" => {
                     i += 1;
                     tcp_cwd = PathBuf::from(argv.get(i).cloned().unwrap_or_default());
+                }
+                "--mediation" => {
+                    i += 1;
+                    mediation = match argv.get(i).map(String::as_str) {
+                        Some("first-responder") => okra_policy::lattice::MediationPolicy::FirstResponder,
+                        Some("designated") => okra_policy::lattice::MediationPolicy::Designated,
+                        Some("consensus") => okra_policy::lattice::MediationPolicy::Consensus,
+                        Some("local-only") => okra_policy::lattice::MediationPolicy::LocalOnly,
+                        other => {
+                            eprintln!("error: unknown mediation {other:?} (first-responder|designated|consensus|local-only)");
+                            std::process::exit(2);
+                        }
+                    };
+                }
+                "--designated" => {
+                    i += 1;
+                    designated = argv.get(i).cloned();
                 }
                 "--provider" => {
                     i += 1;
@@ -729,6 +751,13 @@ fn main() {
             eprintln!("error: --cwd {:?} is not a directory", tcp_cwd);
             std::process::exit(2);
         }
+        if mediation == okra_policy::lattice::MediationPolicy::Designated
+            && designated.as_deref().unwrap_or_default().is_empty()
+        {
+            // fail at startup, not on the first hanging ask
+            eprintln!("error: --mediation designated needs --designated CLIENT_ID");
+            std::process::exit(2);
+        }
         // loopback-only posture
         let host_part = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(&addr).to_string();
         if !host_part.starts_with("127.0.0.1") && !host_part.starts_with("localhost") && !host_part.starts_with("[::1]") {
@@ -748,6 +777,7 @@ fn main() {
             sessions_dir,
             factory,
             label,
+            (mediation, designated),
         ));
         serve_tcp::serve_tcp(state, listener);
     }

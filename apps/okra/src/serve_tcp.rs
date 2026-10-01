@@ -101,6 +101,10 @@ pub struct TcpServeState {
     pub sampler_factory: SamplerFactory,
     /// Human-readable sampler label for /health and the workbench top bar.
     pub sampler_label: String,
+    /// n0033: who answers permission asks when several clients attach
+    /// (policy + the designated client id). Today the workbench bridge is
+    /// the one client; the seam is live and fail-closed tested.
+    pub mediation: (okra_policy::lattice::MediationPolicy, Option<String>),
     next_static: std::sync::atomic::AtomicU64,
 }
 
@@ -110,6 +114,7 @@ impl TcpServeState {
         sessions_dir: std::path::PathBuf,
         sampler_factory: SamplerFactory,
         sampler_label: String,
+        mediation: (okra_policy::lattice::MediationPolicy, Option<String>),
     ) -> Self {
         let home = okra_host::fsutil::home_dir().unwrap_or_else(|| cwd.clone());
         let config = okra_host::client_info::client_config(
@@ -160,6 +165,7 @@ impl TcpServeState {
             session_turns: Mutex::new(std::collections::BTreeMap::new()),
             sampler_factory,
             sampler_label,
+            mediation,
             next_static: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -1507,6 +1513,7 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
     let turn_sdir = state.sessions_dir.clone();
     let factory = Arc::clone(&state.sampler_factory);
     let turn_checkpoints = Arc::clone(&checkpoints);
+    let mediation = state.mediation.clone();
     std::thread::spawn(move || {
         // worklist: every entry (the original send + each steered input)
         // becomes its OWN turn, carrying its own attachments
@@ -1535,6 +1542,7 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
                 Some(Arc::clone(&session_ctx)),
                 Some(Arc::clone(&turn_checkpoints)),
                 turn_ordinal,
+                mediation.clone(),
             );
             let queued: Vec<crate::serve::SteeredInput> = {
                 let mut q = steer_queue.lock().unwrap(); q.drain(..).collect()

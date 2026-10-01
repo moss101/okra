@@ -1594,6 +1594,7 @@ pub fn run_turn_streaming(
     session_context: Option<Arc<Mutex<okra_compaction::SessionContext>>>,
     checkpoints: Option<Arc<Mutex<okra_host::checkpoints::CheckpointManager>>>,
     prompt_index: usize,
+    mediation: (okra_policy::lattice::MediationPolicy, Option<String>),
 ) -> Result<TurnOutcome, String> {
     let steering_rx = steering;
     // attachments fold BEFORE anything surfaces: model-visible means
@@ -1823,9 +1824,21 @@ pub fn run_turn_streaming(
 
     let mut approval_service = ApprovalService::new(ApprovalPolicy::Ask);
     if !unattended {
-        // attended surfaces: the bridge IS the approval waterfall — the
-        // turn pauses on it until the workbench resolves (or stops)
-        approval_service.add_channel(Box::new(SharedBridge(Arc::clone(&approvals))));
+        // attended surfaces: the ask crosses the MEDIATOR (n0033) — the
+        // workbench bridge is the one attached client today (local,
+        // loopback); policy decides who answers when more clients attach.
+        // first-responder with one client is byte-identical to the old
+        // direct bridge.
+        let mut mediator = okra_policy::mediation::Mediator::new(mediation.0);
+        if let Some(d) = &mediation.1 {
+            mediator = mediator.with_designated(d);
+        }
+        mediator.add_client(
+            "workbench",
+            true,
+            Box::new(SharedBridge(Arc::clone(&approvals))),
+        );
+        approval_service.add_channel(Box::new(mediator));
     }
     let mut executor = okra_agent_core::loop_::PolicyToolExecutor::new(registry, approval_service);
     // Attended surfaces (the workbench) ASK through the bridge: the turn
@@ -3227,6 +3240,7 @@ pub fn serve_stdio(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) ->
                             Some(session_ctx),
                             None,
                             0,
+                            (okra_policy::lattice::MediationPolicy::FirstResponder, None),
                         ) {
                             outbound.notification(
                                 "v4/error",
