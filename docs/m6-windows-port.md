@@ -47,3 +47,24 @@ providing the runner/machine is a user decision).
 4. Clippy windows run; fold new path lessons into clippy.toml bans.
 5. Only then: sandbox enforcement work (restricted token) — until then
    Windows ships `enforcement: partial` (honest, by contract).
+
+## Cross-check from macOS (2026-10-01, n0039)
+
+Attempted: `rustup target add x86_64-pc-windows-msvc` + `cargo check
+--target` over the workspace and over the pure-logic crate subset. Both
+stop at the TLS dependency chain: `ureq → rustls 0.23 → aws-lc-rs`
+(default provider) and `ring` — their build scripts need a target C
+toolchain that does not exist for msvc targets on macOS (no MSVC, and
+aws-lc-sys needs CMake for cross). This is a property of the dependency,
+not of okra's code; rustls 0.23 has no pure-Rust provider on the default
+feature path.
+
+Consequences:
+- The armed `.github/workflows/windows.yml` runner remains the real
+  compile gate (providing it is the recorded user decision).
+- The platform shims above are unchanged in scope; nothing in this
+  session's work (n0028–n0038) added new unix-only paths to the
+  pure-logic crates (protocol/kernel/policy/compaction/memory/session/
+  workflow/gateway/tui stay OS-free; the new sanctioned spawn sites are
+  in apps/okra, which is already unix-gated via portable-pty and the
+  sandbox).
