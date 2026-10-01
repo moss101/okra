@@ -721,6 +721,56 @@ async function stop() {
   } catch (_) { /* ignore */ }
 }
 
+/* ---------- sessions page (N0038: sessions as a first-class surface) ---------- */
+
+const sessionsPage = { open: false, query: '' };
+
+function toggleSessionsPage(force) {
+  sessionsPage.open = force !== undefined ? force : !sessionsPage.open;
+  $('sessions-page').hidden = !sessionsPage.open;
+  $('transcript').hidden = sessionsPage.open;
+  const composer = document.querySelector('.composer');
+  if (composer) composer.style.display = sessionsPage.open ? 'none' : '';
+  if (sessionsPage.open) {
+    renderSessionsPage();
+    $('sessions-search').focus();
+  }
+}
+
+function renderSessionsPage() {
+  const host = $('sessions-grid');
+  if (!host) return;
+  host.textContent = '';
+  const q = sessionsPage.query.trim().toLowerCase();
+  const sessions = state.sessions.filter((s) =>
+    !q || (s.title || '').toLowerCase().includes(q) || (s.id || '').toLowerCase().includes(q));
+  if (!sessions.length) {
+    host.appendChild(el('div', 'task-list-empty',
+      q ? 'No sessions match "' + sessionsPage.query + '".' : 'No sessions yet.'));
+    return;
+  }
+  for (const s of sessions) {
+    const card = el('button', 'session-card' + (s.id === state.activeId ? ' active' : ''));
+    card.type = 'button';
+    card.appendChild(el('span', 'session-card-title', s.title || 'Task ' + s.id.replace(/^web-/, '')));
+    const meta = el('span', 'session-card-meta');
+    const dot = el('span', 'status-dot ' + (s.status || ''));
+    meta.appendChild(dot);
+    meta.appendChild(el('span', null,
+      (s.live ? 'live · ' : '') +
+      (s.eventCount != null ? s.eventCount + ' events' : '') +
+      (s.lastActivity ? ' · ' + new Date(s.lastActivity).toLocaleString() : '')));
+    card.appendChild(meta);
+    card.appendChild(el('span', 'session-card-id', s.id));
+    card.addEventListener('click', () => {
+      delete state.unread[s.id];
+      toggleSessionsPage(false);
+      selectSession(s.id);
+    });
+    host.appendChild(card);
+  }
+}
+
 /* ---------- rendering: task list ---------- */
 
 function renderTaskList() {
@@ -1780,6 +1830,15 @@ function init() {
     if (text) { e.preventDefault(); termSend(text); }
   });
 
+  $('sessions-view-btn').addEventListener('click', () => toggleSessionsPage());
+  $('sessions-close').addEventListener('click', () => toggleSessionsPage(false));
+  $('sessions-search').addEventListener('input', (e) => {
+    sessionsPage.query = e.target.value;
+    renderSessionsPage();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && sessionsPage.open) toggleSessionsPage(false);
+  });
   $('tab-tasks').addEventListener('click', () => switchTab('tasks'));
   $('tab-files').addEventListener('click', () => switchTab('files'));
   $('tab-changes').addEventListener('click', () => switchTab('changes'));
@@ -1813,7 +1872,7 @@ function init() {
 
   // keep the task list fresh (turns can finish in other surfaces);
   // the Changes tab rides the same cadence (writes land as diffs)
-  setInterval(() => { loadSessions(); if (gitState.active) loadGit(); }, 15000);
+  setInterval(() => { loadSessions(); if (gitState.active) loadGit(); if (sessionsPage.open) renderSessionsPage(); }, 15000);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) loadSessions(); });
 }
 
