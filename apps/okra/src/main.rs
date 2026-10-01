@@ -778,6 +778,7 @@ fn main() {
             factory,
             label,
             (mediation, designated),
+            provider.as_ref().map(|p| (p.clone(), model_name.clone())),
         ));
         serve_tcp::serve_tcp(state, listener);
     }

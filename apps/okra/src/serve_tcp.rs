@@ -105,6 +105,9 @@ pub struct TcpServeState {
     /// (policy + the designated client id). Today the workbench bridge is
     /// the one client; the seam is live and fail-closed tested.
     pub mediation: (okra_policy::lattice::MediationPolicy, Option<String>),
+    /// N0034: provider/model flags the subagent child turns inherit
+    /// (None → the offline demo planner, hermetic by default).
+    pub subagent_provider: Option<(String, String)>,
     next_static: std::sync::atomic::AtomicU64,
 }
 
@@ -115,6 +118,7 @@ impl TcpServeState {
         sampler_factory: SamplerFactory,
         sampler_label: String,
         mediation: (okra_policy::lattice::MediationPolicy, Option<String>),
+        subagent_provider: Option<(String, String)>,
     ) -> Self {
         let home = okra_host::fsutil::home_dir().unwrap_or_else(|| cwd.clone());
         let config = okra_host::client_info::client_config(
@@ -166,6 +170,7 @@ impl TcpServeState {
             sampler_factory,
             sampler_label,
             mediation,
+            subagent_provider,
             next_static: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -1514,6 +1519,7 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
     let factory = Arc::clone(&state.sampler_factory);
     let turn_checkpoints = Arc::clone(&checkpoints);
     let mediation = state.mediation.clone();
+    let subagent_provider = state.subagent_provider.clone();
     std::thread::spawn(move || {
         // worklist: every entry (the original send + each steered input)
         // becomes its OWN turn, carrying its own attachments
@@ -1543,6 +1549,7 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
                 Some(Arc::clone(&turn_checkpoints)),
                 turn_ordinal,
                 mediation.clone(),
+                subagent_provider.clone(),
             );
             let queued: Vec<crate::serve::SteeredInput> = {
                 let mut q = steer_queue.lock().unwrap(); q.drain(..).collect()

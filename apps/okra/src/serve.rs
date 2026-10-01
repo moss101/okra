@@ -274,6 +274,152 @@ fn no_takeover_error() -> String {
         .to_string()
 }
 
+/// N0034: the in-turn `subagent` tool — the model can delegate work to a
+/// kernel-isolated child. Each call: a REAL git worktree is created
+/// (branch `<name>`, shared object store), the child runs a full okra
+/// turn confined to it (`--sandbox workspace-write`, fresh session =
+/// inherit-nothing context, empty grants = nothing inherited), its work
+/// is committed on the branch, and the worktree is cleaned up. The
+/// parent checkout is never touched.
+///
+/// This is the G5 surface as a TOOL: "a subagent run in an isolated
+/// worktree cannot touch paths outside its grant — enforced by sandbox,
+/// not policy" (the child's nono confinement is the enforcement).
+fn register_subagent_tool(
+    registry: &mut okra_tools::Registry,
+    cwd: &Path,
+    session_id: &str,
+    provider: Option<(String, String)>,
+) {
+    let spec = okra_tools::ToolSpec {
+        name: "subagent".into(),
+        description: "Delegate a self-contained task to an isolated subagent: it runs in its own git worktree (own branch, own session, nothing inherited from this conversation) and returns a summary plus the branch its work is committed on. The worktree is removed afterwards; merge or cherry-pick the branch to take the work.".into(),
+        arguments_schema: Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "short branch-safe task name (letters/digits/-/_)" },
+                "task": { "type": "string", "description": "the complete task for the subagent — it sees ONLY this" }
+            },
+            "required": ["name", "task"],
+        })),
+        read_only: false,
+        idempotent: false,
+        kind: Some("delegation".into()),
+        ..computer_spec_rest()
+    };
+    let metadata = okra_tools::ToolMetadata::default();
+    let entry = okra_tools::ToolEntry::new(spec, metadata);
+    let cwd = cwd.to_path_buf();
+    let parent_session = session_id.to_string();
+    let _ = registry.register(okra_tools::ErasedTool::simple(
+        entry,
+        vec![okra_tools::ResourceAccess::All],
+        move |args: &serde_json::Value| {
+            let name = args["name"].as_str().unwrap_or_default().to_string();
+            let task = args["task"].as_str().unwrap_or_default().to_string();
+            let outcome = run_isolated_subagent(&cwd, &name, &task, &parent_session, provider.as_ref());
+            okra_tools::ToolStream::terminal_only(
+                match outcome {
+                    Ok(text) => Ok(okra_tools::ToolOutput::text(text)),
+                    Err(e) => Err(okra_tools::ToolError::tool_failed(e)),
+                },
+            )
+        },
+    ));
+}
+
+/// One isolated subagent run (launch → confined child turn → collect →
+/// cleanup). Sanctioned spawn site: the child IS a full okra binary with
+/// its own kernel session and sandbox; arguments are host-built paths,
+/// never raw model text.
+fn run_isolated_subagent(
+    cwd: &Path,
+    name: &str,
+    task: &str,
+    parent_session: &str,
+    provider: Option<&(String, String)>,
+) -> Result<String, String> {
+    use okra_host::subagent::{RoleScope, SubagentLauncher};
+    if name.trim().is_empty() || task.trim().is_empty() {
+        return Err("subagent needs a non-empty name and task".into());
+    }
+    let repo = okra_host::git::GitRepository::open(cwd)
+        .map_err(|_| "subagent requires the workspace to be a git repository (worktree isolation)".to_string())?;
+    let launcher = SubagentLauncher::new(
+        repo,
+        // the parent's own grants live HERE and nowhere else — the
+        // launcher never copies them into the child grant
+        vec![format!("parent:{parent_session}")],
+    );
+    let role = RoleScope {
+        readable: vec![".".into()],
+        writable: vec![".".into()],
+    };
+    let parent_scope = RoleScope {
+        readable: vec![".".into()],
+        writable: vec![".".into()],
+    };
+    let unique = format!("{name}-{}", uuid_v4());
+    let worktree = std::env::temp_dir().join("okra-worktrees").join(&unique);
+    let grant = launcher
+        .launch(&unique, &worktree, &role, &parent_scope, task)
+        .map_err(|e| format!("launch subagent: {e}"))?;
+
+    // the child turn: full okra binary confined to the worktree
+    let bin = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("okra")))
+        .unwrap_or_else(|| std::path::PathBuf::from("okra"));
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.args([
+        "--cwd",
+        &worktree.to_string_lossy(),
+        "--sandbox",
+        "workspace-write",
+        "--json",
+        task,
+    ]);
+    if let Some((provider_name, model)) = provider {
+        cmd.arg("--provider").arg(provider_name);
+        cmd.arg("--model").arg(model);
+    }
+    cmd.env("OKRA_SUBAGENT_PARENT", format!("session-{parent_session}"));
+    #[allow(clippy::disallowed_methods)] // sanctioned site: the confined child runner
+    let output = cmd.output().map_err(|e| format!("spawn subagent turn: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let mut text = String::new();
+    for line in stdout.lines() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+            && v["event"] == "text_delta"
+            && let Some(delta) = v["text"].as_str()
+        {
+            text.push_str(delta);
+        }
+    }
+    if !output.status.success() && text.trim().is_empty() {
+        let _ = launcher.cleanup(&grant);
+        return Err(format!(
+            "subagent turn failed (exit {:?}): {}",
+            output.status.code(),
+            stderr.trim()
+        ));
+    }
+
+    // collect: commit whatever the child produced on its branch, then
+    // remove the worktree (the branch stays in the shared object store)
+    let branch = grant.branch.clone();
+    let commit = okra_host::subagent::SubagentLauncher::collect_work(&grant, &format!("subagent {name}: task output"))
+        .ok();
+    let _ = std::fs::remove_dir_all(worktree.join(".okra-sessions"));
+    let _ = launcher.cleanup(&grant);
+    let summary = text.trim().chars().take(2048).collect::<String>();
+    Ok(format!(
+        "subagent `{name}` completed (branch {branch}, commit {}). Summary:\n{summary}",
+        commit.as_deref().unwrap_or("none — no changes produced"),
+    ))
+}
+
 /// The Claude Desktop parity tool families (N0025): consent tools +
 /// display-scope coordinate family + background app_* family. The N0023
 /// trio (computer_observe/act/screenshot) stays as-is.
@@ -1595,6 +1741,7 @@ pub fn run_turn_streaming(
     checkpoints: Option<Arc<Mutex<okra_host::checkpoints::CheckpointManager>>>,
     prompt_index: usize,
     mediation: (okra_policy::lattice::MediationPolicy, Option<String>),
+    subagent_provider: Option<(String, String)>,
 ) -> Result<TurnOutcome, String> {
     let steering_rx = steering;
     // attachments fold BEFORE anything surfaces: model-visible means
@@ -1683,6 +1830,9 @@ pub fn run_turn_streaming(
     // N0025: the Claude Desktop parity families (consent + display-scope
     // + app_*), sharing the daemon-level consent ledger
     register_computer_parity_tools(&mut registry, computer_consent, &session_id, &approvals);
+    // N0034: delegation — the model can spawn a kernel-isolated subagent
+    // (real worktree, confined child turn, work committed to a branch)
+    register_subagent_tool(&mut registry, &cwd, &session_id, subagent_provider);
 
     // N0023: computer control tools (Claude Desktop parity, AX-first).
     // The approval card IS the split consent: computer_act's card grants
@@ -3241,6 +3391,7 @@ pub fn serve_stdio(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) ->
                             None,
                             0,
                             (okra_policy::lattice::MediationPolicy::FirstResponder, None),
+                            None,
                         ) {
                             outbound.notification(
                                 "v4/error",
