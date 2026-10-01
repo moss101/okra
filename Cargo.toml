@@ -47,6 +47,9 @@ okra-computer = { path = "crates/computer" }
 okra-tui = { path = "crates/tui" }
 
 serde = { version = "1", features = ["derive"] }
+rhai = "1.26.1"
+crossterm = "0.29"
+ratatui = { version = "0.30", features = ["crossterm"] }
 serde_json = "1"
 thiserror = "2"
 sha2 = "0.10"

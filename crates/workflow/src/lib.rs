@@ -3,9 +3,18 @@
 //! N0004); M1 lands the durable run journal so workflow runs are
 //! reconstructable like every other durable truth.
 
+pub mod engine;
+
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
+
+pub fn now_ms() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as f64)
+        .unwrap_or(0.0)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -56,6 +65,7 @@ pub struct JournalEntry {
 /// Append-only NDJSON run journal (ZCode dynamic-workflow run journal
 /// analog). One file per run; a torn final line is skipped on read, never
 /// fatal (kernel loss contract reused).
+#[derive(Clone)]
 pub struct RunJournal {
     dir: PathBuf,
 }

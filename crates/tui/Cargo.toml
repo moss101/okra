@@ -6,4 +6,6 @@ license.workspace = true
 description = "Minimal scrollback writer (--minimal); ratatui pager lands at M4"
 
 [dependencies]
+crossterm = { workspace = true }
+ratatui = { workspace = true }
 serde_json = { workspace = true }

@@ -1,7 +1,11 @@
-//! okra-tui — the `--minimal` scrollback mode (MASTER-PLAN §3 #55).
-//! grok's ratatui pager lands at M4; M1 provides the plain-terminal writer
-//! that renders LoopEvents into scrollback-friendly lines with O(N)
-//! streaming (no block re-render).
+//! okra-tui — the M4 pager (MASTER-PLAN §3 #55, grok pager analog):
+//! `pager::Scrollback` is the block-structured scrollback model (O(N)
+//! streaming, bottom-anchored scrolling, terminal-IO free and unit
+//! tested); the ratatui renderer lives in apps/okra and only draws what
+//! the model slices. `minimal_line` stays as the `--minimal` plain
+//! scrollback writer.
+
+pub mod pager;
 
 /// Render a protocol-style event value into scrollback lines.
 pub fn minimal_line(event: &str, payload: &serde_json::Value) -> Option<String> {

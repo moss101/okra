@@ -17,6 +17,8 @@ mod serve_tcp;
 mod subagent;
 mod serve;
 mod task;
+mod tui_app;
+mod workflow_cli;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -31,6 +33,9 @@ use okra_tools::Registry;
 
 struct Args {
     json: bool,
+    /// `--minimal`: plain scrollback lines (okra_tui::minimal_line) instead
+    /// of inline streaming text — the pager's no-alt-screen sibling.
+    minimal: bool,
     cwd: PathBuf,
     max_turns: usize,
     kill_at_phase: Option<String>,
@@ -54,6 +59,7 @@ fn parse_args() -> Result<Args, String> {
     }
     let mut args = argv.into_iter();
     let mut json = false;
+    let mut minimal = false;
     let mut cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut max_turns = 32usize;
     let mut kill_at_phase = None;
@@ -69,6 +75,7 @@ fn parse_args() -> Result<Args, String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--json" => json = true,
+            "--minimal" => minimal = true,
             "--cwd" => {
                 cwd = PathBuf::from(args.next().ok_or("--cwd needs a value")?);
             }
@@ -114,7 +121,8 @@ fn parse_args() -> Result<Args, String> {
     } else {
         prompt.ok_or("missing prompt (try: okra --json \"read hello.txt\")")?
     };
-    Ok(Args { json, cwd, max_turns, kill_at_phase, kill_at_boundary, fork_session, worktree, task_spec, sandbox, provider, model, prompt })
+    Ok(Args { json,
+        minimal, cwd, max_turns, kill_at_phase, kill_at_boundary, fork_session, worktree, task_spec, sandbox, provider, model, prompt })
 }
 
 fn print_help() {
@@ -252,6 +260,71 @@ fn main() {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
+        }
+    }
+
+    // `okra tui [--cwd DIR] [--provider openai --model M]`: the M4 pager —
+    // ratatui block scrollback over real turns (keys: Enter send, PgUp/PgDn
+    // scroll, Ctrl-C stop/quit)
+    if argv.first().map(String::as_str) == Some("tui") {
+        let mut provider = None;
+        let mut model = None;
+        let mut cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut i = 1;
+        while i < argv.len() {
+            match argv[i].as_str() {
+                "--cwd" => { i += 1; cwd = argv.get(i).cloned().map(PathBuf::from).unwrap_or(cwd); }
+                "--provider" => { i += 1; provider = argv.get(i).cloned(); }
+                "--model" => { i += 1; model = argv.get(i).cloned(); }
+                other => { eprintln!("error: unknown tui flag {other}"); std::process::exit(2); }
+            }
+            i += 1;
+        }
+        if let Err(e) = tui_app::run_tui(cwd, provider, model) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+
+    // `okra workflow run SCRIPT.rhai [--provider openai --model M]
+    //  [--max-steps N]`: M3 Rhai engine — each script step is a full
+    // agent turn in a child process (crates/workflow owns budgets + journal)
+    if argv.first().map(String::as_str) == Some("workflow") {
+        let mut script = None;
+        let mut provider = None;
+        let mut model = None;
+        let mut max_steps: u32 = 256;
+        let mut i = 1;
+        while i < argv.len() {
+            match argv[i].as_str() {
+                "run" => {}
+                "--script" => { i += 1; script = argv.get(i).cloned(); }
+                other if other.ends_with(".rhai") => { script = Some(other.to_string()); }
+                "--provider" => { i += 1; provider = argv.get(i).cloned(); }
+                "--model" => { i += 1; model = argv.get(i).cloned(); }
+                "--max-steps" => {
+                    i += 1;
+                    max_steps = argv.get(i).and_then(|v| v.parse().ok()).unwrap_or(256);
+                }
+                other => { eprintln!("error: unknown workflow flag {other}"); std::process::exit(2); }
+            }
+            i += 1;
+        }
+        let Some(script) = script else {
+            eprintln!("error: workflow needs a .rhai script (`okra workflow run SCRIPT.rhai`)");
+            std::process::exit(2);
+        };
+        let budgets = okra_workflow::RunBudgets { max_steps, ..Default::default() };
+        match workflow_cli::run_workflow_cli(
+            std::path::Path::new(&script),
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            provider,
+            model,
+            budgets,
+        ) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
         }
     }
 
@@ -969,10 +1042,19 @@ fn main() {
     // ---- run the turn, streaming NDJSON ----
     let stdout = std::io::stdout();
     let mut sink = stdout.lock();
-    let write_event = |ev: &LoopEvent, sink: &mut dyn Write, json: bool| {
+    let write_event = |ev: &LoopEvent, sink: &mut dyn Write, json: bool, minimal: bool| {
         if json {
             let line = serde_json::to_string(ev).unwrap_or_default();
             let _ = writeln!(sink, "{line}");
+        } else if minimal {
+            // scrollback mode (#55): one line per event via the pager's
+            // plain writer — terminal-friendly, pipe-friendly
+            if let Ok(v) = serde_json::to_value(ev)
+                && let Some(name) = v["event"].as_str()
+                && let Some(line) = okra_tui::minimal_line(name, &v)
+            {
+                let _ = writeln!(sink, "{line}");
+            }
         } else {
             match ev {
                 LoopEvent::TextDelta { text } => {
@@ -1005,7 +1087,7 @@ fn main() {
         Some(&memory_reader),
         Some(&skill_catalog),
         &args.prompt,
-        &mut |ev| write_event(&ev, &mut sink, args.json),
+        &mut |ev| write_event(&ev, &mut sink, args.json, args.minimal),
     );
     let _ = sink.flush();
 
