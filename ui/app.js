@@ -837,6 +837,34 @@ function buildRowNode(r) {
     case 'turnHeader': {
       div.classList.add('row-turn');
       div.appendChild(el('span', 't-state-' + (r.state || ''), 'turn · ' + (r.state || '').replace('completed', '')));
+      // N0029: completed turns offer rewind — restore the workspace to
+      // the start of this prompt (files + git HEAD + model context)
+      if ((r.state || '').startsWith('completed') && state.activeId) {
+        const btn = el('button', 'rewind-btn');
+        btn.textContent = '↺ rewind here';
+        btn.title = 'Restore the workspace to the start of this turn';
+        const ordinal = parseInt(String(r.turnId || '').replace(/^t/, ''), 10);
+        const sid = state.activeId;
+        btn.addEventListener('click', async () => {
+          if (!confirm('Rewind the workspace to the start of this turn? Later file changes and git state are reverted.')) return;
+          try {
+            const resp = await fetch('/api/rewind', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ sessionId: sid, promptIndex: isNaN(ordinal) ? 0 : ordinal }),
+            });
+            const data = await resp.json();
+            if (!resp.ok) throw new Error(data.error || resp.status);
+            const files = (data.restoredFiles || []).length + (data.removedFiles || []).length;
+            toast('info', 'Rewound', files + ' file(s) restored' +
+              (data.gitResetTo ? ' · git reset' : ''));
+            refreshChanges();
+          } catch (e) {
+            toast('error', 'Rewind failed', String(e.message || e));
+          }
+        });
+        div.appendChild(btn);
+      }
       break;
     }
     case 'userInput': {

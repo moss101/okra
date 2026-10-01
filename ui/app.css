@@ -1417,3 +1417,21 @@ html[data-theme="light"] .icon-moon { display: none; }
   }
   .topbar-cwd { display: none; }
 }
+
+/* ---------- rewind (N0029) ---------- */
+
+.row-turn { display: flex; align-items: center; gap: 8px; }
+.rewind-btn {
+  margin-left: auto;
+  font: 500 11px/1 var(--font-ui);
+  color: var(--text-2, #888);
+  background: transparent;
+  border: 1px solid var(--border, #333);
+  border-radius: 6px;
+  padding: 3px 8px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .12s ease;
+}
+.row-turn:hover .rewind-btn { opacity: 1; }
+.rewind-btn:hover { color: var(--text-1, #eee); border-color: var(--accent, #6792ff); }

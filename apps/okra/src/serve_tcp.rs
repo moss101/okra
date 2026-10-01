@@ -88,6 +88,14 @@ pub struct TcpServeState {
     /// (UI replay) and a restarted daemon starts a fresh context.
     pub contexts:
         Mutex<std::collections::BTreeMap<String, Arc<Mutex<okra_compaction::SessionContext>>>>,
+    /// Rewind checkpoints (N0029): one manager per daemon, durable mirror
+    /// at `<cwd>/.okra/checkpoints.jsonl`, loaded at startup. Writes
+    /// record into the CURRENT session turn's checkpoint; `/api/rewind`
+    /// restores.
+    pub checkpoints: Arc<Mutex<okra_host::checkpoints::CheckpointManager>>,
+    /// Per-session turn ordinal (N0029): the prompt index checkpoints
+    /// key on. Sessions share the manager; the index is per session.
+    pub session_turns: Mutex<std::collections::BTreeMap<String, usize>>,
     /// Per-turn sampler source (`--provider openai` → real network model;
     /// default → offline demo planner).
     pub sampler_factory: SamplerFactory,
@@ -123,6 +131,13 @@ impl TcpServeState {
             sessions_dir: sessions_dir.clone(),
             capabilities: vec![],
         });
+        // N0029: the daemon-wide rewind manager — durable mirror under the
+        // workspace, loaded at startup so checkpoints survive restarts
+        let mirror = cwd.join(".okra").join("checkpoints.jsonl");
+        let mut checkpoint_mgr = okra_host::checkpoints::CheckpointManager::new(cwd.clone())
+            .with_durable_mirror(mirror.clone());
+        let _ = checkpoint_mgr.load_durable_mirror(mirror);
+        let checkpoints = Arc::new(Mutex::new(checkpoint_mgr));
         TcpServeState {
             cwd,
             sessions_dir,
@@ -141,6 +156,8 @@ impl TcpServeState {
             mcp_sessions: Mutex::new(BTreeMap::new()),
             computer_consent: Arc::new(Mutex::new(crate::serve::ComputerConsent::default())),
             contexts: Mutex::new(BTreeMap::new()),
+            checkpoints,
+            session_turns: Mutex::new(std::collections::BTreeMap::new()),
             sampler_factory,
             sampler_label,
             next_static: std::sync::atomic::AtomicU64::new(0),
@@ -621,6 +638,77 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
                 code,
                 "error",
                 serde_json::to_vec(&serde_json::json!({ "error": msg }))
+                    .unwrap_or_default()
+                    .as_slice(),
+            ),
+        };
+    }
+
+    // N0029: rewind the workspace to the start of a prompt — restores
+    // files (first-wins before-bytes), resets git to the captured HEAD
+    // when one exists, truncates the session's checkpoints + continuation
+    // context (the model does not remember post-rewind turns)
+    if method == "POST" && path == "/api/rewind" {
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 {
+            reader.read_exact(&mut body)?;
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        let Some(session) = parsed["sessionId"].as_str() else {
+            return write_http(
+                stream,
+                400,
+                "error",
+                br#"{"error":"sessionId required"}"#.as_slice(),
+            );
+        };
+        let prompt_index = parsed["promptIndex"].as_u64().unwrap_or(0) as usize;
+        // never rewind a session with a turn in flight
+        if state.running_turns.lock().unwrap().contains(session) {
+            return write_http(
+                stream,
+                409,
+                "error",
+                br#"{"error":"turn in flight; stop it before rewinding"}"#
+                    .as_slice(),
+            );
+        }
+        let repo = okra_host::git::GitRepository::open(&state.cwd).ok();
+        let result = state
+            .checkpoints
+            .lock()
+            .unwrap()
+            .restore_to(repo.as_ref(), prompt_index);
+        return match result {
+            Ok(report) => {
+                // model amnesia: the continuation context restarts (v1
+                // resets fully rather than slicing mid-context)
+                state.contexts.lock().unwrap().remove(session);
+                if let Some(turns) = state.session_turns.lock().unwrap().get_mut(session) {
+                    *turns = (*turns).min(prompt_index);
+                }
+                write_http(
+                    stream,
+                    200,
+                    "OK",
+                    serde_json::to_vec(&serde_json::json!({
+                        "sessionId": session,
+                        "promptIndex": prompt_index,
+                        "restoredFiles": report.restored,
+                        "recreatedFiles": report.recreated,
+                        "removedFiles": report.removed,
+                        "gitResetTo": report.git_reset_to,
+                    }))
+                    .unwrap_or_default()
+                    .as_slice(),
+                )
+            }
+            Err(e) => write_http(
+                stream,
+                422,
+                "error",
+                serde_json::to_vec(&serde_json::json!({ "error": e.to_string() }))
                     .unwrap_or_default()
                     .as_slice(),
             ),
@@ -1403,6 +1491,14 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
             Arc::new(Mutex::new(okra_compaction::SessionContext::default()))
         }))
     };
+    // n0029: this session's next turn ordinal (the checkpoint prompt index)
+    let turn_ordinal = {
+        let mut turns = state.session_turns.lock().unwrap();
+        let next = turns.get(&session_id).copied().unwrap_or(0);
+        turns.insert(session_id.clone(), next + 1);
+        next
+    };
+    let checkpoints = Arc::clone(&state.checkpoints);
     // spawn the turn: projections broadcast to ALL surfaces (NDJSON + SSE)
     let state2 = Arc::clone(state);
     let turn_session = session_id.clone();
@@ -1410,6 +1506,7 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
     let turn_cwd = state.cwd.clone();
     let turn_sdir = state.sessions_dir.clone();
     let factory = Arc::clone(&state.sampler_factory);
+    let turn_checkpoints = Arc::clone(&checkpoints);
     std::thread::spawn(move || {
         // worklist: every entry (the original send + each steered input)
         // becomes its OWN turn, carrying its own attachments
@@ -1436,6 +1533,8 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
                 &state2.mcp_sessions,
                 &state2.computer_consent,
                 Some(Arc::clone(&session_ctx)),
+                Some(Arc::clone(&turn_checkpoints)),
+                turn_ordinal,
             );
             let queued: Vec<crate::serve::SteeredInput> = {
                 let mut q = steer_queue.lock().unwrap(); q.drain(..).collect()

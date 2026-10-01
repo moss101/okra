@@ -61,7 +61,19 @@ pub fn openai_sampler_factory(model: String) -> Result<SamplerFactory, String> {
 /// The serve tool plane: the same four-tool registry the CLI runs
 /// (read_file/list_dir/write_file/edit_file) — the web surface drives the
 /// real toolchain, not a read-only subset.
+///
+/// `checkpoints` (N0029): when present, write_file/edit_file record
+/// before/after bytes into the rewind checkpoint for `prompt_index` —
+/// the G3 "rewind restores a scratched refactor" seam.
 pub fn build_registry(cwd: &Path) -> Registry {
+    build_registry_with_checkpoints(cwd, None, 0)
+}
+
+pub fn build_registry_with_checkpoints(
+    cwd: &Path,
+    checkpoints: Option<std::sync::Arc<Mutex<okra_host::checkpoints::CheckpointManager>>>,
+    prompt_index: usize,
+) -> Registry {
     let mut registry = Registry::new();
     let rf = okra_tools::builtins::read_file_tool(cwd.to_path_buf());
     let entry = rf.entry();
@@ -84,17 +96,42 @@ pub fn build_registry(cwd: &Path) -> Registry {
             move |args| ld.execute(args),
         ))
         .expect("list_dir registers once");
+
+    // checkpoint-capturing wrappers: read the bytes before, run the real
+    // tool, read after — recording only files inside the workspace
+
     let wf = okra_tools::builtins::ErasedWriteFile::new(cwd.to_path_buf());
     let entry = wf.entry();
+    let wf_ck = checkpoints.clone();
+    let wf_cwd = cwd.to_path_buf();
     registry
         .register(okra_tools::ErasedTool::simple(
             entry,
             vec![okra_tools::ResourceAccess::write_file("*")],
-            move |args| wf.execute(args),
+            move |args| {
+                let rel = rel_under(&wf_cwd, args["path"].as_str().unwrap_or_default());
+                let before = rel.as_ref().and_then(|r| std::fs::read(wf_cwd.join(r)).ok());
+                let result = wf.execute(args);
+                let after = rel.as_ref().and_then(|r| std::fs::read(wf_cwd.join(r)).ok());
+                if let Some(rel) = rel
+                    && let Some(mgr) = wf_ck.as_ref()
+                    && let Ok(mut mgr) = mgr.lock()
+                {
+                    let _ = mgr.record_operation(
+                        prompt_index,
+                        &rel,
+                        before.as_deref(),
+                        after.as_deref(),
+                    );
+                }
+                result
+            },
         ))
         .expect("write_file registers once");
     let ef = okra_tools::builtins::ErasedEditFile::new(cwd.to_path_buf());
     let entry = ef.entry();
+    let ef_ck = checkpoints.clone();
+    let ef_cwd = cwd.to_path_buf();
     registry
         .register(okra_tools::ErasedTool::simple(
             entry,
@@ -102,10 +139,41 @@ pub fn build_registry(cwd: &Path) -> Registry {
                 okra_tools::FileAccessOperation::Readwrite,
                 "*",
             )],
-            move |args| ef.execute(args),
+            move |args| {
+                let rel = rel_under(&ef_cwd, args["path"].as_str().unwrap_or_default());
+                let before = rel.as_ref().and_then(|r| std::fs::read(ef_cwd.join(r)).ok());
+                let result = ef.execute(args);
+                let after = rel.as_ref().and_then(|r| std::fs::read(ef_cwd.join(r)).ok());
+                if let Some(rel) = rel
+                    && let Some(mgr) = ef_ck.as_ref()
+                    && let Ok(mut mgr) = mgr.lock()
+                {
+                    let _ = mgr.record_operation(
+                        prompt_index,
+                        &rel,
+                        before.as_deref(),
+                        after.as_deref(),
+                    );
+                }
+                result
+            },
         ))
         .expect("edit_file registers once");
     registry
+}
+
+/// Workspace-relative form of a tool path (None = outside/empty — those
+/// are the tool's own refusal cases, nothing to checkpoint).
+fn rel_under(cwd: &Path, path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    let p = Path::new(path);
+    let joined = if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
+    joined
+        .strip_prefix(cwd)
+        .ok()
+        .map(|r| r.to_string_lossy().into_owned())
 }
 
 /// The non-essential ToolSpec fields for ask_user (the meaningful ones
@@ -1524,6 +1592,8 @@ pub fn run_turn_streaming(
     mcp_sessions: &Mutex<std::collections::BTreeMap<String, Arc<Mutex<okra_tools::McpClient>>>>,
     computer_consent: &ComputerConsentHandle,
     session_context: Option<Arc<Mutex<okra_compaction::SessionContext>>>,
+    checkpoints: Option<Arc<Mutex<okra_host::checkpoints::CheckpointManager>>>,
+    prompt_index: usize,
 ) -> Result<TurnOutcome, String> {
     let steering_rx = steering;
     // attachments fold BEFORE anything surfaces: model-visible means
@@ -1571,7 +1641,13 @@ pub fn run_turn_streaming(
 
     // 2. build the agent (full CLI tool plane + policy ceiling, sampler
     // from the state's factory — real provider when `--provider` was given)
-    let mut registry = build_registry(&cwd);
+    // N0029: writes capture into this prompt's rewind checkpoint
+    if let Some(mgr) = checkpoints.as_ref()
+        && let Ok(mut mgr) = mgr.lock()
+    {
+        mgr.begin_prompt(prompt_index);
+    }
+    let mut registry = build_registry_with_checkpoints(&cwd, checkpoints.clone(), prompt_index);
     // N0019: probed MCP tools join the turn (approval-gated: unknown
     // side-effectors); N0020: ask_user joins ATTENDED surfaces only (an
     // unattended bridge would block the turn forever).
@@ -1794,6 +1870,9 @@ pub fn run_turn_streaming(
     let sampler = (sampler_factory)();
     let mut agent = Agent::new(config, sampler, Box::new(executor), kernel_session);
     agent.set_stop_flag(stop);
+    // one Agent per turn on a shared kernel session: seed the counter so
+    // turn/start (and replay's row numbering) stays monotonic per session
+    agent.set_turn_counter(prompt_index as u64);
 
     // 3. drive the turn, streaming LoopEvents into rows
     let topic_for_events = topic.clone();
@@ -2027,6 +2106,14 @@ pub fn run_turn_streaming(
     wd_done.store(true, Ordering::Relaxed);
     let _ = wd_handle.join();
     fwd_done.store(true, Ordering::Relaxed);
+    // N0029: finalize this prompt's rewind checkpoint — the git HEAD at
+    // turn end is what restore_to resets to; outside a repo it is FS-only
+    if let Some(mgr) = checkpoints.as_ref()
+        && let Ok(mut mgr) = mgr.lock()
+    {
+        let repo = okra_host::git::GitRepository::open(&cwd).ok();
+        let _ = mgr.finalize_prompt(prompt_index, None, repo.as_ref());
+    }
     // session lock: this session's turn is over — the computer is free
     computer_consent
         .lock()
@@ -3138,6 +3225,8 @@ pub fn serve_stdio(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) ->
                             &Mutex::new(std::collections::BTreeMap::new()),
                             &Arc::new(Mutex::new(ComputerConsent::default())),
                             Some(session_ctx),
+                            None,
+                            0,
                         ) {
                             outbound.notification(
                                 "v4/error",

@@ -464,6 +464,13 @@ impl<S: Sampler + ?Sized> Agent<S> {
         self.stop = flag;
     }
 
+    /// Seed the turn counter (surfaces that rebuild an Agent per turn on
+    /// one kernel session pass their own ordinal so `turn/start` stays
+    /// monotonic across turns — replay keys rows off it).
+    pub fn set_turn_counter(&mut self, n: u64) {
+        self.turn_counter = n;
+    }
+
     /// Hook (#45) telemetry from the executor: (events fired, failures).
     pub fn hook_stats(&self) -> (u64, u64) {
         self.executor.hook_stats()
