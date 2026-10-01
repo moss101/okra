@@ -8,6 +8,7 @@
 //! - scripted model stub with fault injection (delay, truncate) for the
 //!   killAtPhase harness (`sampler.rs`, §3 #63)
 
+pub mod embeddings;
 pub mod messages;
 pub mod jev;
 pub mod openai;

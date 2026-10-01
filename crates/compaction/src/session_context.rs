@@ -308,6 +308,19 @@ impl SessionContext {
         self.refresh_world_head();
     }
 
+    /// Prompt-relevant suggestion (M5 embedding retrieval): the skill is
+    /// surfaced as RELEVANT — distinct from path-conditional ACTIVE, so
+    /// the model can tell "you touched matching files" from "the ask
+    /// resembles this skill".
+    pub fn suggest_skill(&mut self, name: &str, note: &str) {
+        self.world.set(
+            Section::Skills,
+            name,
+            format!("RELEVANT — {note}"),
+        );
+        self.refresh_world_head();
+    }
+
     /// Set the disclosure-layer-1 skill index text (head fold).
     pub fn set_skill_index(&mut self, index: &str) {
         self.skill_index = Some(index.to_string());

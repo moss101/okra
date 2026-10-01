@@ -1,0 +1,120 @@
+//! Embeddings client (M5 retrieval's network tier): OpenAI-compatible
+//! `POST /v1/embeddings` over the same ureq/rustls client shape as the
+//! chat provider (`openai.rs`); env and error taxonomy shared with it.
+//! The offline tier lives in `okra-memory::retrieval` — this client is
+//! optional, never a dependency of correctness.
+
+use crate::openai::OpenAiConfig;
+use crate::sampler::SamplerError;
+
+pub struct EmbeddingClient {
+    config: OpenAiConfig,
+}
+
+impl EmbeddingClient {
+    /// None when no credential exists (the offline tier takes over —
+    /// absence is not an error).
+    pub fn from_env(model: impl Into<String>) -> Option<Self> {
+        OpenAiConfig::from_env(model).map(|config| EmbeddingClient { config })
+    }
+
+    pub fn with_config(config: OpenAiConfig) -> Self {
+        EmbeddingClient { config }
+    }
+
+    pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, SamplerError> {
+        let url = format!("{}/embeddings", self.config.base_url.trim_end_matches('/'));
+        let body = serde_json::json!({
+            "model": self.config.model,
+            "input": texts,
+        });
+        // the same agent shape as the chat provider (timeout-scoped,
+        // rustls via the workspace ureq)
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(self.config.timeout_secs))
+            .build();
+        let mut req = agent
+            .post(&url)
+            .set("content-type", "application/json")
+            .set("authorization", &format!("Bearer {}", self.config.api_key));
+        for (k, v) in &self.config.extra_headers {
+            req = req.set(k, v);
+        }
+        let payload = serde_json::to_string(&body).unwrap_or_default();
+        let resp = req
+            .send_string(&payload)
+            .map_err(|e| SamplerError::Transient(e.to_string()))?;
+        match resp.status() {
+            200..=299 => {}
+            401 => return Err(SamplerError::Unauthorized),
+            429 => return Err(SamplerError::RateLimited { retry_after_secs: None }),
+            _ => return Err(SamplerError::Permanent(format!("embeddings: {}", resp.status()))),
+        }
+        let parsed: serde_json::Value = resp
+            .into_json()
+            .map_err(|e| SamplerError::Permanent(format!("embeddings decode: {e}")))?;
+        let mut out = Vec::new();
+        let Some(data) = parsed["data"].as_array() else {
+            return Err(SamplerError::Permanent("embeddings: no data array".into()));
+        };
+        for item in data {
+            let Some(vector) = item["embedding"].as_array() else {
+                return Err(SamplerError::Permanent("embeddings: missing vector".into()));
+            };
+            let v: Vec<f32> = vector
+                .iter()
+                .filter_map(|x| x.as_f64().map(|f| f as f32))
+                .collect();
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let v = if norm > 0.0 { v.iter().map(|x| x / norm).collect() } else { v };
+            out.push(v);
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    fn spawn_mock_server(response: &'static str) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line); // request line
+                let _ = reader.read_line(&mut line); // host
+                let _ = reader.read_line(&mut line); // content-type
+                let _ = reader.read_line(&mut line); // auth
+                let _ = reader.read_line(&mut line); // blank
+                let mut body = String::new();
+                let _ = reader.read_line(&mut body);
+                let mut stream = stream;
+                let _ = writeln!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", response.len(), response);
+            }
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    #[test]
+    fn embeds_and_normalizes() {
+        // two near-orthogonal unit vectors, pre-normalized by the server
+        let response = r#"{"data":[{"embedding":[3.0,0.0,0.0]},{"embedding":[0.0,5.0,0.0]}]}"#;
+        let (base, _server) = spawn_mock_server(response);
+        let client = EmbeddingClient::with_config(OpenAiConfig {
+            base_url: format!("{base}/v1"),
+            api_key: "test".into(),
+            model: "text-embedding-3-small".into(),
+            timeout_secs: 5,
+            extra_headers: vec![],
+        });
+        let vectors = client.embed(&["hello", "world"]).unwrap();
+        assert_eq!(vectors.len(), 2);
+        assert!((vectors[0][0] - 1.0).abs() < 1e-5, "normalized: {:?}", vectors[0]);
+        assert!((vectors[1][1] - 1.0).abs() < 1e-5, "normalized: {:?}", vectors[1]);
+    }
+}

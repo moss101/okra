@@ -2171,6 +2171,27 @@ pub fn run_turn_streaming(
         );
         let skill_catalog =
             okra_memory::SkillCatalog::load_dir(&cwd.join(".okra").join("skills"));
+        // n0035: prompt-relevant skill retrieval (embedding tier). Offline
+        // hashed embeddings by default — deterministic, keyless; the
+        // network tier engages with OKRA_EMBEDDINGS=on + a credential and
+        // falls back offline on any error (retrieval must never fail a
+        // turn). Suggestions are distinct from path-conditional
+        // activations (RELEVANT vs ACTIVE in the head).
+        let relevant_skills: Vec<(String, f32)> = {
+            let items: Vec<(String, String)> = skill_catalog
+                .skills
+                .iter()
+                .map(|s| {
+                    (
+                        s.name.clone(),
+                        format!("{} {}", s.description, s.match_patterns.join(" ")),
+                    )
+                })
+                .collect();
+            let index = okra_memory::retrieval::EmbeddingIndex::build_offline(items);
+            let query = okra_memory::retrieval::EmbeddingIndex::offline_query(&input_text);
+            index.rank(&query, 3)
+        };
         let mut handle_ev = |ev: LoopEvent| {
             let mut p = row_lock.lock().unwrap();
         match ev {
@@ -2253,6 +2274,13 @@ pub fn run_turn_streaming(
         match session_context {
             Some(ctx_lock) => {
                 let mut ctx = ctx_lock.lock().unwrap();
+                for (name, score) in &relevant_skills {
+                    let digest = skill_catalog
+                        .full_body(name)
+                        .and_then(|body| body.lines().next().map(str::to_string))
+                        .unwrap_or_default();
+                    ctx.suggest_skill(name, &format!("({:.2}) {}", score, digest));
+                }
                 agent.run_turn_continuation(
                     &mut ctx,
                     &okra_compaction::ScriptedCompactor,
