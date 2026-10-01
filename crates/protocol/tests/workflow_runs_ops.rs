@@ -92,9 +92,9 @@ fn unknown_run_with_complete_header_is_born_canonical() {
         wire(&state),
         concat!(
             r#"{"revision":7,"runs":[{"runId":"r1","status":"running","#,
-            r#""usage":{"nodesUsed":2,"spentTokens":0},"#,
-            r#""actors":[{"siteId":"a","ordinal":0,"name":"reader","status":"running"}],"#,
-            r#""nodes":[{"siteId":"n","ordinal":0,"kind":"ask","phase":"queued"}],"#,
+            r#""usage":{"spentTokens":0,"nodesUsed":2},"#,
+            r#""actors":[{"siteId":"a","ordinal":0,"status":"running","name":"reader"}],"#,
+            r#""nodes":[{"siteId":"n","ordinal":0,"phase":"queued","kind":"ask"}],"#,
             r#""lastEventSequence":3}]}"#
         )
     );

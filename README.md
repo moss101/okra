@@ -54,7 +54,19 @@ M3  host services + alpha       ◐ strangler: SQLite session/task index
                                   (three-valued entitlement, envelope
                                   contract, ensure flow), Claude/Gemini
                                   plugin converters (#46 CLOSED — data-only,
-                                  fail-closed path handling); G2 live PASSED vs a real
+                                  fail-closed path handling); Rhai workflow
+                                  ENGINE live (n0030: step seam, budget-
+                                  honest cancellation, journal-first;
+                                  steps run as full child turns via
+                                  `okra workflow run`) + workflowRun.*
+                                  protocol ops (n0032, differential-
+                                  validated byte-identical vs the TS
+                                  donor) + validation passes (n0036:
+                                  taint + causality, pre-run); REWIND over
+                                  the wire (n0029: writes capture
+                                  checkpoints, `POST /api/rewind`
+                                  restores files+git+context, workbench
+                                  button); G2 live PASSED vs a real
                                   network model (glm-5.3-flash) INCLUDING
                                   the FULL 100-turn / 1,352-read live
                                   profile: flat context (peak 19.9k ≤ 20k),
@@ -98,7 +110,27 @@ M4  surfaces                  ◐ NDJSON two-surface + cross-surface steering,
                                   user-armed environment per N0007)
                                   + **leader/roster** (one leader per daemon,
                                   term-bumped claims, `roster/claim`).
-M5  differentiators ◐ (subagent kernel isolation)
+                                  **TUI pager** (n0031: `okra tui` — ratatui
+                                  block scrollback with scroll-lock over
+                                  real turns; `--minimal` plain mode).
+                                  **Mediation live** (n0033: first-responder/
+                                  designated/consensus/local-only over
+                                  scoped clients, `--mediation` flag,
+                                  fail-closed). **Sessions page** (n0038:
+                                  full-canvas searchable sessions surface —
+                                  a peer of the transcript, Devin-style).
+M5  differentiators ✔ in-turn `subagent` tool (n0034: REAL git worktree,
+                                  confined child turn, inherit-nothing,
+                                  grants never inherited, work collected
+                                  on a branch — G5 isolation as a tool the
+                                  model calls); embedding-based skill
+                                  retrieval (n0035: two-tier, offline
+                                  hashed default + OpenAI-compatible
+                                  network tier, RELEVANT vs ACTIVE);
+                                  workflow validation passes (n0036);
+                                  computer control as a standalone MCP
+                                  server (n0037: `okra mcp-serve --computer`,
+                                  consent from launch config, fail-closed)
 M6  scale                      ◐ i18n slice: daemon-side en-US/zh-CN catalog
                                   domain (locale negotiation, fallback chain,
                                   interpolation; the UI catalog stays in the
@@ -116,7 +148,12 @@ M6  scale                      ◐ i18n slice: daemon-side en-US/zh-CN catalog
                                   refuses non-allowlisted providers before
                                   any model call (fail-closed pins apply
                                   read-only confinement); serve --tcp
-                                  refuses denied providers at startup
+                                  refuses denied providers at startup;
+                                  macOS→msvc cross-check attempted +
+                                  documented (n0039: blocked at the
+                                  rustls/aws-lc-rs C toolchain — the
+                                  armed windows.yml runner stays the
+                                  gate)
 ```
 
 
@@ -134,8 +171,14 @@ completed (16 steps, 15k tokens). Both fixable day-1 findings were
 closed same day (write mode preservation `282e511`; harness wc-padding
 `3e0b011`). Day-1 artifacts remain banked in `docs/dogfood/` and the
 journal; the harness (`scripts/dogfood-log.sh`) is ready for the
-restart. Priority shifts to completing the app: M1 sandbox vendoring +
-real providers, M4 TUI, M5 differentiators, M6 remainder.
+restart. **App-completion pass (2026-10-01, n0028–n0039):** the
+then-pending engineering items closed — skills/memory wired into every
+surface, Rhai workflow engine + workflowRun ops + validation, rewind
+over the wire, the TUI pager, live mediation, the in-turn subagent
+tool, embedding retrieval, the standalone computer MCP server, the
+sessions page, and the Windows cross-check documented. Dogfooding
+restart is the user's call per the original decision (it needs their
+credentials and daily usage).
 
 ## Real-Zed ACP drive (2026-09-27)
 

@@ -7,7 +7,10 @@ description = "zcode-protocol-v4 port: wire frames, delivery profiles, delta ops
 
 [dependencies]
 serde = { workspace = true }
-serde_json = { workspace = true }
+# preserve_order: the daemon graph gets it via nono anyway — pinning it
+# here makes the crate behave identically standalone (the workflowRun
+# byte contract depends on map order, so it must not be ambient)
+serde_json = { workspace = true, features = ["preserve_order"] }
 thiserror = { workspace = true }
 
 [dev-dependencies]

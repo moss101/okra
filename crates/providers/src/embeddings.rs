@@ -76,25 +76,45 @@ impl EmbeddingClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
 
     fn spawn_mock_server(response: &'static str) -> (String, std::thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // robust request read: consume headers + declared content-length
+        // (same pattern as openai.rs's LocalServer — fixed line counts
+        // break when the client's header set shifts between builds)
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
-            if let Ok((stream, _)) = listener.accept() {
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut line = String::new();
-                let _ = reader.read_line(&mut line); // request line
-                let _ = reader.read_line(&mut line); // host
-                let _ = reader.read_line(&mut line); // content-type
-                let _ = reader.read_line(&mut line); // auth
-                let _ = reader.read_line(&mut line); // blank
-                let mut body = String::new();
-                let _ = reader.read_line(&mut body);
-                let mut stream = stream;
-                let _ = writeln!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", response.len(), response);
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 16384];
+                let mut raw = Vec::new();
+                loop {
+                    let n = match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    raw.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&raw).into_owned();
+                    if let Some(hend) = text.find("\r\n\r\n") {
+                        let declared = text[..hend]
+                            .lines()
+                            .find(|l| l.to_lowercase().starts_with("content-length:"))
+                            .and_then(|l| l.split(':').nth(1))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if raw.len() >= hend + 4 + declared {
+                            break;
+                        }
+                    }
+                }
+                let http = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                );
+                let _ = stream.write_all(http.as_bytes());
+                let _ = stream.flush();
             }
         });
         (format!("http://{}", addr), handle)
