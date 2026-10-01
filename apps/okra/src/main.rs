@@ -21,6 +21,7 @@ mod tui_app;
 mod mcp_serve;
 mod workflow_cli;
 mod workflow_gate;
+mod tui_surface;
 mod workflow_serve;
 
 use std::io::Write;
@@ -353,15 +354,50 @@ fn main() {
         let mut provider = None;
         let mut model = None;
         let mut cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        // n0042: the TUI as a daemon SURFACE — attach to a live session
+        // (see + steer + approve); --smoke drives it headless for CI
+        let mut attach: Option<String> = None;
+        let mut session: Option<String> = None;
+        let mut smoke_prompt: Option<String> = None;
+        let mut deny_approvals = false;
         let mut i = 1;
         while i < argv.len() {
             match argv[i].as_str() {
                 "--cwd" => { i += 1; cwd = argv.get(i).cloned().map(PathBuf::from).unwrap_or(cwd); }
                 "--provider" => { i += 1; provider = argv.get(i).cloned(); }
                 "--model" => { i += 1; model = argv.get(i).cloned(); }
+                "--attach" => { i += 1; attach = argv.get(i).cloned(); }
+                "--session" => { i += 1; session = argv.get(i).cloned(); }
+                "--smoke" => { i += 1; smoke_prompt = argv.get(i).cloned(); }
+                "--deny-approvals" => deny_approvals = true,
                 other => { eprintln!("error: unknown tui flag {other}"); std::process::exit(2); }
             }
             i += 1;
+        }
+        let _ = &cwd;
+        if let Some(addr) = attach {
+            match tui_surface::SurfaceClient::attach(&addr, session.as_deref()) {
+                Ok(mut client) => {
+                    if let Some(prompt) = smoke_prompt {
+                        // headless drive: render + approve + complete, print
+                        match client.smoke(&prompt, deny_approvals, std::time::Duration::from_secs(60)) {
+                            Ok(()) => {
+                                for line in client.scrollback.lines() {
+                                    println!("{}", line.text);
+                                }
+                                std::process::exit(0);
+                            }
+                            Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
+                        }
+                    }
+                    if let Err(e) = tui_app::run_tui_attached(client) {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                    std::process::exit(0);
+                }
+                Err(e) => { eprintln!("error: attach: {e}"); std::process::exit(1); }
+            }
         }
         if let Err(e) = tui_app::run_tui(cwd, provider, model) {
             eprintln!("error: {e}");

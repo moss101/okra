@@ -233,3 +233,49 @@ mod tests {
         assert_eq!(sb.viewport(1).last().map(|l| l.text.as_str()), Some("▸ c"));
     }
 }
+
+impl Scrollback {
+    /// Replace the last line of `kind` (push if the tail differs) — the
+    /// attach-surface rendering path: a streaming assistant row arrives
+    /// as a full-text projection each revision, so the live line is
+    /// REPLACED, never re-appended (the delta path coalesces instead).
+    pub fn set_last_line(&mut self, kind: LineKind, text: &str) {
+        if let Some(last) = self.lines.last_mut()
+            && last.kind == kind
+        {
+            last.text = text.to_string();
+        } else {
+            self.push(kind, text);
+        }
+    }
+
+    /// Append one pre-rendered line (projection rows rendered through
+    /// `crate::projection_row_line`).
+    pub fn push_line(&mut self, kind: LineKind, text: &str) {
+        self.push(kind, text);
+    }
+}
+
+#[cfg(test)]
+mod attach_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn streaming_rows_replace_the_live_line() {
+        let mut sb = Scrollback::new();
+        sb.set_last_line(LineKind::Assistant, "partial");
+        sb.set_last_line(LineKind::Assistant, "partial text");
+        sb.set_last_line(LineKind::Assistant, "partial text done");
+        let texts: Vec<&str> = sb.lines().iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["partial text done"], "one mutating line, no duplicates");
+        // a tool card after it starts a new line
+        sb.set_last_line(LineKind::Tool, "▸ read_file");
+        assert_eq!(sb.lines().len(), 2);
+        // and a new assistant row pushes, not clobbers the tool line
+        sb.set_last_line(LineKind::Assistant, "answer");
+        assert_eq!(sb.lines().len(), 3);
+        assert_eq!(sb.lines().last().map(|l| l.text.as_str()), Some("answer"));
+        let _ = json!({}); // keep the json import pattern honest for future feed tests
+    }
+}

@@ -33,15 +33,29 @@ pub struct Mediator {
     /// The `designated` policy's chosen client id.
     pub designated: Option<String>,
     pub clients: Vec<Client>,
+    /// Live-attachment probe (n0042): answers whether a client id is
+    /// currently attached. When present and the DESIGNATED client is not
+    /// attached, the ask answers NOTHING — the designation names a real
+    /// surface, not a hope. `Send + Sync` so a daemon can consult its
+    /// surface registry from the turn thread.
+    pub attached_probe: Option<AttachedProbe>,
 }
+
+/// Live-attachment probe: is a client id currently attached?
+pub type AttachedProbe = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 impl Mediator {
     pub fn new(policy: MediationPolicy) -> Self {
-        Mediator { policy, designated: None, clients: Vec::new() }
+        Mediator { policy, designated: None, clients: Vec::new(), attached_probe: None }
     }
 
     pub fn with_designated(mut self, id: &str) -> Self {
         self.designated = Some(id.to_string());
+        self
+    }
+
+    pub fn with_attached_probe(mut self, probe: AttachedProbe) -> Self {
+        self.attached_probe = Some(probe);
         self
     }
 
@@ -63,6 +77,14 @@ impl ApprovalChannel for Mediator {
                 .find_map(|c| c.channel.answer(request)),
             MediationPolicy::Designated => {
                 let designated = self.designated.as_deref()?;
+                // the designation must name a LIVE surface: absent → the
+                // ask falls through the waterfall (unavailable → deny),
+                // never silently answered by someone else
+                if let Some(probe) = &self.attached_probe
+                    && !probe(designated)
+                {
+                    return None;
+                }
                 self.clients
                     .iter()
                     .find(|c| c.id == designated)?
@@ -157,6 +179,29 @@ mod tests {
         m2.add_client("workbench", true, Scripted::allow());
         m2.add_client("editor", false, Scripted::silent());
         assert_eq!(m2.answer(&req()), None, "missing designation never falls back to another client");
+    }
+
+    #[test]
+    fn designated_with_an_absent_surface_answers_nothing_even_with_the_bridge_attached() {
+        // the probe says the designated surface is NOT live → no verdict,
+        // even though the bridge channel would happily answer
+        let mut m = Mediator::new(MediationPolicy::Designated)
+            .with_designated("workbench")
+            .with_attached_probe(Arc::new(|id| id != "workbench"));
+        m.add_client("workbench", true, Scripted::allow());
+        assert_eq!(m.answer(&req()), None);
+
+        // probe says live → the bridge answers
+        let mut live = Mediator::new(MediationPolicy::Designated)
+            .with_designated("workbench")
+            .with_attached_probe(Arc::new(|id| id == "workbench"));
+        live.add_client("workbench", true, Scripted::allow());
+        assert_eq!(live.answer(&req()), Some(O::AllowedOnce));
+
+        // no probe configured: the static behavior stands (back-compat)
+        let mut noprobe = Mediator::new(MediationPolicy::Designated).with_designated("workbench");
+        noprobe.add_client("workbench", true, Scripted::allow());
+        assert_eq!(noprobe.answer(&req()), Some(O::AllowedOnce));
     }
 
     #[test]

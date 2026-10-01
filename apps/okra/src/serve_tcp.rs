@@ -55,7 +55,7 @@ pub struct TcpServeState {
     pub writers: Mutex<Vec<SurfaceWriter>>,
     /// G4 bookkeeping: every attached surface is registered here with a
     /// kind + capabilities, heartbeated per frame, and detached on exit.
-    pub surfaces: Mutex<okra_host::surfaces::SurfaceRegistry>,
+    pub surfaces: Arc<Mutex<okra_host::surfaces::SurfaceRegistry>>,
     /// Cross-session pub/sub: one session publishes, others poll.
     pub bus: Mutex<okra_host::broadcast::BroadcastBus>,
     /// Sessions with a live turn thread (G4 breadth): a command on a
@@ -154,7 +154,7 @@ impl TcpServeState {
             sessions: Mutex::new(BTreeMap::new()),
             steering: Mutex::new(BTreeMap::new()),
             writers: Mutex::new(Vec::new()),
-            surfaces: Mutex::new(okra_host::surfaces::SurfaceRegistry::new()),
+            surfaces: Arc::new(Mutex::new(okra_host::surfaces::SurfaceRegistry::new())),
             bus: Mutex::new(okra_host::broadcast::BroadcastBus::new(256)),
             running_turns: Mutex::new(std::collections::BTreeSet::new()),
             stop_flags: Mutex::new(BTreeMap::new()),
@@ -1471,6 +1471,27 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
 
     // ---- resolveApproval: answer the ask the workbench is showing ----
     if cmd_type == "resolveApproval" {
+        // n0042 mediation gate: under the designated policy, resolutions
+        // only count when the designated surface is LIVE — an NDJSON
+        // client cannot click-approve around a browser designation
+        let (policy, designated) = state.mediation.clone();
+        if policy == okra_policy::lattice::MediationPolicy::Designated
+            && designated.as_deref() == Some("workbench")
+            && !state
+                .surfaces
+                .lock()
+                .map(|r| r.has_kind(okra_host::surfaces::SurfaceKind::Browser))
+                .unwrap_or(false)
+        {
+            eprintln!("[serve-tcp] resolveApproval REFUSED: designated surface (workbench) not attached");
+            return serde_json::json!({
+                "commandId": command_id,
+                "status": "rejected",
+                "reasonCode": "okra.mediation.designatedAbsent",
+                "message": "designated client (workbench) is not attached; its approvals cannot be answered by another surface",
+                "revisionAtDecision": 0,
+            });
+        }
         let approval_id = envelope["payload"]["approvalId"].as_str().unwrap_or_default();
         let allow = envelope["payload"]["decision"].as_str() == Some("allow");
         let resolved = state
@@ -1622,6 +1643,27 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
     let turn_checkpoints = Arc::clone(&checkpoints);
     let mediation = state.mediation.clone();
     let subagent_provider = state.subagent_provider.clone();
+    // n0042: the designated policy consults LIVE attachment — the probe
+    // maps the client id to the surface registry ("workbench" = Browser)
+    let mediation_probe: Option<okra_policy::mediation::AttachedProbe> =
+        if mediation.0 == okra_policy::lattice::MediationPolicy::Designated {
+            let reg = Arc::clone(&state.surfaces);
+            Some(Arc::new(move |id: &str| {
+                if id != "workbench" {
+                    // unknown designations get the conservative answer:
+                    // attached unless the registry says otherwise
+                    return true;
+                }
+                let attached = reg
+                    .lock()
+                    .map(|r| r.has_kind(okra_host::surfaces::SurfaceKind::Browser))
+                    .unwrap_or(false);
+                eprintln!("[mediation-probe] workbench attached={attached}");
+                attached
+            }))
+        } else {
+            None
+        };
     std::thread::spawn(move || {
         // worklist: every entry (the original send + each steered input)
         // becomes its OWN turn, carrying its own attachments
@@ -1651,6 +1693,7 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
                 Some(Arc::clone(&turn_checkpoints)),
                 turn_ordinal,
                 mediation.clone(),
+                mediation_probe.clone(),
                 subagent_provider.clone(),
             );
             let queued: Vec<crate::serve::SteeredInput> = {

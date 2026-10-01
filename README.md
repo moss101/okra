@@ -127,6 +127,18 @@ M4  surfaces                  ◐ NDJSON two-surface + cross-surface steering,
                                   fail-closed). **Sessions page** (n0038:
                                   full-canvas searchable sessions surface —
                                   a peer of the transcript, Devin-style).
+                                  **TUI as a daemon SURFACE** (n0042:
+                                  `okra tui --attach` — see + steer +
+                                  y/n-approve a LIVE session over the
+                                  v4 NDJSON protocol, scroll-locked;
+                                  `--smoke` drives it headless for CI;
+                                  late subscribers see replayed rows).
+                                  **Designated mediation DIVERGES**
+                                  (n0042: live-attachment probe — no
+                                  browser, no approvals, and
+                                  resolveApproval refused with
+                                  okra.mediation.designatedAbsent;
+                                  e2e-proven both ways).
                                   #56 headless set COMPLETE (n0040:
                                   --json-schema contract, --tools globs,
                                   --worktree runs in a REAL created

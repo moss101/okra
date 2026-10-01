@@ -363,3 +363,130 @@ fn draw(
     );
     frame.render_widget(Paragraph::new(format!(" ❯ {input}")), *composer_area);
 }
+
+/// The attached pager (n0042): the scrollback is the daemon's live
+/// projection for one session — the composer SENDS or STEERS, y/n
+/// resolves the pending approval, Ctrl-C stops the live turn.
+pub fn run_tui_attached(mut client: crate::tui_surface::SurfaceClient) -> Result<(), String> {
+    let _guard = TuiGuard::enter().map_err(|e| format!("terminal setup: {e}"))?;
+    let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
+    let mut terminal = ratatui::Terminal::new(backend).map_err(|e| format!("terminal: {e}"))?;
+    let mut input = String::new();
+    let mut quit = false;
+
+    while !quit {
+        client.poll();
+        let height = {
+            let h = terminal.size().map(|s| s.height).unwrap_or(24);
+            h.saturating_sub(2) as usize
+        };
+        terminal
+            .draw(|frame| draw_attached(frame, &client, &input, height))
+            .map_err(|e| format!("draw: {e}"))?;
+
+        if crossterm::event::poll(Duration::from_millis(30)).unwrap_or(false) {
+            let Ok(Event::Key(key)) = crossterm::event::read() else { continue };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match (key.code, key.modifiers) {
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                    if client.phase == "running" || client.phase == "awaitingApproval" {
+                        let _ = client.stop();
+                    } else {
+                        quit = true;
+                    }
+                }
+                (KeyCode::Char('d'), KeyModifiers::CONTROL) => quit = true,
+                (KeyCode::Enter, _) => {
+                    let text = input.trim().to_string();
+                    if !text.is_empty() {
+                        input.clear();
+                        let _ = client.send_text(&text);
+                    }
+                }
+                (KeyCode::Backspace, _) => {
+                    input.pop();
+                }
+                (KeyCode::Char(ch), m) if m.is_empty() || m == KeyModifiers::SHIFT => {
+                    // y/n resolve the pending approval when the composer
+                    // is empty (type normally otherwise)
+                    if input.is_empty()
+                        && (ch == 'y' || ch == 'n')
+                        && let Some((id, _)) = client.awaiting_approval.clone()
+                    {
+                        let _ = client.resolve_approval(&id, ch == 'y');
+                    } else {
+                        input.push(ch);
+                    }
+                }
+                (KeyCode::PageUp, _) => client.scrollback.scroll_up(height / 2, height),
+                (KeyCode::PageDown, _) => client.scrollback.scroll_down(height / 2, height),
+                (KeyCode::Char('G'), _) => client.scrollback.jump_to_bottom(),
+                (KeyCode::Home, _) => client.scrollback.scroll_up(usize::MAX, height),
+                (KeyCode::End, _) => client.scrollback.jump_to_bottom(),
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn draw_attached(
+    frame: &mut Frame,
+    client: &crate::tui_surface::SurfaceClient,
+    input: &str,
+    height: usize,
+) {
+    let area = frame.area();
+    let lines: Vec<UiLine> = client
+        .scrollback
+        .viewport(height)
+        .iter()
+        .map(|l| match l.kind {
+            LineKind::Divider => UiLine::styled(
+                l.text.clone(),
+                Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            ),
+            LineKind::User => UiLine::styled(format!("❯ {}", l.text), Style::new().fg(Color::Cyan)),
+            LineKind::Assistant => UiLine::raw(l.text.clone()),
+            LineKind::Tool => UiLine::styled(
+                l.text.clone(),
+                Style::new().fg(if l.text.starts_with('✗') { Color::Red } else { Color::Green }),
+            ),
+            LineKind::Note => UiLine::styled(
+                l.text.clone(),
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::DIM),
+            ),
+        })
+        .collect();
+
+    let chunks = ratatui::layout::Layout::vertical([
+        ratatui::layout::Constraint::Min(1),
+        ratatui::layout::Constraint::Length(1),
+        ratatui::layout::Constraint::Length(1),
+    ])
+    .split(area);
+    let mut chunks = chunks.iter();
+
+    let Some(scroll_area) = chunks.next() else { return };
+    let Some(status_area) = chunks.next() else { return };
+    let Some(composer_area) = chunks.next() else { return };
+
+    frame.render_widget(Paragraph::new(lines), *scroll_area);
+
+    let status = if let Some((_, tool)) = &client.awaiting_approval {
+        format!("approval: {tool} · y allows, n denies")
+    } else if client.phase == "running" {
+        "running · Enter steers · Ctrl-C stops".to_string()
+    } else if client.scrollback.pinned() {
+        format!("{} · session {}", client.phase, client.session_id)
+    } else {
+        "scrolled · G jumps to the bottom".to_string()
+    };
+    frame.render_widget(
+        Paragraph::new(UiLine::styled(format!(" {status}"), Style::new().fg(Color::DarkGray))),
+        *status_area,
+    );
+    frame.render_widget(Paragraph::new(format!(" ❯ {input}")), *composer_area);
+}

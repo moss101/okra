@@ -1764,6 +1764,7 @@ pub fn run_turn_streaming(
     checkpoints: Option<Arc<Mutex<okra_host::checkpoints::CheckpointManager>>>,
     prompt_index: usize,
     mediation: (okra_policy::lattice::MediationPolicy, Option<String>),
+    mediation_probe: Option<okra_policy::mediation::AttachedProbe>,
     subagent_provider: Option<(String, String)>,
 ) -> Result<TurnOutcome, String> {
     let steering_rx = steering;
@@ -1925,12 +1926,10 @@ pub fn run_turn_streaming(
             spec_act,
             okra_tools::ToolMetadata::default(),
         );
-        eprintln!("[comp-debug] registering computer_act");
-        let reg_result = registry.register(okra_tools::ErasedTool::simple(
+        let _ = registry.register(okra_tools::ErasedTool::simple(
             entry,
             vec![okra_tools::ResourceAccess::All],
             move |args: &serde_json::Value| {
-                eprintln!("[comp-debug] computer_act CLOSURE RAN");
                 let app = args["app"].as_str().unwrap_or_default().to_string();
                 let typing = args["typing"].as_bool().unwrap_or(false);
                 let actions: Vec<okra_computer::AxAction> = args["actions"]
@@ -1941,15 +1940,12 @@ pub fn run_turn_streaming(
                             .collect()
                     })
                     .unwrap_or_default();
-                eprintln!("[comp-debug] computer_act EXECUTING app={app}");
-                    eprintln!("[comp-debug] actions raw: {}", args);
                 let results = okra_computer::backend::execute_real(&app, &actions, typing);
                 okra_tools::ToolStream::terminal_only(Ok(okra_tools::ToolOutput::text(
                     serde_json::to_string_pretty(&results).unwrap_or_default(),
                 )))
             },
         ));
-        eprintln!("[comp-debug] computer_act register result: {reg_result:?}");
 
         let spec_shot = okra_tools::ToolSpec {
             name: "computer_screenshot".into(),
@@ -2005,6 +2001,9 @@ pub fn run_turn_streaming(
         let mut mediator = okra_policy::mediation::Mediator::new(mediation.0);
         if let Some(d) = &mediation.1 {
             mediator = mediator.with_designated(d);
+        }
+        if let Some(probe) = mediation_probe {
+            mediator = mediator.with_attached_probe(probe);
         }
         mediator.add_client(
             "workbench",
@@ -3459,6 +3458,7 @@ pub fn serve_stdio(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) ->
                             Some(session_checkpoints),
                             turn_ordinal,
                             (okra_policy::lattice::MediationPolicy::FirstResponder, None),
+                            None,
                             None,
                         ) {
                             outbound.notification(

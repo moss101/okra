@@ -191,6 +191,16 @@ impl SurfaceRegistry {
         }
     }
 
+    /// Is any live (attached, heartbeated) surface of `kind` present?
+    /// The mediation designated policy consults this at ask time — a
+    /// designation for "workbench" answers nothing when no browser is
+    /// attached (n0042).
+    pub fn has_kind(&self, kind: SurfaceKind) -> bool {
+        self.entries
+            .values()
+            .any(|e| !e.detached && e.kind == kind)
+    }
+
     /// Explicit detach (clean client exit). A leader detaching releases
     /// leadership — the next roster/claim elects a new leader (term+1).
     pub fn detach(&mut self, id: &str) -> bool {

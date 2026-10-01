@@ -232,7 +232,7 @@ pub fn serve_acp(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) -> !
                             serde_json::json!({ "sessionId": sid_n, "update": update }),
                         );
                     };
-                    match acp_turn(
+                    let outcome = acp_turn(
                         &session_cwd_t,
                         &sessions_dir_t,
                         &kernel_id_t,
@@ -241,18 +241,22 @@ pub fn serve_acp(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) -> !
                         &text_t,
                         &stop_flag,
                         &mut notify,
-                    ) {
+                    );
+                    // bookkeeping BEFORE the reply: a client that prompts
+                    // again the instant it sees the reply must find the
+                    // session idle (found by the ACP cancel e2e flake)
+                    if let Some(sess) = st.sessions.lock().unwrap().get_mut(&sid) {
+                        sess.turn_ordinal += 1;
+                    }
+                    st.stop_flags.lock().unwrap().remove(&sid);
+                    st.running.lock().unwrap().remove(&sid);
+                    match outcome {
                         Ok(stop_reason) => oc.result(
                             &id,
                             serde_json::json!({ "stopReason": stop_reason }),
                         ),
                         Err(e) => oc.error(&id, -32000, &format!("turn failed: {e}")),
                     }
-                    if let Some(sess) = st.sessions.lock().unwrap().get_mut(&sid) {
-                        sess.turn_ordinal += 1;
-                    }
-                    st.stop_flags.lock().unwrap().remove(&sid);
-                    st.running.lock().unwrap().remove(&sid);
                 });
             }
             other => outbound.error(&id, -32601, &format!("method not found: {other}")),
