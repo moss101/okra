@@ -4,6 +4,7 @@
 //! reconstructable like every other durable truth.
 
 pub mod engine;
+pub mod validate;
 
 use serde::{Deserialize, Serialize};
 use std::io::Write;

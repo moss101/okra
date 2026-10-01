@@ -290,6 +290,21 @@ fn main() {
     // `okra workflow run SCRIPT.rhai [--provider openai --model M]
     //  [--max-steps N]`: M3 Rhai engine — each script step is a full
     // agent turn in a child process (crates/workflow owns budgets + journal)
+    if argv.first().map(String::as_str) == Some("workflow")
+        && argv.get(1).map(String::as_str) == Some("validate")
+    {
+        let script_path = argv.get(2).map(std::path::PathBuf::from);
+        let Some(script_path) = script_path else {
+            eprintln!("error: workflow validate needs a .rhai script");
+            std::process::exit(2);
+        };
+        let script = std::fs::read_to_string(&script_path)
+            .unwrap_or_else(|e| { eprintln!("error: read {}: {e}", script_path.display()); std::process::exit(1); });
+        let report = okra_workflow::validate::validate(&script);
+        println!("VALIDATION {}", serde_json::to_string(&report).unwrap_or_default());
+        std::process::exit(if report.has_errors() { 1 } else { 0 });
+    }
+
     if argv.first().map(String::as_str) == Some("workflow") {
         let mut script = None;
         let mut provider = None;
