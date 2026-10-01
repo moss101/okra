@@ -20,7 +20,7 @@
 //!   rhai metadata API): scripts defining any get an explicit INFO
 //!   finding so nobody mistakes v1 coverage for interprocedural truth.
 
-use rhai::{AST, ASTNode, Engine, Expr, Stmt};
+use rhai::{ASTNode, Engine, Expr, Stmt};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -99,12 +99,10 @@ impl ValidationReport {
 #[derive(Debug)]
 enum Node {
     Step { name: Option<String>, line: u32 },
-    Gate { line: u32 },
     Decl { name: String, line: u32 },
     /// a variable reference attributed to the step whose argument
     /// subtree contains it (None = outside any step call)
     RefInStep { var: String, gated: bool },
-    HelperFnDef,
 }
 
 /// Record a step/gate call site (statement or expression form).
@@ -115,16 +113,12 @@ fn record_call(call: &rhai::FnCallExpr, _path: &[ASTNode], nodes: &mut Vec<Node>
         .first()
         .map(|a| a.position().line().map(|l| l as u32).unwrap_or(0))
         .unwrap_or(0);
-    match call.name.as_ref() {
-        "step" => {
-            let name = match call.args.first() {
-                Some(Expr::StringConstant(s, ..)) => Some(s.to_string()),
-                _ => None,
-            };
-            nodes.push(Node::Step { name, line });
-        }
-        "gate" => nodes.push(Node::Gate { line }),
-        _ => {}
+    if call.name == "step" {
+        let name = match call.args.first() {
+            Some(Expr::StringConstant(s, ..)) => Some(s.to_string()),
+            _ => None,
+        };
+        nodes.push(Node::Step { name, line });
     }
 }
 
@@ -190,12 +184,11 @@ pub fn validate(script: &str) -> ValidationReport {
         match node {
             ASTNode::Stmt(stmt) => match stmt {
                 Stmt::Var(box_, ..) => {
-                    if let (ident, _, _) = &**box_ {
-                        nodes.push(Node::Decl {
-                            name: ident.name.to_string(),
-                            line: stmt.position().line().map(|l| l as u32).unwrap_or(0),
-                        });
-                    }
+                    let (ident, _, _) = &**box_;
+                    nodes.push(Node::Decl {
+                        name: ident.name.to_string(),
+                        line: stmt.position().line().map(|l| l as u32).unwrap_or(0),
+                    });
                 }
                 // a bare call statement is Stmt::FnCall (rhai duplicates
                 // Expr::FnCall for the single-call-statement pattern)
@@ -334,18 +327,19 @@ pub fn validate(script: &str) -> ValidationReport {
         match node {
             Node::Step { name, line } => current_step = Some((name.clone(), *line)),
             Node::RefInStep { var, gated } => {
-                if !gated && entry_params.contains(var) {
-                    if let Some((step_name, step_line)) = &current_step {
-                        report.findings.push(Finding {
-                            severity: Severity::Warning,
-                            code: "ungated_input_to_step",
-                            message: format!(
-                                "untrusted entry input `{var}` flows into step {} without a gate() wrapper",
-                                step_name.as_deref().unwrap_or("(unnamed)")
-                            ),
-                            line: Some(*step_line),
-                        });
-                    }
+                if !gated
+                    && entry_params.contains(var)
+                    && let Some((step_name, step_line)) = &current_step
+                {
+                    report.findings.push(Finding {
+                        severity: Severity::Warning,
+                        code: "ungated_input_to_step",
+                        message: format!(
+                            "untrusted entry input `{var}` flows into step {} without a gate() wrapper",
+                            step_name.as_deref().unwrap_or("(unnamed)")
+                        ),
+                        line: Some(*step_line),
+                    });
                 }
             }
             _ => {}

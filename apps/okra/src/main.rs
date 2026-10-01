@@ -18,6 +18,7 @@ mod subagent;
 mod serve;
 mod task;
 mod tui_app;
+mod mcp_serve;
 mod workflow_cli;
 
 use std::io::Write;
@@ -261,6 +262,30 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+
+    // `okra mcp-serve --computer [--allow-app NAME]... [--allow-full-control]`:
+    // M5 standalone seam — okra's computer control as an MCP stdio server
+    // for external MCP clients (consent from the launch config, fail-closed)
+    if argv.first().map(String::as_str) == Some("mcp-serve") {
+        let mut computer = false;
+        let mut allow_apps: Vec<String> = Vec::new();
+        let mut allow_full_control = false;
+        let mut i = 1;
+        while i < argv.len() {
+            match argv[i].as_str() {
+                "--computer" => computer = true,
+                "--allow-app" => { i += 1; if let Some(app) = argv.get(i) { allow_apps.push(app.clone()); } }
+                "--allow-full-control" => allow_full_control = true,
+                other => { eprintln!("error: unknown mcp-serve flag {other}"); std::process::exit(2); }
+            }
+            i += 1;
+        }
+        if !computer {
+            eprintln!("error: mcp-serve needs --computer (the only server surface today)");
+            std::process::exit(2);
+        }
+        mcp_serve::serve_computer_mcp(allow_apps, allow_full_control);
     }
 
     // `okra tui [--cwd DIR] [--provider openai --model M]`: the M4 pager —

@@ -1104,7 +1104,7 @@ fn register_computer_parity_tools(
 }
 
 /// Minimal base64 for PNG data URLs (no dependency added).
-fn b64_png(png: &[u8]) -> String {
+pub(crate) fn b64_png(png: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(png.len().div_ceil(3) * 4);
     for chunk in png.chunks(3) {
