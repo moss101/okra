@@ -20,6 +20,8 @@ mod task;
 mod tui_app;
 mod mcp_serve;
 mod workflow_cli;
+mod workflow_gate;
+mod workflow_serve;
 
 use std::io::Write;
 use std::path::PathBuf;

@@ -66,7 +66,15 @@ M3  host services + alpha       ◐ strangler: SQLite session/task index
                                   the wire (n0029: writes capture
                                   checkpoints, `POST /api/rewind`
                                   restores files+git+context, workbench
-                                  button); G2 live PASSED vs a real
+                                  button, git reset to the captured HEAD
+                                  e2e-proven); the workflow→wire LINK
+                                  live (n0041: POST /api/workflow/run —
+                                  validate → engine → live workflowRuns
+                                  projection, change-only deltas via the
+                                  ported diff to EVERY surface, protocol
+                                  reducer reconstructs the run; TypeSafe
+                                  Jev step gate on autonomous step text,
+                                  inert by default); G2 live PASSED vs a real
                                   network model (glm-5.3-flash) INCLUDING
                                   the FULL 100-turn / 1,352-read live
                                   profile: flat context (peak 19.9k ≤ 20k),

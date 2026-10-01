@@ -291,3 +291,105 @@ fn wait_for(frames: &Mutex<Vec<serde_json::Value>>, pred: &dyn Fn(&[serde_json::
     }
     false
 }
+
+#[test]
+fn g4_rewind_resets_git_to_the_captured_head() {
+    let td = tempfile::tempdir().unwrap();
+    let ws = td.path().join("repo");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("base.txt"), "base").unwrap();
+    let git = |args: &[&str]| -> String {
+        let out = std::process::Command::new("git")
+            .args(["-C", &ws.to_string_lossy()])
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    git(&["init", "-q"]);
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "base"]);
+    let base_head = git(&["rev-parse", "HEAD"]).trim().to_string();
+
+    let (mut daemon, addr) = spawn_daemon(&ws);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let frames = std::sync::Arc::new(mutex_vec());
+        let writer = std::sync::Arc::clone(&frames);
+        let a = addr.clone();
+        let t = std::thread::spawn(move || {
+            sse_collect(&a, "rewind-git", &writer, &|f| {
+                f.iter().any(|f| f["params"]["control"]["phase"] == "completedSuccess"
+                    || f["params"]["control"]["phase"] == "completedInterrupted")
+            })
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let (status, _reply) = http_post_command(&addr, &serde_json::json!({
+            "commandId": "rw-git-1",
+            "type": "sendText",
+            "sessionId": "rewind-git",
+            "payload": { "text": "create scratch-git.md" }
+        }));
+        assert_eq!(status, 200);
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let approval_id = loop {
+            assert!(Instant::now() < deadline, "no approval surfaced");
+            let pending = frames.lock().unwrap().iter().rev().find_map(|f| {
+                f["params"]["control"]["awaitingApproval"]
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|p| p["approvalId"].as_str().map(str::to_string))
+            });
+            if let Some(id) = pending {
+                break id;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let (status, reply) = http_post_command(&addr, &serde_json::json!({
+            "commandId": "rw-git-resolve",
+            "type": "resolveApproval",
+            "sessionId": "rewind-git",
+            "payload": { "approvalId": approval_id, "decision": "allow" }
+        }));
+        assert_eq!(status, 200, "{reply}");
+        let _ = t.join();
+        assert!(ws.join("scratch-git.md").is_file());
+
+        // commit the turn's work AFTER the turn (the checkpoint captured
+        // HEAD at turn end = the base commit)
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "the turn's scratch"]);
+        assert_ne!(git(&["rev-parse", "HEAD"]).trim(), base_head);
+
+        // rewind to prompt 0: files restored AND git reset to base HEAD
+        let (status, body) = http_post(&addr, "/api/rewind", &serde_json::json!({
+            "sessionId": "rewind-git",
+            "promptIndex": 0
+        }));
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            !ws.join("scratch-git.md").exists(),
+            "the turn's file is gone (before-state: absent)"
+        );
+        assert_eq!(
+            git(&["rev-parse", "HEAD"]).trim(),
+            base_head,
+            "git was reset to the captured HEAD"
+        );
+        assert_eq!(
+            body["gitResetTo"].as_str().unwrap_or_default(),
+            base_head,
+            "the report names the reset"
+        );
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}

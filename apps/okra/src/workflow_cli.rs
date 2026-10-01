@@ -44,6 +44,20 @@ impl WorkflowHost for TurnStepHost {
         if prompt.trim().is_empty() {
             return Err(format!("step `{name}`: empty prompt"));
         }
+        // n0041 step gate: one Jev judgment on the task text before it
+        // becomes an autonomous child turn (inert without the env pair,
+        // fail-open on API errors, refusals are honest step errors)
+        match crate::workflow_gate::judge_step(name, &prompt) {
+            crate::workflow_gate::GateVerdict::Refuse(p) => {
+                return Err(format!(
+                    "workflow gate refused step `{name}` (escape probability {p:.2}) — the task appears to escape the workflow's controls"
+                ));
+            }
+            crate::workflow_gate::GateVerdict::Warn(p) => {
+                eprintln!("[workflow-gate] step `{name}` elevated escape probability {p:.2} — proceeding");
+            }
+            _ => {}
+        }
         let mut cmd = std::process::Command::new(&self.exe);
         cmd.arg("--cwd").arg(&self.cwd).arg("--json").arg(&prompt);
         if let Some(provider) = &self.provider {
@@ -99,7 +113,7 @@ pub fn run_workflow_cli(
     let run = run_workflow(
         &script,
         TurnStepHost::new(cwd, provider, model),
-        &journal,
+        std::rc::Rc::new(journal),
         &run_id,
         &budgets,
         None,

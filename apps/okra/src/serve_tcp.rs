@@ -655,6 +655,108 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
         };
     }
 
+    // n0041: run a workflow over the daemon — validate first (422 with
+    // the report), then engine + live workflowRuns projection; deltas
+    // broadcast to every attached surface as v4/workflowRuns frames
+    if method == "POST" && path == "/api/workflow/run" {
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 {
+            reader.read_exact(&mut body)?;
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        let Some(script) = parsed["script"].as_str() else {
+            return write_http(
+                stream,
+                400,
+                "error",
+                br#"{"error":"script (rhai source) required"}"#.as_slice(),
+            );
+        };
+        let max_steps = parsed["maxSteps"].as_u64().unwrap_or(64).min(256) as u32;
+        let provider = state.subagent_provider.clone();
+        return match crate::workflow_serve::spawn_workflow_run(state, script, max_steps, provider) {
+            Ok(run_id) => write_http(
+                stream,
+                200,
+                "OK",
+                serde_json::to_vec(&serde_json::json!({
+                    "runId": run_id,
+                    "status": "accepted",
+                    "deltas": "v4/workflowRuns frames on every attached surface",
+                }))
+                .unwrap_or_default()
+                .as_slice(),
+            ),
+            Err(report) => write_http(
+                stream,
+                422,
+                "error",
+                serde_json::to_vec(&serde_json::json!({
+                    "error": "validation failed",
+                    "findings": report.findings,
+                }))
+                .unwrap_or_default()
+                .as_slice(),
+            ),
+        }
+    }
+
+    // n0041: workflow status from the durable journal (the live deltas
+    // carry it too; this is the poll fallback)
+    if method == "GET" && (path.starts_with("/api/workflow/status") || path.starts_with("/api/workflow/status?")) {
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or_default();
+        let run_id = query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("runId="))
+            .unwrap_or_default()
+            .to_string();
+        if run_id.is_empty() {
+            return write_http(
+                stream,
+                400,
+                "error",
+                br#"{"error":"runId required"}"#.as_slice(),
+            );
+        }
+        let journal = okra_workflow::RunJournal::new(state.cwd.join(".okra").join("workflows"));
+        let summary = match journal.read(&run_id) {
+            Ok(entries) if entries.is_empty() => serde_json::json!({
+                "runId": run_id, "status": "unknown", "events": 0,
+            }),
+            Ok(entries) => {
+                let Some(last) = entries.last().cloned() else {
+                    return write_http(
+                        stream,
+                        200,
+                        "OK",
+                        br#"{"status":"running","events":0}"#.as_slice(),
+                    );
+                };
+                let steps = entries.iter().filter(|e| e.event == "step/finished").count();
+                serde_json::json!({
+                    "runId": run_id,
+                    "status": match last.event.as_str() {
+                        "run/completed" => "completed",
+                        "run/failed" => "failed",
+                        "run/cancelled" => "cancelled",
+                        _ => "running",
+                    },
+                    "events": entries.len(),
+                    "steps": steps,
+                    "lastEvent": last.event,
+                })
+            }
+            Err(_) => serde_json::json!({ "runId": run_id, "status": "unknown", "events": 0 }),
+        };
+        return write_http(
+            stream,
+            200,
+            "OK",
+            serde_json::to_vec(&summary).unwrap_or_default().as_slice(),
+        );
+    }
+
     // N0029: rewind the workspace to the start of a prompt — restores
     // files (first-wins before-bytes), resets git to the captured HEAD
     // when one exists, truncates the session's checkpoints + continuation

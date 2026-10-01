@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use rhai::{Dynamic, Engine, EvalAltResult, Scope};
 
-use crate::{check_budgets, BudgetBreach, JournalEntry, RunBudgets, RunJournal, RunStatus, WorkflowRun};
+use crate::{check_budgets, BudgetBreach, JournalEntry, RunBudgets, RunJournalSink, RunStatus, WorkflowRun};
 
 /// Step execution seam. `step` receives the script's name + input and
 /// returns the step's output; an Err fails the run.
@@ -106,7 +106,7 @@ struct RunState {
     steps: u32,
 }
 
-fn journal_entry(journal: &RunJournal, state: &Rc<RefCell<RunState>>, run_id: &str, event: &str, data: serde_json::Value) {
+fn journal_entry(journal: &dyn RunJournalSink, state: &Rc<RefCell<RunState>>, run_id: &str, event: &str, data: serde_json::Value) {
     let entry = {
         let mut st = state.borrow_mut();
         st.seq += 1;
@@ -128,7 +128,7 @@ fn journal_entry(journal: &RunJournal, state: &Rc<RefCell<RunState>>, run_id: &s
 pub fn run_workflow<H: WorkflowHost + 'static>(
     script: &str,
     host: H,
-    journal: &RunJournal,
+    journal: std::rc::Rc<dyn RunJournalSink>,
     run_id: &str,
     budgets: &RunBudgets,
     stop: Option<&Arc<AtomicBool>>,
@@ -136,7 +136,6 @@ pub fn run_workflow<H: WorkflowHost + 'static>(
     let started = Instant::now();
     let state = Rc::new(RefCell::new(RunState { seq: 0, steps: 0 }));
     let host = Rc::new(RefCell::new(host));
-    let journal = Rc::new(journal.clone());
     let run_id = run_id.to_string();
     let budgets = *budgets;
     let stop = stop.cloned();
@@ -147,7 +146,7 @@ pub fn run_workflow<H: WorkflowHost + 'static>(
         budgets,
         error: None,
     };
-    journal_entry(&journal, &state, &run_id, "run/started", serde_json::json!({
+    journal_entry(&*journal, &state, &run_id, "run/started", serde_json::json!({
         "budgets": budgets,
     }));
 
@@ -216,14 +215,14 @@ pub fn run_workflow<H: WorkflowHost + 'static>(
                 *aborted.borrow_mut() = Some(Abort::Cancelled(Some(breach)));
                 return Err(Abort::Cancelled(Some(breach)).into_rhai());
             }
-            journal_entry(&journal, &state, &run_id, "step/started", serde_json::json!({
+            journal_entry(&*journal, &state, &run_id, "step/started", serde_json::json!({
                 "name": name,
                 "step": steps_now,
             }));
             match host.borrow_mut().step(name, input) {
                 Ok(value) => {
                     let preview = truncate_2048(&value.to_string());
-                    journal_entry(&journal, &state, &run_id, "step/finished", serde_json::json!({
+                    journal_entry(&*journal, &state, &run_id, "step/finished", serde_json::json!({
                         "name": name,
                         "step": steps_now,
                         "ok": true,
@@ -232,7 +231,7 @@ pub fn run_workflow<H: WorkflowHost + 'static>(
                     Ok(value)
                 }
                 Err(e) => {
-                    journal_entry(&journal, &state, &run_id, "step/finished", serde_json::json!({
+                    journal_entry(&*journal, &state, &run_id, "step/finished", serde_json::json!({
                         "name": name,
                         "step": steps_now,
                         "ok": false,
@@ -249,7 +248,7 @@ pub fn run_workflow<H: WorkflowHost + 'static>(
         Err(e) => {
             run.status = RunStatus::Failed;
             run.error = Some(truncate_2048(&e.to_string()));
-            journal_entry(&journal, &state, &run_id, "run/failed", serde_json::json!({
+            journal_entry(&*journal, &state, &run_id, "run/failed", serde_json::json!({
                 "stage": "compile",
                 "error": run.error,
             }));
@@ -270,7 +269,7 @@ pub fn run_workflow<H: WorkflowHost + 'static>(
         (_, Some(abort)) => {
             run.status = RunStatus::Cancelled;
             run.error = Some(abort.reason());
-            journal_entry(&journal, &state, &run_id, "run/cancelled", serde_json::json!({
+            journal_entry(&*journal, &state, &run_id, "run/cancelled", serde_json::json!({
                 "steps": state.borrow().steps,
                 "elapsedMs": elapsed,
                 "reason": run.error,
@@ -278,7 +277,7 @@ pub fn run_workflow<H: WorkflowHost + 'static>(
         }
         (Ok(value), None) => {
             run.status = RunStatus::Completed;
-            journal_entry(&journal, &state, &run_id, "run/completed", serde_json::json!({
+            journal_entry(&*journal, &state, &run_id, "run/completed", serde_json::json!({
                 "steps": state.borrow().steps,
                 "elapsedMs": elapsed,
                 "result": truncate_2048(&value.to_string()),
@@ -289,7 +288,7 @@ pub fn run_workflow<H: WorkflowHost + 'static>(
             if let Some(abort) = Abort::from_marker(&text) {
                 run.status = RunStatus::Cancelled;
                 run.error = Some(abort.reason());
-                journal_entry(&journal, &state, &run_id, "run/cancelled", serde_json::json!({
+                journal_entry(&*journal, &state, &run_id, "run/cancelled", serde_json::json!({
                     "steps": state.borrow().steps,
                     "elapsedMs": elapsed,
                     "reason": run.error,
@@ -297,7 +296,7 @@ pub fn run_workflow<H: WorkflowHost + 'static>(
             } else {
                 run.status = RunStatus::Failed;
                 run.error = Some(truncate_2048(&text));
-                journal_entry(&journal, &state, &run_id, "run/failed", serde_json::json!({
+                journal_entry(&*journal, &state, &run_id, "run/failed", serde_json::json!({
                     "steps": state.borrow().steps,
                     "elapsedMs": elapsed,
                     "error": run.error,
@@ -323,6 +322,7 @@ fn truncate_2048(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RunJournal;
 
     struct EchoHost;
     impl WorkflowHost for EchoHost {
@@ -349,7 +349,7 @@ mod tests {
                 b
             }
         "#;
-        let run = run_workflow(script, EchoHost, &journal, "r1", &RunBudgets::default(), None);
+        let run = run_workflow(script, EchoHost, Rc::new(journal.clone()), "r1", &RunBudgets::default(), None);
         assert_eq!(run.status, RunStatus::Completed);
         let entries = journal.read("r1").unwrap();
         let events: Vec<&str> = entries.iter().map(|e| e.event.as_str()).collect();
@@ -367,7 +367,7 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let journal = RunJournal::new(td.path().join("j"));
         let script = r#"fn run() { step("explode", 0) }"#;
-        let run = run_workflow(script, FailingHost, &journal, "r2", &RunBudgets::default(), None);
+        let run = run_workflow(script, FailingHost, Rc::new(journal.clone()), "r2", &RunBudgets::default(), None);
         assert_eq!(run.status, RunStatus::Failed);
         assert!(run.error.unwrap().contains("explode"));
         let entries = journal.read("r2").unwrap();
@@ -380,7 +380,7 @@ mod tests {
         let journal = RunJournal::new(td.path().join("j"));
         let script = r#"fn run() { for i in 0..10 { step("s" + i, i); } }"#;
         let budgets = RunBudgets { max_steps: 3, ..Default::default() };
-        let run = run_workflow(script, EchoHost, &journal, "r3", &budgets, None);
+        let run = run_workflow(script, EchoHost, Rc::new(journal.clone()), "r3", &budgets, None);
         assert_eq!(run.status, RunStatus::Cancelled, "{:?}", run.error);
         assert!(run.error.unwrap().contains("steps"));
         let entries = journal.read("r3").unwrap();
@@ -395,7 +395,7 @@ mod tests {
         // thing standing between this script and forever
         let script = r#"fn run() { let x = 0; while x >= 0 { x = x + 1; } 0 }"#;
         let budgets = RunBudgets { max_wall_clock_ms: 300, max_steps: 256, max_fan_out: 16 };
-        let run = run_workflow(script, EchoHost, &journal, "r4", &budgets, None);
+        let run = run_workflow(script, EchoHost, Rc::new(journal.clone()), "r4", &budgets, None);
         assert_eq!(run.status, RunStatus::Cancelled, "{:?}", run.error);
         assert!(run.error.unwrap().contains("wall clock"));
     }
@@ -411,7 +411,7 @@ mod tests {
             flag2.store(true, Ordering::Relaxed);
         });
         let script = r#"fn run() { let x = 0; while true { x = x + 1; } 0 }"#;
-        let run = run_workflow(script, EchoHost, &journal, "r5", &RunBudgets::default(), Some(&flag));
+        let run = run_workflow(script, EchoHost, Rc::new(journal.clone()), "r5", &RunBudgets::default(), Some(&flag));
         assert_eq!(run.status, RunStatus::Cancelled);
         assert_eq!(run.error.as_deref(), Some("stopped"));
     }
@@ -431,7 +431,7 @@ mod tests {
                 recovered
             }
         "#;
-        let run = run_workflow(script, FailingHost, &journal, "r6", &RunBudgets::default(), None);
+        let run = run_workflow(script, FailingHost, Rc::new(journal.clone()), "r6", &RunBudgets::default(), None);
         assert_eq!(run.status, RunStatus::Completed, "{:?}", run.error);
         let entries = journal.read("r6").unwrap();
         let completed = entries.last().cloned().unwrap();

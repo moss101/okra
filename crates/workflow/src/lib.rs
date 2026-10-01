@@ -63,6 +63,13 @@ pub struct JournalEntry {
     pub data: serde_json::Value,
 }
 
+/// What the engine writes to (durable truth first). `RunJournal` is the
+/// file implementation; `TeeJournal` fans every entry out to a live
+/// observer (the workflowRuns state projector) while it lands on disk.
+pub trait RunJournalSink {
+    fn append(&self, entry: &JournalEntry) -> std::io::Result<()>;
+}
+
 /// Append-only NDJSON run journal (ZCode dynamic-workflow run journal
 /// analog). One file per run; a torn final line is skipped on read, never
 /// fatal (kernel loss contract reused).
@@ -103,6 +110,33 @@ impl RunJournal {
             }
         }
         Ok(out)
+    }
+}
+
+impl RunJournalSink for RunJournal {
+    fn append(&self, entry: &JournalEntry) -> std::io::Result<()> {
+        RunJournal::append(self, entry)
+    }
+}
+
+/// Tee: durable journal + a live observer per entry (single-threaded
+/// engine, so the observer is an `Fn` behind an `Rc`).
+pub struct TeeJournal {
+    inner: RunJournal,
+    on_append: std::rc::Rc<dyn Fn(&JournalEntry)>,
+}
+
+impl TeeJournal {
+    pub fn new(inner: RunJournal, on_append: std::rc::Rc<dyn Fn(&JournalEntry)>) -> Self {
+        TeeJournal { inner, on_append }
+    }
+}
+
+impl RunJournalSink for TeeJournal {
+    fn append(&self, entry: &JournalEntry) -> std::io::Result<()> {
+        self.inner.append(entry)?;
+        (self.on_append)(entry);
+        Ok(())
     }
 }
 
