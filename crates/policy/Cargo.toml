@@ -10,6 +10,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
+
+# the kernel-sandbox backend (Landlock/Seatbelt) — unix-only by upstream
+# contract; windows builds the honest-unavailable stub in nono_backend.rs
+[target.'cfg(unix)'.dependencies]
 nono = { workspace = true }
 
 [dev-dependencies]

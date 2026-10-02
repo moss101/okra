@@ -45,7 +45,10 @@ pub trait SelfConfinement {
     ) -> Result<ConfinementReport, SandboxError>;
 }
 
-/// The nono-backed backend (Landlock/Seatbelt).
+/// The nono-backed backend (Landlock/Seatbelt). On Windows there is no
+/// kernel-sandbox primitive nono targets — the same struct reports the
+/// honesty contract (`Unavailable` for every confinable mode), matching
+/// how nono itself reports an unsupported unix kernel.
 pub struct NonoSandboxBackend {
     /// Network blocked regardless of mode (strict/offline operation).
     pub force_block_network: bool,
@@ -65,8 +68,12 @@ impl NonoSandboxBackend {
         NonoSandboxBackend { force_block_network: true, allow_temp: false }
     }
 
-    fn platform_support() -> Result<nono::SupportInfo, SandboxError> {
-        let info = nono::Sandbox::support_info();
+    /// The platform's support verdict. Windows: honestly unavailable —
+    /// the recorded M6 first pass ships `enforcement: partial` and the
+    /// callers' fail-closed paths handle it exactly like an unsupported
+    /// unix kernel (no silent passthrough, by the N0001 contract).
+    fn platform_support() -> Result<SupportInfo, SandboxError> {
+        let info = support_info()?;
         if !info.is_supported {
             return Err(SandboxError::Unavailable(format!(
                 "kernel sandbox unsupported on {}: {}",
@@ -76,6 +83,22 @@ impl NonoSandboxBackend {
         Ok(info)
     }
 
+    /// Windows stub: no capability set exists to build (the real one needs
+    /// nono's unix primitives). The confinable() check still runs first so
+    /// `DangerFullAccess` refuses identically on every platform.
+    #[cfg(not(unix))]
+    fn capability_set(
+        &self,
+        _policy: &SandboxExecutionPolicy,
+        _extra_writable: &[PathBuf],
+    ) -> Result<(), SandboxError> {
+        if !crate::confine::confinable(_policy) {
+            return Err(SandboxError::NotConfinable(_policy.mode));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
     fn capability_set(
         &self,
         policy: &SandboxExecutionPolicy,
@@ -155,6 +178,7 @@ fn system_read_paths() -> Vec<PathBuf> {
 }
 
 impl SelfConfinement for NonoSandboxBackend {
+    #[cfg(unix)]
     fn apply_to_self(
         &self,
         policy: &SandboxExecutionPolicy,
@@ -174,6 +198,24 @@ impl SelfConfinement for NonoSandboxBackend {
             network_blocked,
         })
     }
+
+    /// Windows: the honesty contract. Confined modes refuse with
+    /// `Unavailable` (callers clamp to read-only behavior / refuse, per
+    /// the fail-closed ladder) — a Windows apply NEVER lies with
+    /// `enforcement: full`.
+    #[cfg(not(unix))]
+    fn apply_to_self(
+        &self,
+        policy: &SandboxExecutionPolicy,
+        extra_writable: &[PathBuf],
+    ) -> Result<ConfinementReport, SandboxError> {
+        self.capability_set(policy, extra_writable)?;
+        let info = Self::platform_support()?;
+        Err(SandboxError::Unavailable(format!(
+            "kernel sandbox unsupported on {}: {}",
+            info.platform, info.details
+        )))
+    }
 }
 
 /// Profile-name → mode mapping helper (`profiles.rs:69-84` spellings).
@@ -189,6 +231,35 @@ pub fn mode_for_profile_name(name: &ProfileName) -> Option<SandboxMode> {
 /// True if `path` sits inside `dir` or is that directory (lexical check).
 pub fn path_within(path: &Path, dir: &Path) -> bool {
     path.starts_with(dir)
+}
+
+/// Platform support verdict, shared shape with `nono::SupportInfo` so
+/// both impls speak one type.
+#[derive(Debug, Clone)]
+pub(crate) struct SupportInfo {
+    pub is_supported: bool,
+    pub platform: &'static str,
+    pub details: String,
+}
+
+#[cfg(unix)]
+fn support_info() -> Result<SupportInfo, SandboxError> {
+    let info = nono::Sandbox::support_info();
+    Ok(SupportInfo {
+        is_supported: info.is_supported,
+        platform: info.platform,
+        details: info.details,
+    })
+}
+
+#[cfg(not(unix))]
+fn support_info() -> Result<SupportInfo, SandboxError> {
+    Err(SandboxError::Unavailable(String::new())).map(|_: SupportInfo| SupportInfo {
+        is_supported: false,
+        platform: "windows",
+        details: "no kernel sandbox primitive nono targets (Landlock/Seatbelt);                   Windows ships `enforcement: partial` honestly — restricted tokens/AppContainer                   are the recorded second-pass work (docs/m6-windows-port.md)"
+            .into(),
+    })
 }
 
 #[cfg(test)]
@@ -238,6 +309,37 @@ mod tests {
             mode_for_profile_name(&crate::profiles::parse_profile_name("off")),
             Some(SandboxMode::DangerFullAccess)
         );
+    }
+
+    /// Windows bring-up gate: the stub must refuse confined modes with
+    /// the honest `Unavailable` verdict (never `enforcement: full`), and
+    /// `DangerFullAccess` must refuse IDENTICALLY to unix.
+    #[cfg(not(unix))]
+    #[test]
+    fn windows_stub_reports_unavailable_and_refuses_full_access() {
+        use std::path::PathBuf;
+        let backend = NonoSandboxBackend::new();
+        let policy = SandboxExecutionPolicy {
+            mode: SandboxMode::ReadOnly,
+            workspace_root: PathBuf::from("C:\\ws"),
+            session_id: None,
+        };
+        let err = backend
+            .apply_to_self(&policy, &[])
+            .expect_err("windows must not claim full enforcement");
+        assert!(matches!(err, SandboxError::Unavailable(_)), "{err}");
+        let policy = SandboxExecutionPolicy {
+            mode: SandboxMode::DangerFullAccess,
+            workspace_root: PathBuf::from("C:\\ws"),
+            session_id: None,
+        };
+        let err = backend
+            .apply_to_self(&policy, &[])
+            .expect_err("full access must not confine");
+        assert!(matches!(
+            err,
+            SandboxError::NotConfinable(SandboxMode::DangerFullAccess)
+        ));
     }
 
     #[test]
