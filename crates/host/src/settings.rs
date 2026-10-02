@@ -60,6 +60,11 @@ pub fn catalog() -> Vec<SettingDescriptor> {
             default: Value::from(2u64),
             description: "default fork budget for subagent launches",
         },
+        SettingDescriptor {
+            key: "permissions.rules",
+            default: Value::Array(Vec::new()),
+            description: "project permission rules (#24): confirmed suggestedPermissionUpdates land here as {tool, pathPrefix?, effect} objects",
+        },
     ]
 }
 

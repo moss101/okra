@@ -24,6 +24,48 @@ pub enum ApprovalOutcome {
     Unavailable,
 }
 
+/// The lifetime the user attaches to an ALLOW (MASTER-PLAN §3 #53: "Allow
+/// once / this conversation / always / Deny"). The OUTCOME union stays the
+/// closed deepseek four — exactly one outcome grants — and the scope only
+/// parameterizes what the grant mint may record. `Always` NEVER silently
+/// persists: it takes effect for the session immediately and additionally
+/// produces a suggested ruleset update (§3 #24) that a human must confirm
+/// before it lands in project settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub enum ApprovalScope {
+    /// These bytes, this session (grant is arg-hash-bound; a retry of the
+    /// same approved bytes does not re-prompt).
+    #[default]
+    Once,
+    /// This tool for the rest of the conversation (session tool grant —
+    /// WEAKER than the arg-hash binding, chosen explicitly by a human,
+    /// never minted implicitly, dies with the session).
+    Conversation,
+    /// From now on (session tool grant now + a suggested project rule
+    /// pending confirmation).
+    Always,
+}
+
+/// A channel answer with its scope. A plain `ApprovalOutcome` answer maps
+/// to scope `Once` (the pre-#53 behavior, byte-for-byte).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApprovalAnswer {
+    pub outcome: ApprovalOutcome,
+    pub scope: ApprovalScope,
+}
+
+impl ApprovalAnswer {
+    pub fn new(outcome: ApprovalOutcome) -> ApprovalAnswer {
+        ApprovalAnswer { outcome, scope: ApprovalScope::Once }
+    }
+
+    pub fn scoped(outcome: ApprovalOutcome, scope: ApprovalScope) -> ApprovalAnswer {
+        ApprovalAnswer { outcome, scope }
+    }
+}
+
 impl ApprovalOutcome {
     /// The mapping from `core/tools/src/index.ts:1750-1764`: exactly one
     /// outcome grants; everything else denies with a distinct reason.
@@ -68,6 +110,13 @@ pub struct ApprovalRequest {
 /// An answerer channel. Out-of-vocabulary or erroring answerers fail closed.
 pub trait ApprovalChannel: Send + Sync {
     fn answer(&self, request: &ApprovalRequest) -> Option<ApprovalOutcome>;
+
+    /// Scoped answer (#53). Default: delegate to `answer` with scope
+    /// `Once`, so every pre-existing channel keeps working unchanged and
+    /// the default stays the tightest scope.
+    fn answer_scoped(&self, request: &ApprovalRequest) -> Option<ApprovalAnswer> {
+        self.answer(request).map(ApprovalAnswer::new)
+    }
 }
 
 /// `ApprovalService` (`index.ts:267-306`): policy gate → waterfall →
@@ -95,6 +144,10 @@ pub enum ApprovalAuditEvent {
     Decided {
         id: ApprovalRequestId,
         outcome: ApprovalOutcome,
+        /// The scope the user attached to an allow (#53). `Option` with
+        /// serde default so logs written before #53 replay unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<ApprovalScope>,
     },
 }
 
@@ -125,6 +178,18 @@ impl ApprovalService {
         call_id: &str,
         args_json: &str,
     ) -> (ApprovalOutcome, Vec<ApprovalAuditEvent>) {
+        let (outcome, _scope, audit) = self.decide_scoped(tool_name, call_id, args_json);
+        (outcome, audit)
+    }
+
+    /// The decision path with the user's scope (#53). Same fail-closed
+    /// waterfall; the scope only rides on a granted answer.
+    pub fn decide_scoped(
+        &mut self,
+        tool_name: &str,
+        call_id: &str,
+        args_json: &str,
+    ) -> (ApprovalOutcome, ApprovalScope, Vec<ApprovalAuditEvent>) {
         let id = format!("apr-{}", {
             self.ids += 1;
             self.ids
@@ -142,26 +207,33 @@ impl ApprovalService {
             call_id: call_id.to_string(),
             args_json: args_json.to_string(),
         };
-        let outcome = match self.policy {
+        let answer = match self.policy {
             ApprovalPolicy::Never => {
                 // pre-dispatch denial, independent of listener registration
                 // order — fail closed by construction
-                ApprovalOutcome::Rejected
+                ApprovalAnswer::new(ApprovalOutcome::Rejected)
             }
             ApprovalPolicy::Ask => {
                 let mut answer = None;
                 for channel in &self.channels {
-                    if let Some(o) = channel.answer(&request) {
-                        answer = Some(normalize_outcome(o));
+                    if let Some(a) = channel.answer_scoped(&request) {
+                        answer = Some(normalize_answer(a));
                         break;
                     }
                 }
                 // terminal fallback: unavailable with no answerer
-                answer.unwrap_or(ApprovalOutcome::Unavailable)
+                answer.unwrap_or(ApprovalAnswer::new(ApprovalOutcome::Unavailable))
             }
         };
-        let decided = ApprovalAuditEvent::Decided { id, outcome };
-        (outcome, vec![asked, decided])
+        let (outcome, scope) = (answer.outcome, answer.scope);
+        if !outcome.grants() {
+            // a denial carries no scope, whatever the channel claimed
+            let scope = ApprovalScope::Once;
+            let decided = ApprovalAuditEvent::Decided { id, outcome, scope: None };
+            return (outcome, scope, vec![asked, decided]);
+        }
+        let decided = ApprovalAuditEvent::Decided { id, outcome, scope: Some(scope) };
+        (outcome, scope, vec![asked, decided])
     }
 }
 
@@ -170,6 +242,18 @@ impl ApprovalService {
 /// "maybe" answers; kept as a function for wire-level callers.
 pub fn normalize_outcome(o: ApprovalOutcome) -> ApprovalOutcome {
     o
+}
+
+/// A rogue answer normalizes to deny, and a denial always carries the
+/// tightest scope (a channel claiming scope `Always` on a denial is
+/// clamped — the scope only exists where the outcome grants).
+pub fn normalize_answer(a: ApprovalAnswer) -> ApprovalAnswer {
+    let outcome = normalize_outcome(a.outcome);
+    if outcome.grants() {
+        ApprovalAnswer { outcome, scope: a.scope }
+    } else {
+        ApprovalAnswer::new(outcome)
+    }
 }
 
 /// grok `ToolApprovalPolicy` ceiling (`xai-tool-runtime/src/context.rs:255-265`):

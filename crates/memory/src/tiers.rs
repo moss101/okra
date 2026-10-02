@@ -68,6 +68,34 @@ impl TieredReader {
         std::fs::write(&path, content)?;
         Ok(path)
     }
+
+    /// Append one line to a tier (the accept path of the extract agent —
+    /// a memory FILE is a list of lines; an append never rewrites what is
+    /// stored). Returns the line count after the append.
+    pub fn append_tier(&self, tier: MemoryTier, line: &str) -> std::io::Result<usize> {
+        let line = line.trim();
+        if line.is_empty() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty memory line"));
+        }
+        let existing = self.read_tier(tier).unwrap_or_default();
+        let mut lines: Vec<&str> = existing.lines().collect();
+        if lines.iter().any(|l| l.trim() == line) {
+            // already stored — idempotent accept
+            return Ok(lines.len());
+        }
+        lines.push(line);
+        let mut content = lines.join("\n");
+        content.push('\n');
+        self.write_tier(tier, &content)?;
+        Ok(lines.len())
+    }
+
+    /// The stored lines of a tier (the dream agent's input).
+    pub fn lines_of(&self, tier: MemoryTier) -> Vec<String> {
+        self.read_tier(tier)
+            .map(|c| c.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
@@ -99,5 +127,23 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let reader = TieredReader::new(td.path().join("h"), td.path().join("w"));
         assert_eq!(reader.recall(), "");
+    }
+}
+
+#[cfg(test)]
+mod append_tests {
+    use super::*;
+
+    #[test]
+    fn append_is_idempotent_and_never_rewrites() {
+        let td = tempfile::tempdir().unwrap();
+        let reader = TieredReader::new(td.path().join("h"), td.path().join("w"));
+        assert_eq!(reader.append_tier(MemoryTier::User, "Run cargo clippy before commits").unwrap(), 1);
+        assert_eq!(reader.append_tier(MemoryTier::User, "Prefer small PRs").unwrap(), 2);
+        // duplicate accept: no growth
+        assert_eq!(reader.append_tier(MemoryTier::User, "Prefer small PRs").unwrap(), 2);
+        let lines = reader.lines_of(MemoryTier::User);
+        assert_eq!(lines, vec!["Run cargo clippy before commits", "Prefer small PRs"]);
+        assert!(reader.append_tier(MemoryTier::User, "   ").is_err(), "empty line refused");
     }
 }

@@ -169,6 +169,175 @@ fn once_scope_is_dedup_not_approval() {
     assert!(!store.seen_once("write_file", r#"{"path":"b"}"#, "1"));
 }
 
+// ---- #53 approval scopes ------------------------------------------------
+
+use policy::{ApprovalAnswer, ApprovalScope, PermissionLattice as Lattice, RulesetLearner};
+
+struct ScopedChannel {
+    outcome: ApprovalOutcome,
+    scope: ApprovalScope,
+}
+impl policy::ApprovalChannel for ScopedChannel {
+    fn answer(&self, _req: &policy::ApprovalRequest) -> Option<ApprovalOutcome> {
+        Some(self.outcome)
+    }
+    fn answer_scoped(&self, _req: &policy::ApprovalRequest) -> Option<ApprovalAnswer> {
+        Some(ApprovalAnswer::scoped(self.outcome, self.scope))
+    }
+}
+
+#[test]
+fn scope_rides_on_a_granted_answer_only() {
+    // granted + conversation scope → the scope survives the waterfall
+    let mut svc = ApprovalService::new(ApprovalPolicy::Ask);
+    svc.add_channel(Box::new(ScopedChannel {
+        outcome: ApprovalOutcome::AllowedOnce,
+        scope: ApprovalScope::Conversation,
+    }));
+    let (outcome, scope, audit) = svc.decide_scoped("bash", "c1", "{}");
+    assert_eq!(outcome, ApprovalOutcome::AllowedOnce);
+    assert_eq!(scope, ApprovalScope::Conversation);
+    // the audit Decided event carries the scope
+    let decided = audit
+        .iter()
+        .find_map(|e| match e {
+            policy::ApprovalAuditEvent::Decided { scope, .. } => Some(*scope),
+            _ => None,
+        })
+        .expect("decided event");
+    assert_eq!(decided, Some(ApprovalScope::Conversation));
+
+    // the same channel answering with a DENIAL is clamped to the tightest
+    // scope — a denial carries no scope at all
+    let mut svc2 = ApprovalService::new(ApprovalPolicy::Ask);
+    svc2.add_channel(Box::new(ScopedChannel {
+        outcome: ApprovalOutcome::Rejected,
+        scope: ApprovalScope::Always,
+    }));
+    let (outcome2, scope2, audit2) = svc2.decide_scoped("bash", "c2", "{}");
+    assert_eq!(outcome2, ApprovalOutcome::Rejected);
+    assert_eq!(scope2, ApprovalScope::Once);
+    let decided2 = audit2
+        .iter()
+        .find_map(|e| match e {
+            policy::ApprovalAuditEvent::Decided { scope, .. } => Some(*scope),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(decided2, None, "denials log no scope");
+}
+
+#[test]
+fn plain_channels_default_to_once_scope() {
+    let mut svc = ApprovalService::new(ApprovalPolicy::Ask);
+    svc.add_channel(Box::new(ScriptedChannel(Some(ApprovalOutcome::AllowedOnce))));
+    let (_, scope, _) = svc.decide_scoped("bash", "c1", "{}");
+    assert_eq!(scope, ApprovalScope::Once, "pre-#53 channels keep the tightest scope");
+}
+
+#[test]
+fn conversation_scope_mints_session_tool_grant_that_dies_with_revocation() {
+    let mut store = GrantStore::new(1);
+    let rec = store.record_approval_scoped(
+        ApprovalOutcome::AllowedOnce,
+        ApprovalScope::Conversation,
+        "bash",
+        r#"{"cmd":"cargo test"}"#,
+        "1",
+        ToolApprovalCeiling::GrantsAllowed,
+        false,
+    );
+    assert!(!rec.suggests_rule, "conversation scope never suggests a rule");
+    assert!(rec.session_tool.is_some());
+    // the weaker grant answers WITHOUT the args hash
+    assert!(store.check_session_tool("bash", "1"));
+    assert!(store.check_session_tool("bash", "1"), "any args, same tool");
+    // but not for another tool or a behavior bump
+    assert!(!store.check_session_tool("write_file", "1"));
+    assert!(!store.check_session_tool("bash", "2"));
+    // and it dies with revocation (session end / policy revocation)
+    store.revoke_persistent();
+    assert!(!store.check_session_tool("bash", "1"), "revocation clears the weaker grants too");
+}
+
+#[test]
+fn always_scope_suggests_a_rule_and_persists_only_when_allowed() {
+    let mut store = GrantStore::new(1);
+    let rec = store.record_approval_scoped(
+        ApprovalOutcome::AllowedOnce,
+        ApprovalScope::Always,
+        "write_file",
+        r#"{"path":"src/a.rs"}"#,
+        "1",
+        ToolApprovalCeiling::GrantsAllowed,
+        true, // host permits persistence
+    );
+    assert!(rec.suggests_rule, "always → the caller must surface a ruleset suggestion");
+    assert!(rec.session_tool.is_some());
+    // the arg-hash grant persisted
+    assert_eq!(
+        store.check("write_file", r#"{"path":"src/a.rs"}"#, "1", GrantScope::Persistent),
+        GrantDecision::Granted
+    );
+    // without allow_persistent, no persistent record — only the session
+    let mut store2 = GrantStore::new(1);
+    let rec2 = store2.record_approval_scoped(
+        ApprovalOutcome::AllowedOnce,
+        ApprovalScope::Always,
+        "write_file",
+        r#"{"path":"src/a.rs"}"#,
+        "1",
+        ToolApprovalCeiling::GrantsAllowed,
+        false,
+    );
+    assert!(rec2.suggests_rule);
+    assert_eq!(
+        store2.check("write_file", r#"{"path":"src/a.rs"}"#, "1", GrantScope::Persistent),
+        GrantDecision::NotGranted
+    );
+    assert_eq!(
+        store2.check("write_file", r#"{"path":"src/a.rs"}"#, "1", GrantScope::Conversation),
+        GrantDecision::Granted
+    );
+    // AlwaysPrompt records NOTHING at any scope
+    let mut store3 = GrantStore::new(1);
+    let rec3 = store3.record_approval_scoped(
+        ApprovalOutcome::AllowedOnce,
+        ApprovalScope::Always,
+        "write_file",
+        "{}",
+        "1",
+        ToolApprovalCeiling::AlwaysPrompt,
+        true,
+    );
+    assert!(rec3.grant.is_none() && rec3.session_tool.is_none() && !rec3.suggests_rule);
+    assert!(store3.is_empty());
+}
+
+#[test]
+fn ruleset_learning_from_scoped_decisions() {
+    use policy::{RuleEffect, RuleSource};
+    let mut learner = RulesetLearner::new();
+    let mut lattice = Lattice::new();
+    // three allowed writes under src/ — enough evidence for a suggestion
+    for p in ["src/a.rs", "src/b.rs", "src/c.rs"] {
+        learner.observe("write_file", Some(p), ApprovalOutcome::AllowedOnce, ApprovalScope::Once);
+    }
+    let suggestions = learner.suggest(&lattice, 2, 5);
+    assert_eq!(suggestions.len(), 1);
+    assert_eq!(suggestions[0].rule.tool, "write_file");
+    assert_eq!(suggestions[0].rule.path_prefix.as_deref(), Some("src/"));
+    assert_eq!(suggestions[0].rule.effect, RuleEffect::Allow);
+    assert_eq!(suggestions[0].rule.source, RuleSource::Project);
+
+    // applying lands a project rule that ANSWERS future evaluations
+    let rule = RulesetLearner::apply(&suggestions[0], &mut lattice);
+    assert_eq!(lattice.evaluate("write_file", Some("src/d.rs")), policy::Decision::Allow);
+    // and the learner stops suggesting it
+    assert!(learner.suggest(&lattice, 1, 5).is_empty());
+    let _ = rule;
+}
+
 #[test]
 fn ceiling_parse_fails_closed() {
     assert_eq!(

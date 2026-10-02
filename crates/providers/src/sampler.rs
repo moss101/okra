@@ -88,6 +88,12 @@ pub trait Sampler: Send + Sync {
         let resp = self.sample(request)?;
         Ok((TextStream::completed(&resp.text), resp))
     }
+    /// #37: drain model-fallback switches recorded since the last call.
+    /// Default: none (a plain sampler never switches). The turn loop logs
+    /// these and surfaces show the switch — a model change is never silent.
+    fn drain_fallback_events(&self) -> Vec<crate::fallback::FallbackEvent> {
+        Vec::new()
+    }
 }
 
 /// Text deltas (already-produced form; the sync runtime replays them).

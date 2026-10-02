@@ -440,8 +440,7 @@ mod tests {
 
     #[test]
     fn cycle_detection_finds_back_edges() {
-        let mut g = CausalityGraph::default();
-        g.nodes = vec!["a".into(), "b".into(), "c".into()];
+        let mut g = CausalityGraph { nodes: vec!["a".into(), "b".into(), "c".into()], ..Default::default() };
         g.edges.insert("a".into(), vec!["b".into()]);
         g.edges.insert("b".into(), vec!["c".into()]);
         g.edges.insert("c".into(), vec!["a".into()]);
@@ -449,8 +448,7 @@ mod tests {
         assert_eq!(cycles.len(), 1, "{cycles:?}");
         assert!(cycles[0].contains(&"a".to_string()) && cycles[0].contains(&"c".to_string()));
 
-        let mut acyclic = CausalityGraph::default();
-        acyclic.nodes = vec!["a".into(), "b".into()];
+        let mut acyclic = CausalityGraph { nodes: vec!["a".into(), "b".into()], ..Default::default() };
         acyclic.edges.insert("a".into(), vec!["b".into()]);
         assert!(acyclic.cycles().is_empty());
     }

@@ -665,7 +665,7 @@ fn g4_approvals_pause_turn_until_resolved() {
             assert_eq!(status, 200, "{reply}");
 
             // wait for the ask to reach the surface
-            let mut approval_id = String::new();
+            let approval_id;
             let deadline = Instant::now() + Duration::from_secs(20);
             loop {
                 assert!(
@@ -966,7 +966,7 @@ fn g4_terminals_run_a_real_pty_over_http() {
         // 8. close
         let (status, body) = http_post(&addr, &format!("/api/term/{id}/close"), &serde_json::json!({}));
         assert_eq!(status, 200, "{body}");
-        let (status, body) = http_get(&addr, "/api/term");
+        let (_, body) = http_get(&addr, "/api/term");
         assert!(body.contains("\"ids\":[]"), "terminal not pruned: {body}");
     }));
     let _ = daemon.kill();
@@ -1097,7 +1097,7 @@ fn g4_git_stage_and_commit_over_the_wire() {
         let files = String::from_utf8_lossy(&show.stdout);
         assert!(files.contains("a.txt"), "committed files: {files}");
         assert!(!files.contains("b.txt"), "unstaged file leaked into the commit: {files}");
-        let (status, body) = http_get(&addr, "/api/git");
+        let (_, body) = http_get(&addr, "/api/git");
         assert!(body.contains("b.txt"), "b.txt no longer dirty: {body}");
 
         // 3. honest refusals
@@ -1797,7 +1797,7 @@ done
 
         // 2. act: AXPress path reaches the fixture osascript with the args
         run_tool("computer act Finder click w0/e1", "comp-act");
-        let (status, rows) = http_get(&addr, "/api/sessions/comp-act/rows");
+        let (_, rows) = http_get(&addr, "/api/sessions/comp-act/rows");
         assert!(rows.contains("computer_act"), "{rows}");
         let log_contents = std::fs::read_to_string(&log).unwrap_or_default();
         assert!(
@@ -1807,7 +1807,7 @@ done
 
         // 3. screenshot: PNG data URL
         run_tool("computer screenshot", "comp-shot");
-        let (status, rows) = http_get(&addr, "/api/sessions/comp-shot/rows");
+        let (_, rows) = http_get(&addr, "/api/sessions/comp-shot/rows");
         assert!(
             rows.contains("data:image/png;base64,"),
             "screenshot data URL missing: {rows}"
@@ -1845,7 +1845,7 @@ fn g4_skills_management_lifecycle() {
         assert_eq!(status, 409);
 
         // 3. listing shows it enabled with patterns
-        let (status, body) = http_get(&addr, "/api/skills");
+        let (_, body) = http_get(&addr, "/api/skills");
         assert!(body.contains("rust-review"), "{body}");
         assert!(body.contains("src/**"), "{body}");
         assert!(body.contains("\"disabled\":false"), "{body}");
@@ -1855,7 +1855,7 @@ fn g4_skills_management_lifecycle() {
         assert_eq!(status, 200, "{reply}");
         assert!(!td.path().join(".okra/skills/SKILL-rust-review.md").exists());
         assert!(td.path().join(".okra/skills/SKILL-rust-review.md.disabled").is_file());
-        let (status, body) = http_get(&addr, "/api/skills");
+        let (_, body) = http_get(&addr, "/api/skills");
         assert!(body.contains("\"disabled\":true"), "{body}");
 
         // 5. enable → back
@@ -1866,7 +1866,7 @@ fn g4_skills_management_lifecycle() {
         // 6. delete
         let (status, reply) = http_post(&addr, "/api/skills/delete", &serde_json::json!({ "name": "rust-review" }));
         assert_eq!(status, 200, "{reply}");
-        let (status, body) = http_get(&addr, "/api/skills");
+        let (_, body) = http_get(&addr, "/api/skills");
         assert!(body.contains("\"skills\":[]"), "{body}");
 
         // 7. honest failures: unknown name → 404; unsanitizable name → 400
@@ -2009,7 +2009,7 @@ echo "cliclick $*" >> "$OKRA_AX_LOG"
 
         // 1. app tool WITHOUT a grant → honest error naming request_access
         run("computer appwindows Finder", "cc-no");
-        let (status, rows) = http_get(&addr, "/api/sessions/cc-no/rows");
+        let (_, rows) = http_get(&addr, "/api/sessions/cc-no/rows");
         assert!(rows.contains("no app capability grant"), "{rows}");
         assert!(rows.contains("computer_request_access"), "{rows}");
 
@@ -2027,12 +2027,12 @@ echo "cliclick $*" >> "$OKRA_AX_LOG"
         assert_eq!(status, 200);
         assert!(body.contains("Finder"), "{body}");
         run("computer appwindows Finder", "cc-after-grant");
-        let (status, rows) = http_get(&addr, "/api/sessions/cc-after-grant/rows");
+        let (_, rows) = http_get(&addr, "/api/sessions/cc-after-grant/rows");
         assert!(rows.contains("w0"), "windows not listed: {rows}");
 
         // 4. takeover flow: fullclick works after its card resolves
         run("computer fullclick 50 60", "cc-fullclick");
-        let (status, body) = http_get(&addr, "/api/computer/consent");
+        let (_, body) = http_get(&addr, "/api/computer/consent");
         assert!(body.contains("\"fullControl\":true"), "{body}");
         let log_contents = std::fs::read_to_string(&log).unwrap_or_default();
         assert!(
@@ -2042,7 +2042,7 @@ echo "cliclick $*" >> "$OKRA_AX_LOG"
 
         // 5. list_granted reflects both consents through a turn
         run("computer grant Finder", "cc-list"); // already granted; idempotent
-        let (status, body) = http_get(&addr, "/api/computer/consent");
+        let (_, body) = http_get(&addr, "/api/computer/consent");
         assert!(body.contains("Finder") && body.contains("fullControl"), "{body}");
     }));
     let _ = daemon.kill();
@@ -2152,7 +2152,7 @@ echo "cliclick $*" >> "$OKRA_AX_LOG"
                         .and_then(|p| p["approvalId"].as_str().map(str::to_string))
                 });
                 if let Some(id) = id {
-                    let (status, reply) = http_post_command(&addr, &serde_json::json!({
+                    let (status, _) = http_post_command(&addr, &serde_json::json!({
                         "commandId": format!("n26-apr-{sid}"),
                         "type": "resolveApproval",
                         "sessionId": sid,
@@ -2185,7 +2185,7 @@ echo "cliclick $*" >> "$OKRA_AX_LOG"
         let fb = start("n26-lock-b");
         send("n26-lock-b", "computer appwindows Finder");
         assert!(done_for(&fb, "n26-lock-b"));
-        let (status, rows) = http_get(&addr, "/api/sessions/n26-lock-b/rows");
+        let (_, rows) = http_get(&addr, "/api/sessions/n26-lock-b/rows");
         assert!(
             rows.contains("Another okra session is currently using the computer"),
             "lock error missing: {rows}"
@@ -2198,7 +2198,7 @@ echo "cliclick $*" >> "$OKRA_AX_LOG"
         let fc = start("n26-after");
         send("n26-after", "computer appwindows Finder");
         assert!(done_for(&fc, "n26-after"));
-        let (status, rows) = http_get(&addr, "/api/sessions/n26-after/rows");
+        let (_, rows) = http_get(&addr, "/api/sessions/n26-after/rows");
         let (_, consent_now) = http_get(&addr, "/api/computer/consent");
         assert!(rows.contains("w0"), "windows should list after release (consent: {consent_now}): {rows}");
         assert!(
@@ -2419,12 +2419,12 @@ echo 'elem|0|1|AXButton|Save|100|300|80|30|AXPress'
         let _ = t.join();
 
         // the tool result reports the split
-        let (status, rows) = http_get(&addr, "/api/sessions/per-app/rows");
+        let (_, rows) = http_get(&addr, "/api/sessions/per-app/rows");
         assert!(rows.contains("granted: [TextEdit]"), "{rows}");
         assert!(rows.contains("denied: [Finder]"), "{rows}");
 
         // the consent ledger holds ONLY the allowed app
-        let (status, body) = http_get(&addr, "/api/computer/consent");
+        let (_, body) = http_get(&addr, "/api/computer/consent");
         assert!(body.contains("TextEdit"), "{body}");
         assert!(!body.contains("Finder"), "denied app must not be granted: {body}");
     }));

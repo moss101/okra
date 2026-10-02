@@ -503,7 +503,6 @@ fn semantic_wander_governor_nudges_a_circling_turn() {
 #[test]
 fn semantic_governor_stays_quiet_when_healthy() {
     use okra_agent_core::semantics::{JevWanderVerdict, SemanticJudge};
-    use std::sync::Mutex;
 
     struct Healthy;
     impl SemanticJudge for Healthy {
@@ -571,4 +570,235 @@ fn semantic_governor_stays_quiet_when_healthy() {
     let outcome = agent.run_turn("read two files", &mut collect(&mut events)).unwrap();
     assert!(matches!(outcome, TurnOutcome::Completed { .. }));
     assert!(!events.iter().any(|e| matches!(e, LoopEvent::Nudge { .. })));
+}
+
+// ---- #53 approval scopes: the session tool grant suppresses re-prompts —
+
+use okra_policy::approval::{ApprovalAnswer, ApprovalScope};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+struct AskCountingScopedChannel {
+    scope: ApprovalScope,
+    asks: Arc<AtomicU64>,
+}
+impl ApprovalChannel for AskCountingScopedChannel {
+    fn answer(&self, _req: &okra_policy::ApprovalRequest) -> Option<ApprovalOutcome> {
+        self.asks.fetch_add(1, AtomicOrdering::SeqCst);
+        Some(ApprovalOutcome::AllowedOnce)
+    }
+    fn answer_scoped(&self, req: &okra_policy::ApprovalRequest) -> Option<ApprovalAnswer> {
+        self.answer(req).map(|o| ApprovalAnswer::scoped(o, self.scope))
+    }
+}
+
+fn scope_agent(
+    root: &std::path::Path,
+    steps: Vec<ScriptedStep>,
+    scope: ApprovalScope,
+    asks: Arc<AtomicU64>,
+) -> Agent<ScriptedModel> {
+    let mut registry = Registry::new();
+    let wf = okra_tools::builtins::ErasedWriteFile::new(root.to_path_buf());
+    let entry = wf.entry();
+    registry
+        .register(okra_tools::ErasedTool::simple(
+            entry,
+            vec![okra_tools::ResourceAccess::write_file("*")],
+            move |args| wf.execute(args),
+        ))
+        .unwrap();
+    let mut approvals = ApprovalService::new(ApprovalPolicy::Ask);
+    approvals.add_channel(Box::new(AskCountingScopedChannel { scope, asks }));
+    let executor = PolicyToolExecutor::new(registry, approvals);
+    let header = kernel::SessionHeader {
+        version: kernel::SESSION_FORMAT_VERSION,
+        id: format!(
+            "scope-{}",
+            std::process::id() as u64 * 1000
+                + std::sync::atomic::AtomicU64::fetch_add(&SESSION_SEQ, 1, std::sync::atomic::Ordering::SeqCst)
+        ),
+        created_at: 1.0,
+        cwd: root.to_string_lossy().into_owned(),
+        parent_session: None,
+        is_seeded: false,
+    };
+    let session = kernel::SessionHandle::create(&root.join(".okra-sessions"), &header).unwrap();
+    Agent::new(
+        AgentConfig { unattended: true, ..Default::default() },
+        Arc::new(ScriptedModel::new(steps)),
+        Box::new(executor),
+        session,
+    )
+}
+
+fn write_call(id: &str, path: &str) -> ScriptedStep {
+    ScriptedStep {
+        text: String::new(),
+        tool_calls: vec![ToolCall {
+            id: id.into(),
+            name: "write_file".into(),
+            args_json: json!({ "path": path, "content": "x" }).to_string(),
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn conversation_scope_grants_later_different_args_without_reprompting() {
+    let td = tempfile::tempdir().unwrap();
+    let asks = Arc::new(AtomicU64::new(0));
+    let steps = vec![
+        write_call("c1", "a.txt"),
+        write_call("c2", "b.txt"), // different args — covered by the session tool grant
+        ScriptedStep { text: "done".into(), ..Default::default() },
+    ];
+    let mut agent = scope_agent(td.path(), steps, ApprovalScope::Conversation, Arc::clone(&asks));
+    let mut events = Vec::new();
+    let outcome = agent.run_turn("write two files", &mut collect(&mut events)).unwrap();
+    assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+    assert_eq!(
+        asks.load(AtomicOrdering::SeqCst),
+        1,
+        "#53: the conversation scope grants the second different-args write WITHOUT a second prompt"
+    );
+    // the grant event rode to the surface with the scope
+    assert!(events.iter().any(|e| matches!(e, LoopEvent::ApprovalGranted { scope, .. } if scope == "conversation")));
+}
+
+#[test]
+fn once_scope_still_prompts_per_call() {
+    let td = tempfile::tempdir().unwrap();
+    let asks = Arc::new(AtomicU64::new(0));
+    let steps = vec![
+        write_call("c1", "a.txt"),
+        write_call("c2", "b.txt"), // different args — no wider grant: prompts again
+        ScriptedStep { text: "done".into(), ..Default::default() },
+    ];
+    let mut agent = scope_agent(td.path(), steps, ApprovalScope::Once, Arc::clone(&asks));
+    let mut events = Vec::new();
+    let outcome = agent.run_turn("write two files", &mut collect(&mut events)).unwrap();
+    assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+    assert_eq!(
+        asks.load(AtomicOrdering::SeqCst),
+        2,
+        "scope once keeps the pre-#53 behavior: every distinct approved bytes prompts"
+    );
+    assert!(events.iter().any(|e| matches!(e, LoopEvent::ApprovalGranted { scope, .. } if scope == "once")));
+}
+
+// ---- #37: XML tool-call recovery + model-fallback events ----------------
+
+use okra_providers::{FallbackEvent, SampleRequest, SampleResponse};
+
+#[test]
+fn xml_tool_calls_in_text_are_recovered_and_executed() {
+    let td = tempfile::tempdir().unwrap();
+    // the model emits the call as TEXT instead of the structured field
+    let steps = vec![
+        ScriptedStep {
+            text: "<tool_call>{\"name\":\"write_file\",\"arguments\":{\"path\":\"rec.txt\",\"content\":\"recovered!\"}}</tool_call>".into(),
+            ..Default::default()
+        },
+        ScriptedStep { text: "done".into(), ..Default::default() },
+    ];
+    let mut registry = Registry::new();
+    let wf = okra_tools::builtins::ErasedWriteFile::new(td.path().to_path_buf());
+    let entry = wf.entry();
+    registry
+        .register(okra_tools::ErasedTool::simple(
+            entry,
+            vec![okra_tools::ResourceAccess::write_file("*")],
+            move |args| wf.execute(args),
+        ))
+        .unwrap();
+    // the recovered write is a REAL side-effecting call: it goes through
+    // the same approval seam as any write (an allow channel keeps the test
+    // focused on the recovery, not the approval)
+    let mut approvals = ApprovalService::new(ApprovalPolicy::Ask);
+    approvals.add_channel(Box::new(AllowChannel));
+    let executor = PolicyToolExecutor::new(registry, approvals);
+    let header = kernel::SessionHeader {
+        version: kernel::SESSION_FORMAT_VERSION,
+        id: format!("xml-recovery-{}", std::process::id()),
+        created_at: 1.0,
+        cwd: td.path().to_string_lossy().into_owned(),
+        parent_session: None,
+        is_seeded: false,
+    };
+    let session = kernel::SessionHandle::create(&td.path().join(".okra-sessions"), &header).unwrap();
+    let mut agent = Agent::new(
+        AgentConfig { unattended: true, ..Default::default() },
+        Arc::new(ScriptedModel::new(steps)),
+        Box::new(executor),
+        session,
+    );
+    let mut events = Vec::new();
+    let outcome = agent.run_turn("write the file", &mut collect(&mut events)).unwrap();
+    assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+    // the recovered call REALLY executed through the tool plane
+    assert!(
+        td.path().join("rec.txt").is_file(),
+        "the XML-embedded call executed for real"
+    );
+    assert_eq!(
+        std::fs::read_to_string(td.path().join("rec.txt")).unwrap(),
+        "recovered!"
+    );
+    // the receipt rode to the surface
+    assert!(events.iter().any(|e| matches!(e, LoopEvent::ToolCallsRecovered { count: 1 })));
+    assert!(events.iter().any(|e| matches!(e, LoopEvent::ToolCallStarted { name, .. } if name == "write_file")));
+}
+
+/// Wraps a scripted model and reports a canned fallback switch (#37).
+struct FallbackReportingModel {
+    inner: ScriptedModel,
+    event: FallbackEvent,
+}
+impl okra_providers::Sampler for FallbackReportingModel {
+    fn sample(&self, request: &SampleRequest) -> Result<SampleResponse, SamplerError> {
+        self.inner.sample(request)
+    }
+    fn drain_fallback_events(&self) -> Vec<FallbackEvent> {
+        vec![self.event.clone()]
+    }
+}
+
+#[test]
+fn model_fallback_switches_are_surfaced_and_logged() {
+    let td = tempfile::tempdir().unwrap();
+    let steps = vec![
+        ScriptedStep { text: "answered on the fallback model".into(), ..Default::default() },
+        ScriptedStep { text: "done".into(), ..Default::default() },
+    ];
+    let registry = Registry::new();
+    let approvals = ApprovalService::new(ApprovalPolicy::Never);
+    let executor = PolicyToolExecutor::new(registry, approvals);
+    let header = kernel::SessionHeader {
+        version: kernel::SESSION_FORMAT_VERSION,
+        id: format!("fallback-{}", std::process::id()),
+        created_at: 1.0,
+        cwd: td.path().to_string_lossy().into_owned(),
+        parent_session: None,
+        is_seeded: false,
+    };
+    let session = kernel::SessionHandle::create(&td.path().join(".okra-sessions"), &header).unwrap();
+    let model = FallbackReportingModel {
+        inner: ScriptedModel::new(steps),
+        event: FallbackEvent {
+            from: "glm-primary".into(),
+            to: "glm-backup".into(),
+            reason: "rate limited (429)".into(),
+        },
+    };
+    let mut agent = Agent::new(
+        AgentConfig { unattended: true, ..Default::default() },
+        Arc::new(model),
+        Box::new(executor),
+        session,
+    );
+    let mut events = Vec::new();
+    let outcome = agent.run_turn("hello", &mut collect(&mut events)).unwrap();
+    assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+    assert!(events.iter().any(|e| matches!(e, LoopEvent::ModelFallback { from, to, .. }
+        if from == "glm-primary" && to == "glm-backup")));
 }

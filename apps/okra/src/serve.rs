@@ -24,7 +24,7 @@ use okra_agent_core::turn::{CancellationCategory, TurnOutcome};
 use okra_kernel as kernel;
 use okra_policy::ToolApprovalCeiling;
 use okra_policy::approval::{
-    ApprovalChannel, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, ApprovalService,
+    ApprovalAnswer, ApprovalChannel, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, ApprovalScope, ApprovalService,
 };
 use okra_host::notifications::{classify, NotificationClass};
 use okra_providers::Sampler;
@@ -1524,9 +1524,11 @@ pub struct PendingApproval {
 /// blocks until a surface resolves it (`resolveApproval` command) or the
 /// turn's stop flag flips (→ Cancelled — stop-interruptible by contract).
 /// Fail-closed: the outcome union is unchanged; exactly AllowedOnce grants.
+/// #53: the resolution may carry a SCOPE (once / conversation / always) —
+/// the default is `once`, so every pre-existing caller is unchanged.
 pub struct SurfaceApprovalChannel {
     pending: Mutex<Vec<PendingApproval>>,
-    answers: Mutex<std::collections::HashMap<String, ApprovalOutcome>>,
+    answers: Mutex<std::collections::HashMap<String, ApprovalAnswer>>,
     wake: std::sync::Condvar,
     stop: Arc<AtomicBool>,
 }
@@ -1542,15 +1544,23 @@ impl SurfaceApprovalChannel {
     }
 
     /// A surface answered: allow → AllowedOnce, deny → Rejected.
+    /// (Default-scope form; the callers that don't model #53 scopes land here.)
+    #[allow(dead_code)]
     pub fn resolve(&self, approval_id: &str, allow: bool) -> bool {
-        let outcome = if allow {
-            ApprovalOutcome::AllowedOnce
+        self.resolve_scoped(approval_id, allow, ApprovalScope::Once)
+    }
+
+    /// A surface answered WITH a scope (#53). Denials always store the
+    /// tightest scope — the scope only exists where the outcome grants.
+    pub fn resolve_scoped(&self, approval_id: &str, allow: bool, scope: ApprovalScope) -> bool {
+        let answer = if allow {
+            ApprovalAnswer::scoped(ApprovalOutcome::AllowedOnce, scope)
         } else {
-            ApprovalOutcome::Rejected
+            ApprovalAnswer::new(ApprovalOutcome::Rejected)
         };
         let known = {
             let mut answers = self.answers.lock().unwrap();
-            answers.insert(approval_id.to_string(), outcome);
+            answers.insert(approval_id.to_string(), answer);
             self.pending
                 .lock()
                 .unwrap()
@@ -1589,6 +1599,10 @@ impl ApprovalChannel for SharedBridge {
     fn answer(&self, request: &ApprovalRequest) -> Option<ApprovalOutcome> {
         self.0.answer(request)
     }
+
+    fn answer_scoped(&self, request: &ApprovalRequest) -> Option<ApprovalAnswer> {
+        self.0.answer_scoped(request)
+    }
 }
 
 impl SurfaceApprovalChannel {
@@ -1613,6 +1627,12 @@ impl SurfaceApprovalChannel {
 
     /// Block until `id` is answered (stop-flag aware). Fails closed.
     pub fn wait_for(&self, id: &str) -> ApprovalOutcome {
+        self.wait_for_scoped(id).outcome
+    }
+
+    /// The scoped wait (#53): same stop-aware loop, the answer carries
+    /// the user's scope.
+    pub fn wait_for_scoped(&self, id: &str) -> ApprovalAnswer {
         loop {
             // bounded waits so a stop flip is honoured mid-approval
             let answers = self.answers.lock().unwrap();
@@ -1620,17 +1640,17 @@ impl SurfaceApprovalChannel {
                 .wake
                 .wait_timeout(answers, std::time::Duration::from_millis(250))
                 .unwrap();
-            if let Some(outcome) = answers.remove(id) {
+            if let Some(answer) = answers.remove(id) {
                 drop(answers);
                 self.pending.lock().unwrap().retain(|p| p.id != id);
                 self.wake.notify_all();
-                return outcome;
+                return answer;
             }
             drop(answers);
             if self.stop.load(Ordering::Relaxed) {
                 self.pending.lock().unwrap().retain(|p| p.id != id);
                 self.wake.notify_all();
-                return ApprovalOutcome::Cancelled;
+                return ApprovalAnswer::new(ApprovalOutcome::Cancelled);
             }
             let _ = timeout;
         }
@@ -1646,6 +1666,16 @@ impl ApprovalChannel for SurfaceApprovalChannel {
             &request.args_json,
         );
         Some(self.wait_for(&request.id))
+    }
+
+    fn answer_scoped(&self, request: &ApprovalRequest) -> Option<ApprovalAnswer> {
+        self.register(
+            &request.id,
+            &request.tool_name,
+            &request.call_id,
+            &request.args_json,
+        );
+        Some(self.wait_for_scoped(&request.id))
     }
 }
 
@@ -1742,6 +1772,194 @@ fn embeddings_network_tier() -> Option<Box<okra_memory::retrieval::NetworkEmbed>
     }))
 }
 
+/// #24 permission learning, shared across every turn of the daemon:
+/// granted approvals feed the learner; CONFIRMED suggestions land in the
+/// shared lattice AND persist to workspace settings (`permissions.rules`).
+/// Nothing here auto-applies — the surface shows the suggestion and a
+/// human confirms over POST /api/rules.
+pub struct PermissionLearning {
+    pub learner: Mutex<okra_policy::RulesetLearner>,
+    pub lattice: Mutex<okra_policy::PermissionLattice>,
+    /// Explicitly dismissed suggestions (tool, path prefix) — never
+    /// re-suggested this daemon lifetime.
+    pub dismissed: Mutex<Vec<(String, Option<String>)>>,
+}
+
+pub type PermissionLearningHandle = Arc<PermissionLearning>;
+
+impl PermissionLearning {
+    /// Load persisted rules from the workspace settings scope.
+    pub fn load(home: &Path, cwd: &Path) -> PermissionLearningHandle {
+        let lattice = Mutex::new(load_persisted_rules(home, cwd));
+        Arc::new(PermissionLearning {
+            learner: Mutex::new(okra_policy::RulesetLearner::new()),
+            lattice,
+            dismissed: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Current suggestions (lattice-aware, dismissed-filtered).
+    pub fn suggestions(&self, min_occurrences: u32, max: usize) -> Vec<okra_policy::SuggestedPermissionUpdate> {
+        let learner = self.learner.lock().unwrap();
+        let lattice = self.lattice.lock().unwrap();
+        let dismissed = self.dismissed.lock().unwrap();
+        learner
+            .suggest(&lattice, min_occurrences, max + dismissed.len())
+            .into_iter()
+            .filter(|s| {
+                let prefix = s.rule.path_prefix.as_deref();
+                !dismissed
+                    .iter()
+                    .any(|(t, p)| &s.rule.tool == t && p.as_deref() == prefix)
+            })
+            .take(max)
+            .collect()
+    }
+}
+
+/// Parse `permissions.rules` out of the workspace settings scope.
+fn load_persisted_rules(home: &Path, cwd: &Path) -> okra_policy::PermissionLattice {
+    let mut lattice = okra_policy::PermissionLattice::new();
+    let store = okra_host::settings::SettingsStore::new(home).with_workspace(cwd);
+    if let Ok((serde_json::Value::Array(rules), _)) = store.get("permissions.rules") {
+        for r in rules {
+            if let Ok(rule) = serde_json::from_value::<okra_policy::PermissionRule>(r) {
+                lattice.add_rule(rule);
+            }
+        }
+    }
+    lattice
+}
+
+/// Persist one rule into the workspace settings scope (`permissions.rules`
+/// array), deduped.
+pub fn persist_rule(home: &Path, cwd: &Path, rule: &okra_policy::PermissionRule) -> Result<usize, String> {
+    let store = okra_host::settings::SettingsStore::new(home).with_workspace(cwd);
+    let mut rules: Vec<serde_json::Value> = match store.get("permissions.rules") {
+        Ok((serde_json::Value::Array(a), _)) => a,
+        _ => Vec::new(),
+    };
+    let encoded = serde_json::to_value(rule).map_err(|e| e.to_string())?;
+    if rules.contains(&encoded) {
+        return Ok(rules.len());
+    }
+    rules.push(encoded);
+    store
+        .set("permissions.rules", serde_json::Value::Array(rules.clone()), okra_host::settings::SettingsScope::Workspace)
+        .map_err(|e| e.to_string())?;
+    Ok(rules.len())
+}
+
+/// #25: the workspace-provided content whose activation the trust gate
+/// controls — skills, the workspace MCP/daemon config, workspace settings
+/// overrides, and workspace slash commands. An empty set needs no trust.
+pub fn gated_workspace_files(cwd: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.is_file() {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    for dir in [".okra/skills", ".zcode/commands"] {
+        let root = cwd.join(dir);
+        if root.is_dir() {
+            walk(&root, &mut files);
+        }
+    }
+    for f in [".okra/config.json", ".okra/settings.json"] {
+        let p = cwd.join(f);
+        if p.is_file() {
+            files.push(p);
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// M3 watchers domain (#52 per-conversation watchers): what files THIS
+/// conversation touched, and their LIVE dirty state. The durable source is
+/// the checkpoint manager's per-prompt write records (n0029) — no extra
+/// watcher state exists to drift; a file is `changed` when its on-disk
+/// sha256 differs from the conversation's last recorded `after` snapshot,
+/// `deleted` when it no longer exists, `clean` otherwise.
+pub fn watchers_state(
+    mgr: &okra_host::checkpoints::CheckpointManager,
+    cwd: &Path,
+    turns_seen: usize,
+) -> serde_json::Value {
+    // union of every path this session ever recorded, with the LAST
+    // after-snapshot per path (turns are 0..turns_seen for the session)
+    let mut last_after: std::collections::BTreeMap<String, okra_host::checkpoints::FileSnapshot> =
+        Default::default();
+    let mut first_before: std::collections::BTreeMap<String, String> = Default::default();
+    for turn in 0..turns_seen {
+        if let Some(cp) = mgr.get_checkpoint(turn) {
+            for (path, snap) in &cp.fs.before {
+                first_before.entry(path.clone()).or_insert_with(|| snap.sha256.clone());
+            }
+            for (path, snap) in &cp.fs.after {
+                last_after.insert(path.clone(), snap.clone());
+            }
+        }
+    }
+    let files: Vec<serde_json::Value> = last_after
+        .iter()
+        .map(|(path, after)| {
+            let abs = cwd.join(path);
+            let live = std::fs::read(&abs).ok();
+            let state = match live {
+                None => "deleted",
+                Some(bytes) => {
+                    let live_hash = okra_host::plugins::store::sha256_hex(&bytes);
+                    if live_hash == after.sha256 { "clean" } else { "changed" }
+                }
+            };
+            serde_json::json!({
+                "path": path,
+                "state": state,
+                "createdByConversation": !first_before.contains_key(path) && !after.exists,
+                "sizeBytes": after.size_bytes,
+            })
+        })
+        .collect();
+    serde_json::json!({ "turns": turns_seen, "files": files })
+}
+
+/// #25: the current trust verdict for the workspace, as the API renders it.
+pub fn trust_state(store: &okra_policy::ProjectTrustStore, cwd: &Path) -> serde_json::Value {    let gated = gated_workspace_files(cwd);
+    if gated.is_empty() {
+        return serde_json::json!({
+            "verdict": "none",
+            "message": "no workspace-provided content to activate",
+            "gatedFiles": [],
+        });
+    }
+    let digest = okra_policy::content_digest(cwd, &gated);
+    match okra_policy::ensure_trusted(store, cwd, &gated) {
+        okra_policy::TrustVerdict::Trusted { .. } => serde_json::json!({
+            "verdict": "trusted", "digest": digest,
+            "gatedFiles": gated.iter().filter_map(|f| f.strip_prefix(cwd).ok()).filter_map(|r| r.to_str()).collect::<Vec<_>>(),
+        }),
+        okra_policy::TrustVerdict::Changed { stored, current } => serde_json::json!({
+            "verdict": "changed", "storedDigest": stored, "digest": current,
+            "message": "the project's activatable content changed since you trusted it — it stays inert until you re-trust",
+            "gatedFiles": gated.iter().filter_map(|f| f.strip_prefix(cwd).ok()).filter_map(|r| r.to_str()).collect::<Vec<_>>(),
+        }),
+        okra_policy::TrustVerdict::Untrusted => serde_json::json!({
+            "verdict": "untrusted", "digest": digest,
+            "message": "this project provides skills, commands, MCP servers or settings that stay INERT until you trust it",
+            "gatedFiles": gated.iter().filter_map(|f| f.strip_prefix(cwd).ok()).filter_map(|r| r.to_str()).collect::<Vec<_>>(),
+        }),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_turn_streaming(
     broadcast: BroadcastFn,
@@ -1766,6 +1984,10 @@ pub fn run_turn_streaming(
     mediation: (okra_policy::lattice::MediationPolicy, Option<String>),
     mediation_probe: Option<okra_policy::mediation::AttachedProbe>,
     subagent_provider: Option<(String, String)>,
+    permissions: Option<PermissionLearningHandle>,
+    // #25: when present, workspace-provided content activates only if the
+    // project is trusted at its current content digest.
+    trust: Option<okra_policy::ProjectTrustStore>,
 ) -> Result<TurnOutcome, String> {
     let steering_rx = steering;
     // attachments fold BEFORE anything surfaces: model-visible means
@@ -1857,6 +2079,35 @@ pub fn run_turn_streaming(
     // N0034: delegation — the model can spawn a kernel-isolated subagent
     // (real worktree, confined child turn, work committed to a branch)
     register_subagent_tool(&mut registry, &cwd, &session_id, subagent_provider);
+
+    // #16 deferred tool discovery: the compact directory indexes every
+    // REGISTERED tool (native + MCP + interaction + subagent); the model
+    // searches it on demand and receives full schemas for the matches.
+    {
+        let index = Arc::new(okra_tools::DiscoveryIndex::new());
+        let entries: Vec<okra_tools::DiscoveryEntry> = registry
+            .entries()
+            .into_iter()
+            .map(|e| okra_tools::DiscoveryEntry {
+                name: e.spec.name.clone(),
+                description: e.spec.description.clone(),
+                source: if e.spec.kind.as_deref() == Some("mcp") {
+                    format!("mcp:{}", e.spec.namespace.clone().unwrap_or_else(|| "server".into()))
+                } else {
+                    "native".into()
+                },
+                schema: e.spec.arguments_schema.clone(),
+            })
+            .collect();
+        index.refresh(entries);
+        let search = okra_tools::ToolSearch { index };
+        let entry = search.entry();
+        let _ = registry.register(okra_tools::ErasedTool::simple(
+            entry,
+            vec![],
+            move |args: &serde_json::Value| search.execute(args),
+        ));
+    }
 
     // N0023: computer control tools (Claude Desktop parity, AX-first).
     // The approval card IS the split consent: computer_act's card grants
@@ -2013,6 +2264,13 @@ pub fn run_turn_streaming(
         approval_service.add_channel(Box::new(mediator));
     }
     let mut executor = okra_agent_core::loop_::PolicyToolExecutor::new(registry, approval_service);
+    // #24: persisted project rules ride every turn's lattice (loaded at
+    // daemon start; /api/rules keeps both in step)
+    if let Some(perms) = &permissions {
+        for rule in perms.lattice.lock().unwrap().rules().to_vec() {
+            executor.lattice.add_rule(rule);
+        }
+    }
     // Attended surfaces (the workbench) ASK through the bridge: the turn
     // pauses on a non-read-only tool until a surface resolves it. Headless
     // stdio bridges run UnattendedAllowed (no approver exists there);
@@ -2191,8 +2449,32 @@ pub fn run_turn_streaming(
             okra_host::fsutil::home_dir().unwrap_or_else(|| cwd.clone()),
             cwd.clone(),
         );
-        let skill_catalog =
-            okra_memory::SkillCatalog::load_dir(&cwd.join(".okra").join("skills"));
+        // #25 project trust: workspace-provided skills stay INERT until the
+        // project is trusted (or re-trusted after its content changed).
+        // User-scope content (~/.okra/skills) is unaffected — trust gates
+        // what the PROJECT brought in, not what the user installed.
+        let gated = gated_workspace_files(&cwd);
+        let workspace_content_trusted = gated.is_empty()
+            || trust.as_ref().map(|t| {
+                matches!(
+                    okra_policy::ensure_trusted(t, &cwd, &gated),
+                    okra_policy::TrustVerdict::Trusted { .. }
+                )
+            }).unwrap_or(false);
+        let skills_root = if workspace_content_trusted {
+            cwd.join(".okra").join("skills")
+        } else {
+            if !gated.is_empty() {
+                eprintln!(
+                    "[trust] workspace content held INERT: {} gated file(s) not trusted (trust over POST /api/trust)",
+                    gated.len()
+                );
+            }
+            // load_dir fails open on absent dirs — a nonexistent path IS
+            // the empty catalog; the PROJECT skills alone are gated here
+            cwd.join(".okra").join("skills").join(".untrusted-gate")
+        };
+        let skill_catalog = okra_memory::SkillCatalog::load_dir(&skills_root);
         // n0035: prompt-relevant skill retrieval (embedding tier). Offline
         // hashed embeddings by default — deterministic, keyless; the
         // network tier engages with OKRA_EMBEDDINGS=on + a credential and
@@ -2268,6 +2550,20 @@ pub fn run_turn_streaming(
                 r["startedAt"] = serde_json::json!(now_ms());
                 p.upsert_row(r);
                 tool_row_by_call.insert(id, row_id);
+            }
+            LoopEvent::ApprovalGranted { tool, path, scope } => {
+                // #24: evidence for the ruleset learner. A human still
+                // confirms any suggested rule over POST /api/rules —
+                // nothing lands in settings from this arm.
+                if let Some(perms) = &permissions {
+                    let outcome = okra_policy::ApprovalOutcome::AllowedOnce;
+                    let scope = match scope.as_str() {
+                        "conversation" => okra_policy::ApprovalScope::Conversation,
+                        "always" => okra_policy::ApprovalScope::Always,
+                        _ => okra_policy::ApprovalScope::Once,
+                    };
+                    perms.learner.lock().unwrap().observe(&tool, path.as_deref(), outcome, scope);
+                }
             }
             LoopEvent::ToolCallFinished { id, name, is_error, output } => {
                 let row_id = tool_row_by_call.get(&id).copied();
@@ -3458,6 +3754,8 @@ pub fn serve_stdio(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) ->
                             Some(session_checkpoints),
                             turn_ordinal,
                             (okra_policy::lattice::MediationPolicy::FirstResponder, None),
+                            None,
+                            None,
                             None,
                             None,
                         ) {

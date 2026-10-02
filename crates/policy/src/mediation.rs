@@ -17,7 +17,7 @@
 //! Mediation composes with the ApprovalService waterfall: the mediator
 //! IS one channel; `None` (no verdict) hands the ask onward.
 
-use crate::approval::{ApprovalChannel, ApprovalOutcome, ApprovalRequest};
+use crate::approval::{ApprovalAnswer, ApprovalChannel, ApprovalOutcome, ApprovalRequest, ApprovalScope};
 use crate::lattice::MediationPolicy;
 
 /// Where a client runs — `local` surfaces (loopback UIs on the same
@@ -70,11 +70,20 @@ impl Mediator {
 
 impl ApprovalChannel for Mediator {
     fn answer(&self, request: &ApprovalRequest) -> Option<ApprovalOutcome> {
+        self.answer_scoped(request).map(|a| a.outcome)
+    }
+
+    /// The scoped path (#53): the scope rides on the answer wherever the
+    /// policy has ONE answerer (first-responder, designated, local-only
+    /// first local). Consensus keeps its unanimous-outcome rule; the scope
+    /// of a consensus allow is the TIGHTEST scope any client claimed — a
+    /// widening requires unanimity, a narrowing never blocks the grant.
+    fn answer_scoped(&self, request: &ApprovalRequest) -> Option<ApprovalAnswer> {
         match self.policy {
             MediationPolicy::FirstResponder => self
                 .clients
                 .iter()
-                .find_map(|c| c.channel.answer(request)),
+                .find_map(|c| c.channel.answer_scoped(request)),
             MediationPolicy::Designated => {
                 let designated = self.designated.as_deref()?;
                 // the designation must name a LIVE surface: absent → the
@@ -89,15 +98,21 @@ impl ApprovalChannel for Mediator {
                     .iter()
                     .find(|c| c.id == designated)?
                     .channel
-                    .answer(request)
+                    .answer_scoped(request)
             }
             MediationPolicy::Consensus => {
                 // silence is not consent; a rejection anywhere rejects
                 let mut granted = 0;
+                let mut tightest = ApprovalScope::Always;
                 for client in &self.clients {
-                    match client.channel.answer(request) {
-                        Some(ApprovalOutcome::AllowedOnce) => granted += 1,
-                        Some(other) => return Some(other),
+                    match client.channel.answer_scoped(request) {
+                        Some(a) if a.outcome == ApprovalOutcome::AllowedOnce => {
+                            granted += 1;
+                            if (a.scope as u8) < (tightest as u8) {
+                                tightest = a.scope;
+                            }
+                        }
+                        Some(other) => return Some(ApprovalAnswer::new(other.outcome)),
                         None => return None,
                     }
                 }
@@ -105,7 +120,7 @@ impl ApprovalChannel for Mediator {
                     return None;
                 }
                 if granted == self.clients.len() {
-                    Some(ApprovalOutcome::AllowedOnce)
+                    Some(ApprovalAnswer::scoped(ApprovalOutcome::AllowedOnce, tightest))
                 } else {
                     None
                 }
@@ -113,7 +128,7 @@ impl ApprovalChannel for Mediator {
             MediationPolicy::LocalOnly => self
                 .locals()
                 .into_iter()
-                .find_map(|c| c.channel.answer(request)),
+                .find_map(|c| c.channel.answer_scoped(request)),
         }
     }
 }
@@ -228,7 +243,7 @@ mod tests {
         one_no.add_client("b", false, Scripted::deny());
         assert_eq!(one_no.answer(&req()), Some(O::Rejected), "one rejection rejects");
 
-        let mut empty = Mediator::new(MediationPolicy::Consensus);
+        let empty = Mediator::new(MediationPolicy::Consensus);
         assert_eq!(empty.answer(&req()), None, "no clients attached: no verdict");
     }
 

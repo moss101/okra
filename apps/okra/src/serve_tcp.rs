@@ -108,6 +108,16 @@ pub struct TcpServeState {
     /// N0034: provider/model flags the subagent child turns inherit
     /// (None → the offline demo planner, hermetic by default).
     pub subagent_provider: Option<(String, String)>,
+    /// #24/#53: the daemon-side permission learner + shared lattice.
+    /// Granted approvals feed the learner; confirmed rules land here and
+    /// persist to workspace settings (`permissions.rules`).
+    pub permissions: crate::serve::PermissionLearningHandle,
+    /// #25: the user-scope project-trust store (workspace content stays
+    /// inert until trusted).
+    pub trust: okra_policy::ProjectTrustStore,
+    /// #33 memory curation: candidates the extract agent proposed from
+    /// user turns; a human accepts (append to a memory tier) or dismisses.
+    pub memory_suggestions: Arc<Mutex<Vec<okra_memory::MemoryCandidate>>>,
     next_static: std::sync::atomic::AtomicU64,
 }
 
@@ -147,6 +157,15 @@ impl TcpServeState {
             .with_durable_mirror(mirror.clone());
         let _ = checkpoint_mgr.load_durable_mirror(mirror);
         let checkpoints = Arc::new(Mutex::new(checkpoint_mgr));
+        // #24: persisted project rules seed the shared lattice so every
+        // turn honors them; #25: the user-scope trust store
+        let permissions = crate::serve::PermissionLearning::load(&home, &cwd);
+        let trust = okra_policy::ProjectTrustStore::at(
+            okra_host::fsutil::home_dir()
+                .unwrap_or_else(|| cwd.clone())
+                .join(".okra")
+                .join("trusted-projects.json"),
+        );
         TcpServeState {
             cwd,
             sessions_dir,
@@ -171,6 +190,9 @@ impl TcpServeState {
             sampler_label,
             mediation,
             subagent_provider,
+            permissions,
+            trust,
+            memory_suggestions: Arc::new(Mutex::new(Vec::new())),
             next_static: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -655,6 +677,244 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
         };
     }
 
+    // #33 memory curation actions: accept (append to a tier), dismiss,
+    // dream (consolidation report over the current tiers)
+    if method == "POST" && path == "/api/memory" {
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 {
+            reader.read_exact(&mut body)?;
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        let action = parsed["action"].as_str().unwrap_or_default();
+        let home = okra_host::fsutil::home_dir().unwrap_or_else(|| state.cwd.clone());
+        let reader = okra_memory::TieredReader::new(home, state.cwd.clone());
+        return match action {
+            "accept" => {
+                let Some(text) = parsed["text"].as_str().map(str::to_string) else {
+                    return write_http(
+                        stream,
+                        400,
+                        "error",
+                        br#"{"error":"text required"}"#.as_slice(),
+                    );
+                };
+                let tier = match parsed["tier"].as_str() {
+                    Some("project") => okra_memory::MemoryTier::Project,
+                    Some("team") => okra_memory::MemoryTier::Team,
+                    _ => okra_memory::MemoryTier::User,
+                };
+                // secret scan before persistence (the memory crate's own rule)
+                if !okra_memory::scan_secrets(&text).is_empty() {
+                    return write_http(
+                        stream,
+                        422,
+                        "error",
+                        br#"{"error":"candidate looks like it contains a secret; not stored"}"#.as_slice(),
+                    );
+                }
+                match reader.append_tier(tier, &text) {
+                    Ok(count) => {
+                        state
+                            .memory_suggestions
+                            .lock()
+                            .unwrap()
+                            .retain(|c| c.text != text);
+                        let body = serde_json::json!({ "accepted": true, "tier": format!("{tier:?}").to_lowercase(), "lines": count });
+                        write_http(
+                            stream,
+                            200,
+                            "OK",
+                            serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+                        )
+                    }
+                    Err(e) => write_http(
+                        stream,
+                        500,
+                        "error",
+                        serde_json::to_vec(&serde_json::json!({ "error": e.to_string() }))
+                            .unwrap_or_default()
+                            .as_slice(),
+                    ),
+                }
+            }
+            "dismiss" => {
+                let text = parsed["text"].as_str().unwrap_or_default().to_string();
+                state.memory_suggestions.lock().unwrap().retain(|c| c.text != text);
+                write_http(
+                    stream,
+                    200,
+                    "OK",
+                    br#"{"dismissed":true}"#[..].into(),
+                )
+            }
+            "dream" => {
+                let mut lines: Vec<String> = Vec::new();
+                for tier in [
+                    okra_memory::MemoryTier::User,
+                    okra_memory::MemoryTier::Team,
+                    okra_memory::MemoryTier::Project,
+                ] {
+                    lines.extend(reader.lines_of(tier));
+                }
+                let report = okra_memory::dream(&lines);
+                let body = serde_json::json!({
+                    "total": report.total,
+                    "clusters": report.clusters.iter().map(|c| serde_json::json!({
+                        "members": c.members,
+                        "suggestedMerge": c.suggested_merge,
+                    })).collect::<Vec<_>>(),
+                    "contradictions": report.contradictions.iter().map(|c| serde_json::json!({
+                        "a": c.a, "b": c.b,
+                    })).collect::<Vec<_>>(),
+                });
+                write_http(
+                    stream,
+                    200,
+                    "OK",
+                    serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+                )
+            }
+            _ => write_http(
+                stream,
+                400,
+                "error",
+                br#"{"error":"action must be accept|dismiss|dream"}"#.as_slice(),
+            ),
+        };
+    }
+
+    // #25 trust decisions: trust (records the CURRENT content digest) or
+    // revoke (re-gates). Never auto-applied by any turn path.
+    if method == "POST" && path == "/api/trust" {
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 {
+            reader.read_exact(&mut body)?;
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        let action = parsed["action"].as_str().unwrap_or_default();
+        let result = match action {
+            "trust" => {
+                let gated = serve::gated_workspace_files(&state.cwd);
+                let digest = okra_policy::content_digest(&state.cwd, &gated);
+                state.trust.trust(&state.cwd, &digest).map(|_| {
+                    serde_json::json!({ "trusted": true, "digest": digest })
+                })
+            }
+            "revoke" => state.trust.revoke(&state.cwd).map(|removed| {
+                serde_json::json!({ "trusted": false, "revoked": removed })
+            }),
+            other => Err(std::io::Error::other(format!("unknown trust action `{other}`"))),
+        };
+        return match result {
+            Ok(body) => write_http(
+                stream,
+                200,
+                "OK",
+                serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+            ),
+            Err(e) => write_http(
+                stream,
+                400,
+                "error",
+                serde_json::to_vec(&serde_json::json!({ "error": e.to_string() }))
+                    .unwrap_or_default()
+                    .as_slice(),
+            ),
+        };
+    }
+
+    // #24 ruleset learning: confirm (apply → shared lattice + settings) or
+    // dismiss a suggestion. A confirmed rule takes effect on the NEXT turn
+    // (each turn's lattice is seeded from the shared one).
+    if method == "POST" && path == "/api/rules" {
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 {
+            reader.read_exact(&mut body)?;
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        let action = parsed["action"].as_str().unwrap_or_default();
+        let Some(tool) = parsed["tool"].as_str().map(str::to_string) else {
+            return write_http(
+                stream,
+                400,
+                "error",
+                br#"{"error":"tool required"}"#.as_slice(),
+            );
+        };
+        let prefix = parsed["pathPrefix"].as_str().map(str::to_string);
+        let perms = Arc::clone(&state.permissions);
+        return match action {
+            "apply" => {
+                let rule = okra_policy::PermissionRule {
+                    tool: tool.clone(),
+                    path_prefix: prefix.clone(),
+                    effect: okra_policy::RuleEffect::Allow,
+                    source: okra_policy::RuleSource::Project,
+                };
+                // the suggestion must still not contradict the lattice (a
+                // deny may have landed meanwhile): re-check before insert
+                let contradicted = perms
+                    .lattice
+                    .lock()
+                    .unwrap()
+                    .rules()
+                    .iter()
+                    .any(|r| {
+                        r.tool == tool
+                            && r.path_prefix == prefix
+                            && r.effect == okra_policy::RuleEffect::Deny
+                    });
+                if contradicted {
+                    return write_http(
+                        stream,
+                        409,
+                        "error",
+                        br#"{"error":"a deny rule for this tool already exists"}"#.as_slice(),
+                    );
+                }
+                let home = okra_host::fsutil::home_dir().unwrap_or_else(|| state.cwd.clone());
+                match serve::persist_rule(&home, &state.cwd, &rule) {
+                    Ok(count) => {
+                        perms.lattice.lock().unwrap().add_rule(rule);
+                        let body = serde_json::json!({ "applied": true, "rules": count });
+                        write_http(
+                            stream,
+                            200,
+                            "OK",
+                            serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+                        )
+                    }
+                    Err(e) => write_http(
+                        stream,
+                        500,
+                        "error",
+                        serde_json::to_vec(&serde_json::json!({ "error": e }))
+                            .unwrap_or_default()
+                            .as_slice(),
+                    ),
+                }
+            }
+            "dismiss" => {
+                perms.dismissed.lock().unwrap().push((tool, prefix));
+                write_http(
+                    stream,
+                    200,
+                    "OK",
+                    br#"{"dismissed":true}"#[..].into(),
+                )
+            }
+            _ => write_http(
+                stream,
+                400,
+                "error",
+                br#"{"error":"action must be apply|dismiss"}"#.as_slice(),
+            ),
+        };
+    }
+
     // n0041: run a workflow over the daemon — validate first (422 with
     // the report), then engine + live workflowRuns projection; deltas
     // broadcast to every attached surface as v4/workflowRuns frames
@@ -924,6 +1184,77 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
     }
     if path == "/api/mcp" {
         let body = serve::mcp_listing(&state.cwd, &state.mcp_status);
+        return write_http(
+            stream,
+            200,
+            "OK",
+            serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+        );
+    }
+
+    // #25 project trust: the workspace's activation gate
+    if path == "/api/trust" {
+        let body = serve::trust_state(&state.trust, &state.cwd);
+        return write_http(
+            stream,
+            200,
+            "OK",
+            serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+        );
+    }
+
+    // M3 watchers: per-conversation file surface over the checkpoint log
+    if path == "/api/watchers" || path.starts_with("/api/watchers?") {
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let session = query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("session="))
+            .unwrap_or_default();
+        let turns = if session.is_empty() {
+            0
+        } else {
+            state.session_turns.lock().unwrap().get(session).copied().unwrap_or(0)
+        };
+        let mgr = state.checkpoints.lock().unwrap();
+        let body = serve::watchers_state(&mgr, &state.cwd, turns);
+        return write_http(
+            stream,
+            200,
+            "OK",
+            serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+        );
+    }
+
+    // #33 memory curation: extract-agent proposals + dream consolidation
+    if path == "/api/memory/suggestions" {
+        let sug = state.memory_suggestions.lock().unwrap();
+        let body = serde_json::json!({
+            "suggestions": sug.iter().map(|c| serde_json::json!({
+                "text": c.text,
+                "kind": match c.kind { okra_memory::MemoryKind::Preference => "preference", okra_memory::MemoryKind::ProjectFact => "project_fact" },
+                "source": c.source,
+            })).collect::<Vec<_>>(),
+        });
+        return write_http(
+            stream,
+            200,
+            "OK",
+            serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+        );
+    }
+
+    // #24 ruleset learning: current suggestions (lattice + dismissal aware)
+    if path == "/api/rules/suggestions" {
+        let suggestions = state.permissions.suggestions(2, 5);
+        let body = serde_json::json!({
+            "suggestions": suggestions.iter().map(|s| serde_json::json!({
+                "tool": s.rule.tool,
+                "pathPrefix": s.rule.path_prefix,
+                "effect": serde_json::to_value(s.rule.effect).unwrap_or_default(),
+                "occurrences": s.occurrences,
+                "because": s.because,
+            })).collect::<Vec<_>>(),
+        });
         return write_http(
             stream,
             200,
@@ -1494,14 +1825,20 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
         }
         let approval_id = envelope["payload"]["approvalId"].as_str().unwrap_or_default();
         let allow = envelope["payload"]["decision"].as_str() == Some("allow");
+        // #53: optional scope on an allow — "once" (default) | "conversation" | "always"
+        let scope = match envelope["payload"]["scope"].as_str() {
+            Some("conversation") => okra_policy::ApprovalScope::Conversation,
+            Some("always") => okra_policy::ApprovalScope::Always,
+            _ => okra_policy::ApprovalScope::Once,
+        };
         let resolved = state
             .approval_bridges
             .lock()
             .unwrap()
             .get(&session_id)
-            .map(|b| b.resolve(approval_id, allow))
+            .map(|b| b.resolve_scoped(approval_id, allow, scope))
             .unwrap_or(false);
-        eprintln!("[serve-tcp] resolveApproval: session={session_id} id={approval_id} allow={allow} known={resolved}");
+        eprintln!("[serve-tcp] resolveApproval: session={session_id} id={approval_id} allow={allow} scope={scope:?} known={resolved}");
         return serde_json::json!({
             "commandId": command_id,
             "status": if resolved { "accepted" } else { "rejected" },
@@ -1681,7 +2018,7 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
             });
             let _ = run_turn_streaming(
                 broadcast, turn_topic.clone(), turn_session.clone(),
-                turn_cwd.clone(), turn_sdir.clone(), entry.text,
+                turn_cwd.clone(), turn_sdir.clone(), entry.text.clone(),
                 projection, Some(Arc::clone(&steer_queue)),
                 Arc::clone(&stop_flag), &factory,
                 Arc::clone(&bridge), false,
@@ -1695,7 +2032,29 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
                 mediation.clone(),
                 mediation_probe.clone(),
                 subagent_provider.clone(),
+                Some(Arc::clone(&state2.permissions)),
+                Some(state2.trust.clone()),
             );
+            // #33 extract agent: propose durable memories from what the
+            // USER said this turn. Proposals never self-accept — the
+            // surface shows them and a human confirms over /api/memory.
+            {
+                let existing = {
+                    let home = okra_host::fsutil::home_dir()
+                        .unwrap_or_else(|| state2.cwd.clone());
+                    okra_memory::TieredReader::new(home, state2.cwd.clone())
+                        .lines_of(okra_memory::MemoryTier::User)
+                };
+                let cands = okra_memory::extract_memories(&entry.text, &existing);
+                if !cands.is_empty() {
+                    let mut sug = state2.memory_suggestions.lock().unwrap();
+                    for c in cands {
+                        if !sug.iter().any(|s| s.text == c.text) {
+                            sug.push(c);
+                        }
+                    }
+                }
+            }
             let queued: Vec<crate::serve::SteeredInput> = {
                 let mut q = steer_queue.lock().unwrap(); q.drain(..).collect()
             };

@@ -74,7 +74,16 @@ M3  host services + alpha       ◐ strangler: SQLite session/task index
                                   ported diff to EVERY surface, protocol
                                   reducer reconstructs the run; TypeSafe
                                   Jev step gate on autonomous step text,
-                                  inert by default); G2 live PASSED vs a real
+                                  inert by default); approval SCOPES +
+                                  ruleset learning + project trust
+                                  (n0043: #53 once/conversation/always —
+                                  the outcome union stays the closed
+                                  four; #24 granted decisions become
+                                  human-confirmed project rules persisted
+                                  to settings; #25 workspace content
+                                  inert until the project is trusted at
+                                  its content digest, drift re-gates);
+                                  G2 live PASSED vs a real
                                   network model (glm-5.3-flash) INCLUDING
                                   the FULL 100-turn / 1,352-read live
                                   profile: flat context (peak 19.9k ≤ 20k),

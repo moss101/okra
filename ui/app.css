@@ -1474,3 +1474,48 @@ html[data-theme="light"] .icon-moon { display: none; }
   padding: 6px 10px; cursor: pointer;
 }
 .ghost-btn:hover { color: var(--text-1, #eee); border-color: var(--accent, #6792ff); }
+
+/* ---- #53 approval scope menu (allow split button) ---- */
+.approval-actions { position: relative; }
+.approval-btn.scope-more {
+  padding-left: 7px; padding-right: 7px; font-size: 10px; line-height: 1;
+  opacity: 0.85;
+}
+.scope-menu {
+  position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 30;
+  display: flex; flex-direction: column; min-width: 230px;
+  background: var(--surface-raised, #1c1c1c);
+  border: 1px solid var(--border, #333); border-radius: var(--radius-md);
+  box-shadow: 0 10px 28px rgba(0,0,0,0.35); overflow: hidden;
+}
+.scope-item {
+  appearance: none; border: 0; background: transparent; color: var(--text-1, #eee);
+  text-align: left; padding: 9px 12px; font-size: 12.5px; cursor: pointer;
+}
+.scope-item:hover { background: var(--accent-soft, rgba(16,185,129,0.14)); }
+
+/* ---- #24 ruleset suggestions (confirm-to-apply cards) ---- */
+.rule-suggestions {
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 0 var(--pad-x, 20px); margin-top: 10px;
+}
+.rule-card {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface-raised));
+  border-radius: var(--radius-md); padding: 9px 12px; font-size: 12.5px;
+}
+.rule-text { color: var(--text-1, #eee); }
+.rule-actions { display: flex; gap: 7px; flex-shrink: 0; }
+
+/* ---- #25 project trust banner ---- */
+.trust-banner {
+  display: flex; align-items: center; gap: 12px;
+  margin: 10px var(--pad-x, 20px) 0;
+  padding: 9px 12px; font-size: 12.5px;
+  border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
+  background: color-mix(in srgb, var(--warning) 9%, var(--surface-raised));
+  border-radius: var(--radius-md); color: var(--text-1, #eee);
+}
+.trust-banner[hidden] { display: none; }
+.trust-msg { flex: 1; }

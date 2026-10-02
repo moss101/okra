@@ -1270,13 +1270,35 @@ function renderApprovalCard(r) {
 
   const actions = el('div', 'approval-actions');
   if (pending) {
+    // #53: the allow button is a SPLIT — pick the grant's lifetime. Once
+    // stays default; the ▾ opens this-conversation / always. Denials are
+    // scope-free by contract.
     const allow = el('button', 'approval-btn allow', 'Allow once');
     allow.type = 'button';
-    allow.addEventListener('click', () => resolveApproval(r.approvalId, true));
+    allow.addEventListener('click', () => resolveApproval(r.approvalId, true, 'once'));
+    const more = el('button', 'approval-btn allow scope-more', '▾');
+    more.type = 'button';
+    more.title = 'Grant for longer';
+    more.setAttribute('aria-label', 'More grant scopes');
+    more.addEventListener('click', () => {
+      const menu = el('div', 'scope-menu');
+      const conv = el('button', 'scope-item', 'Allow for this conversation');
+      conv.type = 'button';
+      conv.addEventListener('click', () => { menu.remove(); resolveApproval(r.approvalId, true, 'conversation'); });
+      const always = el('button', 'scope-item', 'Allow always (suggest a rule)');
+      always.type = 'button';
+      always.addEventListener('click', () => { menu.remove(); resolveApproval(r.approvalId, true, 'always'); });
+      menu.appendChild(conv);
+      menu.appendChild(always);
+      actions.appendChild(menu);
+      const close = (e) => { if (!menu.contains(e.target)) { menu.remove(); document.removeEventListener('click', close); } };
+      setTimeout(() => document.addEventListener('click', close), 0);
+    });
     const deny = el('button', 'approval-btn deny', 'Deny');
     deny.type = 'button';
-    deny.addEventListener('click', () => resolveApproval(r.approvalId, false));
+    deny.addEventListener('click', () => resolveApproval(r.approvalId, false, 'once'));
     actions.appendChild(allow);
+    actions.appendChild(more);
     actions.appendChild(deny);
   } else {
     const st = r.state === 'allowed' ? 'allowed'
@@ -1303,6 +1325,105 @@ function prettyArgs(argsJson) {
   }
 }
 
+/* ---------- the ONE editor engine (N0047, #54) ----------
+ *
+ * Every text composer in the workbench — the task composer AND the
+ * question-card answer — is wrapped by this engine, so all surfaces share
+ * the same editing semantics: one undo/redo stack per surface (survives
+ * programmatic value sets, which break native textarea undo), Enter/Shift+
+ * Enter submit semantics, and autosize. ProseMirror+Yjs stays REJECTED for
+ * this implementation while the UI is dependency-free vanilla (N0008);
+ * the engine is the seam a rich editor would slot into (see .agents/notes/
+ * 0047-one-editor-engine.md).
+ */
+function createEditor(surface, opts) {
+  const o = opts || {};
+  let undoStack = [surface.value || ''];
+  let redoStack = [];
+  let suppress = false;
+
+  function snapshot() {
+    if (suppress) return;
+    const v = surface.value;
+    if (undoStack[undoStack.length - 1] === v) return;
+    undoStack.push(v);
+    if (undoStack.length > 200) undoStack.shift();
+    redoStack.length = 0;
+  }
+
+  function setValue(v) {
+    // programmatic set: collapses the stack to the new value (native undo
+    // cannot track across external mutations — ours records them)
+    suppress = false;
+    surface.value = v;
+    undoStack = [v];
+    redoStack.length = 0;
+    if (o.autosize) autosize();
+    if (o.onChange) o.onChange(v);
+  }
+
+  function undo() {
+    if (undoStack.length <= 1) return;
+    const cur = undoStack.pop();
+    redoStack.push(cur);
+    suppress = true;
+    surface.value = undoStack[undoStack.length - 1];
+    suppress = false;
+    if (o.autosize) autosize();
+    if (o.onChange) o.onChange(surface.value);
+  }
+
+  function redo() {
+    const nxt = redoStack.pop();
+    if (nxt === undefined) return;
+    undoStack.push(nxt);
+    suppress = true;
+    surface.value = nxt;
+    suppress = false;
+    if (o.autosize) autosize();
+    if (o.onChange) o.onChange(surface.value);
+  }
+
+  function autosize() {
+    if (surface.tagName !== 'TEXTAREA') return;
+    surface.style.height = 'auto';
+    surface.style.height = Math.min(surface.scrollHeight, o.maxHeight || 180) + 'px';
+  }
+
+  surface.addEventListener('input', () => {
+    snapshot();
+    if (o.autosize) autosize();
+    if (o.onChange) o.onChange(surface.value);
+  });
+  surface.addEventListener('keydown', (e) => {
+    const mod = e.metaKey || e.ctrlKey;
+    if (mod && e.key.toLowerCase() === 'z' && !e.shiftKey) {
+      e.preventDefault();
+      undo();
+      return;
+    }
+    if ((mod && e.key.toLowerCase() === 'z' && e.shiftKey)
+      || (mod && e.key.toLowerCase() === 'y')) {
+      e.preventDefault();
+      redo();
+      return;
+    }
+    if (o.onSubmit && e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      o.onSubmit(surface.value);
+    }
+  });
+
+  return {
+    surface,
+    get value() { return surface.value; },
+    setValue,
+    undo,
+    redo,
+    autosize,
+  };
+}
+
 /* ---------- question cards (ask_user flow) ---------- */
 
 function renderQuestionCard(q) {
@@ -1321,17 +1442,17 @@ function renderQuestionCard(q) {
   input.setAttribute('aria-label', 'Your answer');
   const submit = el('button', 'approval-btn allow', 'Answer');
   submit.type = 'button';
+  // the SAME editor engine as the task composer (one submit/undo contract)
+  createEditor(input, {
+    onSubmit: (v) => {
+      const answer = v.trim();
+      if (answer) answerQuestion(q.questionId, answer);
+    },
+  });
   submit.addEventListener('click', () => {
     const answer = input.value.trim();
     if (!answer) { input.focus(); return; }
     answerQuestion(q.questionId, answer);
-  });
-  input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      const answer = input.value.trim();
-      if (answer) answerQuestion(q.questionId, answer);
-    }
   });
   actions.appendChild(input);
   actions.appendChild(submit);
@@ -1352,17 +1473,97 @@ async function answerQuestion(questionId, answer) {
   }
 }
 
-async function resolveApproval(approvalId, allow) {
+async function resolveApproval(approvalId, allow, scope) {
   try {
     await post('/command', {
       commandId: 'web-apr-' + Date.now(),
       type: 'resolveApproval',
       sessionId: state.activeId,
-      payload: { approvalId, decision: allow ? 'allow' : 'deny' },
+      payload: { approvalId, decision: allow ? 'allow' : 'deny', scope: scope || 'once' },
     });
+    // #24: after an allow, refresh the learner's suggestions (an `always`
+    // or repeated allows may have produced one) and surface the newest.
+    if (allow) refreshRuleSuggestions();
+    if (allow && scope === 'always') checkTrust();
   } catch (e) {
     toast('error', 'Could not resolve approval', String(e));
   }
+}
+
+/* ---------- #24 ruleset suggestions + #25 project trust ---------- */
+
+async function refreshRuleSuggestions() {
+  try {
+    const res = await fetch('/api/rules/suggestions');
+    if (!res.ok) return;
+    const body = await res.json();
+    const list = body.suggestions || [];
+    if (!list.length) return;
+    for (const s of list) {
+      const key = 'rule:' + s.tool + ':' + (s.pathPrefix || '');
+      if (state.dismissedRules && state.dismissedRules.has(key)) continue;
+      showRuleSuggestion(s, key);
+    }
+  } catch (_) { /* suggestions are advisory; never fail a turn */ }
+}
+
+function showRuleSuggestion(s, key) {
+  const host = document.getElementById('rule-suggestions');
+  if (!host || host.querySelector('[data-key="' + CSS.escape(key) + '"]')) return;
+  const card = el('div', 'rule-card');
+  card.dataset.key = key;
+  const text = el('div', 'rule-text', s.because || ('Suggest a rule for ' + s.tool));
+  card.appendChild(text);
+  const actions = el('div', 'rule-actions');
+  const apply = el('button', 'approval-btn allow', 'Add rule');
+  apply.type = 'button';
+  apply.addEventListener('click', async () => {
+    try {
+      await post('/api/rules', { action: 'apply', tool: s.tool, pathPrefix: s.pathPrefix || null });
+      card.remove();
+      toast('ok', 'Rule added', 'Takes effect on the next turn and persists in .okra/settings.json');
+    } catch (e) { toast('error', 'Could not add rule', String(e)); }
+  });
+  const dismiss = el('button', 'approval-btn', 'Not now');
+  dismiss.type = 'button';
+  dismiss.addEventListener('click', async () => {
+    try { await post('/api/rules', { action: 'dismiss', tool: s.tool, pathPrefix: s.pathPrefix || null }); } catch (_) {}
+    (state.dismissedRules = state.dismissedRules || new Set()).add(key);
+    card.remove();
+  });
+  actions.appendChild(apply);
+  actions.appendChild(dismiss);
+  card.appendChild(actions);
+  host.appendChild(card);
+}
+
+async function checkTrust() {
+  const banner = document.getElementById('trust-banner');
+  if (!banner) return;
+  try {
+    const res = await fetch('/api/trust');
+    if (!res.ok) { banner.hidden = true; return; }
+    const t = await res.json();
+    if (t.verdict === 'trusted' || t.verdict === 'none') { banner.hidden = true; return; }
+    banner.hidden = false;
+    banner.textContent = '';
+    const msg = el('span', 'trust-msg', t.verdict === 'changed'
+      ? 'This project\u2019s skills/commands/config changed since you trusted it — they stay inert until you re-trust.'
+      : 'This project provides skills, commands, MCP servers or settings. They stay inert until you trust this project.');
+    banner.appendChild(msg);
+    if (t.verdict === 'changed' || t.verdict === 'untrusted') {
+      const btn = el('button', 'approval-btn allow', t.verdict === 'changed' ? 'Re-trust' : 'Trust project');
+      btn.type = 'button';
+      btn.addEventListener('click', async () => {
+        try {
+          await post('/api/trust', { action: 'trust' });
+          banner.hidden = true;
+          toast('ok', 'Project trusted', 'Workspace content activates on the next turn.');
+        } catch (e) { toast('error', 'Could not trust project', String(e)); }
+      });
+      banner.appendChild(btn);
+    }
+  } catch (_) { banner.hidden = true; }
 }
 
 /* ---------- composer state ---------- */
@@ -1790,7 +1991,14 @@ function init() {
   $('new-task').addEventListener('click', newTask);
 
   const input = $('composer-input');
-  input.addEventListener('input', () => { autosize(); updateSendDisabled(); updateMentions(); });
+  // the task composer runs through the SAME editor engine as the question
+  // cards (one undo/redo + submit contract; mentions keep priority below)
+  const composer = createEditor(input, {
+    autosize: true,
+    onChange: () => { updateSendDisabled(); updateMentions(); },
+    onSubmit: () => { if (!turnActive()) send(); },
+  });
+  window.__okraComposer = composer; // testable seam (harness drives it)
   input.addEventListener('keydown', (e) => {
     if (mentions.open) {
       const items = [...document.querySelectorAll('.mention-item')];
@@ -1809,7 +2017,7 @@ function init() {
       }
       if (e.key === 'Escape') { e.preventDefault(); closeMentions(); return; }
     }
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!turnActive()) send(); }
+    // submit + undo/redo are the engine's; nothing to re-handle here
   });
 
   $('send-btn').addEventListener('click', () => {
@@ -1874,6 +2082,10 @@ function init() {
   // the Changes tab rides the same cadence (writes land as diffs)
   setInterval(() => { loadSessions(); if (gitState.active) loadGit(); if (sessionsPage.open) renderSessionsPage(); }, 15000);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) loadSessions(); });
+
+  // #25: the trust gate is a first-load banner (workspace content stays
+  // inert until trusted); #24 suggestions refresh after allows
+  checkTrust();
 }
 
 init();

@@ -18,22 +18,26 @@
 pub mod approval;
 pub mod confine;
 pub mod grants;
+pub mod learning;
 pub mod lattice;
 pub mod mediation;
 pub mod nono_backend;
 pub mod profiles;
+pub mod trust;
 
 pub use approval::{
-    normalize_outcome, parse_ceiling, ApprovalAuditEvent, ApprovalChannel, ApprovalOutcome,
-    ApprovalPolicy, ApprovalRequest, ApprovalService, ToolApprovalCeiling,
+    normalize_outcome, parse_ceiling, ApprovalAnswer, ApprovalAuditEvent, ApprovalChannel,
+    ApprovalOutcome, ApprovalPolicy, ApprovalRequest, ApprovalScope, ApprovalService,
+    ToolApprovalCeiling,
 };
 pub use confine::{
     confinable, classify_failure, matches_denial, ConfinedArgv, FailureClassification, PartialWrapperBackend,
     RunnerFailureRule, SandboxEnforcement, SandboxError, SandboxExecutionPolicy, SandboxMode,
     SandboxProvider,
 };
-pub use grants::{Grant, GrantDecision, GrantScope, GrantStore};
+pub use grants::{Grant, GrantDecision, GrantScope, GrantStore, ScopedRecord, SessionToolGrant};
 pub use lattice::{Decision, MediationPolicy, PermissionLattice, RuleEffect, RuleSource, PermissionRule};
+pub use learning::{path_prefix, RulesetLearner, SuggestedPermissionUpdate};
 pub use nono_backend::{
     mode_for_profile_name, path_within, ConfinementReport, NonoSandboxBackend, SelfConfinement,
 };
@@ -41,3 +45,4 @@ pub use profiles::{
     merge_configs, parse_profile_name, resolve_profile, strict_profile, PathAccess, ProfileName,
     ProfileConfig, SandboxConfig, SandboxProfile,
 };
+pub use trust::{content_digest, ensure_trusted, ProjectTrustStore, TrustRecord, TrustVerdict};

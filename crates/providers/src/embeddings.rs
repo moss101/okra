@@ -76,7 +76,6 @@ impl EmbeddingClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
 
     fn spawn_mock_server(response: &'static str) -> (String, std::thread::JoinHandle<()>) {
         // robust request read: consume headers + declared content-length

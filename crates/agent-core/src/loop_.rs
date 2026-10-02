@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 
 use okra_kernel as kernel;
-use okra_policy::approval::{ApprovalOutcome, ApprovalPolicy, ApprovalService, ToolApprovalCeiling};
+use okra_policy::approval::{ApprovalPolicy, ApprovalService, ToolApprovalCeiling};
 use okra_policy::grants::{GrantDecision, GrantScope, GrantStore};
 use okra_policy::lattice::{Decision as LatticeDecision, PermissionLattice};
 use okra_policy::SandboxMode;
@@ -103,6 +103,14 @@ pub enum LoopEvent {
     Nudge { reason: String },
     CompactionNotice { note: String },
     TurnFinished { outcome: String },
+    /// #24: a granted approval with its user scope — the daemon's learner
+    /// turns the accumulated evidence into suggested permission updates a
+    /// human confirms before any project rule lands in settings.
+    ApprovalGranted { tool: String, path: Option<String>, scope: String },
+    /// #37: the sampler switched models mid-turn (recorded, never silent).
+    ModelFallback { from: String, to: String, reason: String },
+    /// #37: tool calls recovered from XML in a text-only response.
+    ToolCallsRecovered { count: usize },
     Error { message: String },
 }
 
@@ -254,7 +262,10 @@ impl ToolExecutor for PolicyToolExecutor {
                 LatticeDecision::Ask | LatticeDecision::Default | LatticeDecision::Allow => {}
             }
 
-            // grant check first: exact (tool, args hash, policy version)
+            // grant check first: exact (tool, args hash, policy version);
+            // then the weaker session tool grant (#53 — the user explicitly
+            // widened the scope for this conversation; never minted
+            // implicitly, dies with the session store)
             let unattended_yolo = self.ceiling == ToolApprovalCeiling::UnattendedAllowed
                 && self.approvals.policy() == ApprovalPolicy::Ask;
             if self.ceiling != ToolApprovalCeiling::AlwaysPrompt
@@ -262,14 +273,18 @@ impl ToolExecutor for PolicyToolExecutor {
                     == GrantDecision::Granted
             {
                 // granted for exactly these bytes
+            } else if self.ceiling != ToolApprovalCeiling::AlwaysPrompt
+                && self.grants.check_session_tool(&call.name, &behavior)
+            {
+                // granted by an explicit conversation/always scope (#53)
             } else if unattended_yolo {
                 // UnattendedAllowed ceiling: hosts with no session owner may
                 // honour yolo; the arg-hash grant still records the decision
                 // so the audit trail stays complete.
             } else {
-                let (outcome, audit) = self
+                let (outcome, scope, audit) = self
                     .approvals
-                    .decide(&call.name, &call.id, &args_json);
+                    .decide_scoped(&call.name, &call.id, &args_json);
                 self.approval_audit.lock().unwrap().extend(audit);
                 if !outcome.grants() {
                     events(LoopEvent::ToolCallFinished {
@@ -280,15 +295,35 @@ impl ToolExecutor for PolicyToolExecutor {
                     });
                     return Ok((format!("approval denied: {}", outcome.denial_reason()), true, false));
                 }
-                // mint the arg-hash-bound grant
-                self.grants.record_approval(
-                    ApprovalOutcome::AllowedOnce,
+                // mint the arg-hash-bound grant + the scoped records; the
+                // scope rides to the surface (#53) and the daemon's learner
+                // accumulates the evidence (#24 — a human confirms any rule)
+                let record = self.grants.record_approval_scoped(
+                    outcome,
+                    scope,
                     &call.name,
                     &args_json,
                     &behavior,
                     self.ceiling,
                     false,
                 );
+                let _ = record;
+                {
+                    // the suggestion's path scope: the approved call's own
+                    // path argument when it has one (file tools), so the
+                    // proposed rule stays coarse (first path component)
+                    let path = serde_json::from_str::<serde_json::Value>(&args_json)
+                        .ok()
+                        .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(str::to_string));
+                    events(LoopEvent::ApprovalGranted {
+                        tool: call.name.clone(),
+                        path,
+                        scope: serde_json::to_value(scope)
+                            .ok()
+                            .and_then(|v| v.as_str().map(str::to_string))
+                            .unwrap_or_else(|| "once".into()),
+                    });
+                }
             }
         }
 
@@ -752,6 +787,54 @@ impl<S: Sampler + ?Sized> Agent<S> {
             };
             usage_total = crate::backstops::accumulate(usage_total, response.usage);
 
+            // #37: a model switch is never silent — drain the fallback
+            // events the sampler recorded and surface + log each one.
+            for ev in self.sampler.drain_fallback_events() {
+                Self::emit(
+                    &mut out,
+                    LoopEvent::ModelFallback {
+                        from: ev.from.clone(),
+                        to: ev.to.clone(),
+                        reason: ev.reason.clone(),
+                    },
+                );
+                let mut lev = kernel::make_log_only_event(
+                    "model/fallback",
+                    serde_json::json!({ "from": ev.from, "to": ev.to, "reason": ev.reason }),
+                    clock,
+                );
+                lev.ignorable = Some(true);
+                self.log(vec![lev])?;
+            }
+
+            // #37 XML tool-call recovery: a model that answered in text
+            // instead of the structured field still gets its calls executed
+            // — through the same approved-bytes pipeline as any call. The
+            // recovered blocks leave the model-visible text.
+            let mut response = response;
+            if response.tool_calls.is_empty() && response.text.contains("<tool_call") {
+                let (cleaned, recovered) =
+                    okra_providers::recover_xml_tool_calls(&response.text);
+                if !recovered.is_empty() {
+                    Self::emit(
+                        &mut out,
+                        LoopEvent::ToolCallsRecovered { count: recovered.len() },
+                    );
+                    let mut lev = kernel::make_log_only_event(
+                        "assistant/tool_calls_recovered",
+                        serde_json::json!({
+                            "count": recovered.len(),
+                            "names": recovered.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+                        }),
+                        clock,
+                    );
+                    lev.ignorable = Some(true);
+                    self.log(vec![lev])?;
+                }
+                response.text = cleaned;
+                response.tool_calls = recovered;
+            }
+
             // ---- text streaming ----
             self.phase_transition(TurnPhase::Streaming, &mut out)?;
             let mut ts = okra_providers::TextStream::completed(&response.text);
@@ -975,11 +1058,12 @@ impl<S: Sampler + ?Sized> Agent<S> {
                                 "args": args_json.chars().take(400).collect::<String>(),
                             }),
                         ),
-                        okra_policy::ApprovalAuditEvent::Decided { id, outcome } => (
+                        okra_policy::ApprovalAuditEvent::Decided { id, outcome, scope } => (
                             "approval/decided",
                             serde_json::json!({
                                 "approvalId": id,
                                 "outcome": serde_json::to_value(outcome).unwrap_or_default(),
+                                "scope": scope.map(|s| serde_json::to_value(s).unwrap_or_default()),
                             }),
                         ),
                     };
