@@ -118,6 +118,9 @@ pub struct TcpServeState {
     /// #33 memory curation: candidates the extract agent proposed from
     /// user turns; a human accepts (append to a memory tier) or dismisses.
     pub memory_suggestions: Arc<Mutex<Vec<okra_memory::MemoryCandidate>>>,
+    /// Automation domain (#39/#40): durable scheduled turns; the scheduler
+    /// thread fires due specs through the normal sendText path.
+    pub automation: Arc<okra_host::automation::AutomationStore>,
     next_static: std::sync::atomic::AtomicU64,
 }
 
@@ -160,6 +163,11 @@ impl TcpServeState {
         // #24: persisted project rules seed the shared lattice so every
         // turn honors them; #25: the user-scope trust store
         let permissions = crate::serve::PermissionLearning::load(&home, &cwd);
+        // #39/#40: the automation store lives with the daemon's workspace
+        // state (.okra/automation.json, atomically rewritten)
+        let automation = Arc::new(okra_host::automation::AutomationStore::at(
+            cwd.join(".okra"),
+        ));
         let trust = okra_policy::ProjectTrustStore::at(
             okra_host::fsutil::home_dir()
                 .unwrap_or_else(|| cwd.clone())
@@ -193,6 +201,7 @@ impl TcpServeState {
             permissions,
             trust,
             memory_suggestions: Arc::new(Mutex::new(Vec::new())),
+            automation,
             next_static: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -216,6 +225,34 @@ impl TcpServeState {
 }
 
 pub fn serve_tcp(state: Arc<TcpServeState>, listener: std::net::TcpListener) -> ! {
+    // #39/#40 the automation scheduler: a 1s tick fires due scheduled
+    // turns through the SAME sendText path a surface uses (one turn gate,
+    // one projection, one approval bridge). A cron-fired turn is marked
+    // CronScheduled via the envelope marker, so the automation
+    // self-mutation guard denies cron_* inside it.
+    {
+        let state = Arc::clone(&state);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            for spec in state.automation.tick(now) {
+                eprintln!(
+                    "[automation] firing `{}` ({}) into session {}",
+                    spec.name, spec.id, spec.session_id
+                );
+                let envelope = serde_json::json!({
+                    "commandId": format!("auto-{}-{}", spec.id, spec.fire_count),
+                    "type": "sendText",
+                    "sessionId": spec.session_id,
+                    "payload": { "text": spec.prompt, "automation": "cron" },
+                });
+                let _ = command_accept(&state, &envelope);
+            }
+        });
+    }
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let state = Arc::clone(&state);
@@ -1980,6 +2017,13 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
     let turn_checkpoints = Arc::clone(&checkpoints);
     let mediation = state.mediation.clone();
     let subagent_provider = state.subagent_provider.clone();
+    // #39/#40: a scheduled automation's fired turn runs as CronScheduled —
+    // the tool-plane guard then denies cron_* inside it (automation may
+    // not reschedule itself). The marker rides the envelope.
+    let automation_dispatch = match envelope["payload"]["automation"].as_str() {
+        Some("cron") => Some(okra_agent_core::tasks::TurnDispatch::CronScheduled),
+        _ => None,
+    };
     // n0042: the designated policy consults LIVE attachment — the probe
     // maps the client id to the surface registry ("workbench" = Browser)
     let mediation_probe: Option<okra_policy::mediation::AttachedProbe> =
@@ -2034,6 +2078,8 @@ fn command_accept(state: &Arc<TcpServeState>, envelope: &serde_json::Value) -> s
                 subagent_provider.clone(),
                 Some(Arc::clone(&state2.permissions)),
                 Some(state2.trust.clone()),
+                automation_dispatch,
+                Some(Arc::clone(&state2.automation)),
             );
             // #33 extract agent: propose durable memories from what the
             // USER said this turn. Proposals never self-accept — the

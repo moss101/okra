@@ -1988,6 +1988,12 @@ pub fn run_turn_streaming(
     // #25: when present, workspace-provided content activates only if the
     // project is trusted at its current content digest.
     trust: Option<okra_policy::ProjectTrustStore>,
+    // #39/#40: when present, the turn's executor runs under this dispatch
+    // class (a cron-fired turn gets CronScheduled — the automation
+    // self-mutation guard then denies cron_* inside it), and the cron_*
+    // tools are registered against the store.
+    automation_dispatch: Option<okra_agent_core::tasks::TurnDispatch>,
+    automation_store: Option<Arc<okra_host::automation::AutomationStore>>,
 ) -> Result<TurnOutcome, String> {
     let steering_rx = steering;
     // attachments fold BEFORE anything surfaces: model-visible means
@@ -2106,6 +2112,132 @@ pub fn run_turn_streaming(
             entry,
             vec![],
             move |args: &serde_json::Value| search.execute(args),
+        ));
+    }
+    // #39/#40: the automation domain's tools. Side-effecting (they mutate
+    // the durable schedule table); the tool-plane guard denies cron_* on
+    // cron-fired and idle turns, so automation can never reschedule itself.
+    if let Some(store) = &automation_store {
+        let mk = |name: &str, desc: &str| okra_tools::ToolSpec {
+            name: name.into(),
+            namespace: None,
+            title: Some(name.into()),
+            description: desc.into(),
+            arguments_schema: Some(serde_json::json!({"type":"object"})),
+            kind: Some("automation".into()),
+            behavior_version: Some("1".into()),
+            idempotent: true,
+            read_only: false,
+            timeout_ms: Some(5_000),
+            max_concurrency: None,
+        };
+        let md = okra_tools::ToolMetadata { needs_approval: true, ..Default::default() };
+
+        let st = Arc::clone(store);
+        let mut spec = mk(
+            "cron_create",
+            "Create a scheduled automation: fires `prompt` into its own session either every `every_secs` seconds or daily at `at_hhmm` (UTC, \"HH:MM\").",
+        );
+        spec.arguments_schema = Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" },
+                "prompt": { "type": "string" },
+                "every_secs": { "type": "integer", "minimum": 10 },
+                "at_hhmm": { "type": "string", "description": "UTC, \"HH:MM\"" }
+            },
+            "required": ["name", "prompt"]
+        }));
+        let _ = registry.register(okra_tools::ErasedTool::simple(
+            okra_tools::ToolEntry::new(spec, md.clone()),
+            vec![okra_tools::ResourceAccess::All],
+            move |args: &serde_json::Value| {
+                // stable id from the spec content: same schedule → same id
+                let digest = okra_host::plugins::store::sha256_hex(args.to_string().as_bytes());
+                let id = format!("auto-{}", &digest[..10]);
+                let at = args["at_hhmm"].as_str().and_then(|s| {
+                    let mut it = s.split(':');
+                    Some((
+                        it.next()?.trim().parse::<u8>().ok()?,
+                        it.next()?.trim().parse::<u8>().ok()?,
+                    ))
+                });
+                let created = okra_host::automation::AutomationSpec {
+                    session_id: format!("auto-{id}"),
+                    id,
+                    name: args["name"].as_str().unwrap_or_default().into(),
+                    prompt: args["prompt"].as_str().unwrap_or_default().into(),
+                    every_secs: args["every_secs"].as_u64(),
+                    at_hhmm: at,
+                    created_at_epoch_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0),
+                    last_fired_epoch_ms: None,
+                    fire_count: 0,
+                    enabled: true,
+                };
+                match st.create(created) {
+                    Ok(spec) => okra_tools::ToolStream::terminal_only(Ok(
+                        okra_tools::ToolOutput::from_value(serde_json::json!({
+                            "created": true, "id": spec.id, "session": spec.session_id,
+                        })),
+                    )),
+                    Err(e) => okra_tools::ToolStream::terminal_only(Err(
+                        okra_tools::ToolError::tool_failed(e.to_string()),
+                    )),
+                }
+            },
+        ));
+
+        let st = Arc::clone(store);
+        let mut spec = mk("cron_list", "List the scheduled automations (id, schedule, fire count, enabled).");
+        spec.arguments_schema = Some(serde_json::json!({"type":"object"}));
+        let md_ro = okra_tools::ToolMetadata { read_only: true, needs_approval: false, concurrent_safe: true, allowed_in_plan_mode: Some(true), ..Default::default() };
+        let _ = registry.register(okra_tools::ErasedTool::simple(
+            okra_tools::ToolEntry::new(spec, md_ro),
+            vec![],
+            move |_args: &serde_json::Value| {
+                let items: Vec<serde_json::Value> = st
+                    .list()
+                    .into_iter()
+                    .map(|s| serde_json::json!({
+                        "id": s.id, "name": s.name, "prompt": s.prompt,
+                        "session": s.session_id,
+                        "everySecs": s.every_secs, "atHHMM": s.at_hhmm.map(|(h, m)| format!("{h:02}:{m:02}")),
+                        "fireCount": s.fire_count, "enabled": s.enabled,
+                    }))
+                    .collect();
+                okra_tools::ToolStream::terminal_only(Ok(okra_tools::ToolOutput::from_value(
+                    serde_json::json!({ "automations": items }),
+                )))
+            },
+        ));
+
+        let st = Arc::clone(store);
+        let mut spec = mk("cron_delete", "Delete a scheduled automation by id.");
+        spec.arguments_schema = Some(serde_json::json!({
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"]
+        }));
+        let _ = registry.register(okra_tools::ErasedTool::simple(
+            okra_tools::ToolEntry::new(spec, md.clone()),
+            vec![okra_tools::ResourceAccess::All],
+            move |args: &serde_json::Value| {
+                let id = args["id"].as_str().unwrap_or_default();
+                match st.delete(id) {
+                    Ok(true) => okra_tools::ToolStream::terminal_only(Ok(
+                        okra_tools::ToolOutput::from_value(serde_json::json!({ "deleted": true, "id": id })),
+                    )),
+                    Ok(false) => okra_tools::ToolStream::terminal_only(Err(
+                        okra_tools::ToolError::tool_failed(format!("no such automation: {id}")),
+                    )),
+                    Err(e) => okra_tools::ToolStream::terminal_only(Err(
+                        okra_tools::ToolError::tool_failed(e.to_string()),
+                    )),
+                }
+            },
         ));
     }
 
@@ -2264,6 +2396,12 @@ pub fn run_turn_streaming(
         approval_service.add_channel(Box::new(mediator));
     }
     let mut executor = okra_agent_core::loop_::PolicyToolExecutor::new(registry, approval_service);
+    // #39/#40: a cron-fired turn runs under CronScheduled — the automation
+    // self-mutation guard then denies cron_* inside it (automation may not
+    // reschedule itself); ordinary turns may create schedules.
+    if let Some(d) = automation_dispatch {
+        executor.turn_dispatch = d;
+    }
     // #24: persisted project rules ride every turn's lattice (loaded at
     // daemon start; /api/rules keeps both in step)
     if let Some(perms) = &permissions {
@@ -3754,6 +3892,8 @@ pub fn serve_stdio(cwd: std::path::PathBuf, sessions_dir: std::path::PathBuf) ->
                             Some(session_checkpoints),
                             turn_ordinal,
                             (okra_policy::lattice::MediationPolicy::FirstResponder, None),
+                            None,
+                            None,
                             None,
                             None,
                             None,

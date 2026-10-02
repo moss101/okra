@@ -7,6 +7,7 @@
 //!   ownership checks (§3 #52, ChatGPT2 docs/03)
 //! - fsutil: the single sanctioned canonicalize/home_dir call sites
 
+pub mod automation;
 pub mod bigmodel;
 pub mod bots;
 pub mod broadcast;
@@ -97,6 +98,7 @@ pub use client_info::{
 pub use broadcast::{Broadcast, BroadcastBus, BroadcastError};
 pub use feedback_logs::{attach_logs_to_ticket, DiagnosticAttachment, FeedbackArchiveError};
 pub use client_scenes::{cascaded_items, localized, parse_response_body, ClientSceneCatalog, SceneConfig, SceneItem, SceneOption};
+pub use automation::{AutomationError, AutomationSpec, AutomationStore};
 pub use checkpoints::{
     CheckpointError, CheckpointManager, FileSnapshot, GitState, RestoreReport, RewindCheckpoint,
     RewindPoint,
