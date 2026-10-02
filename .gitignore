@@ -2,3 +2,5 @@
 *.swp
 .DS_Store
 apps/desktop/node_modules/
+.okra-sessions/
+.okra/
