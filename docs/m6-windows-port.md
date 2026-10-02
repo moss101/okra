@@ -48,6 +48,20 @@ providing the runner/machine is a user decision).
 5. Only then: sandbox enforcement work (restricted token) — until then
    Windows ships `enforcement: partial` (honest, by contract).
 
+## Cross-check status (2026-10-02 re-verification)
+
+The dev machine cannot even TYPE-CHECK for Windows today, one step before
+the n0039 TLS blockage: the active toolchain is Homebrew rust 1.97.1
+(`rustc --print sysroot` → `/opt/homebrew/Cellar/rust/…`), whose sysroot
+carries no `rustlib/x86_64-pc-windows-msvc` std at all; `rustup target
+add` reports "up to date" against a toolchain it does not manage (a
+no-op), so `cargo check --target x86_64-pc-windows-msvc` dies with
+`E0463: can't find crate for core` on the first std-depending crate
+(serde_core, itoa, memchr, …). Also absent: NASM, mingw, CMake — the C
+toolchains both aws-lc-rs and ring need for msvc. Conclusion unchanged
+and sharpened: every Windows gate (cross-check, then bring-up) requires
+the user-provided runner; nothing code-side remains before it.
+
 ## Cross-check from macOS (2026-10-01, n0039)
 
 Attempted: `rustup target add x86_64-pc-windows-msvc` + `cargo check
