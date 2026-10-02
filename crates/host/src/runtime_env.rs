@@ -253,12 +253,21 @@ impl std::fmt::Display for CaptureError {
 
 impl std::error::Error for CaptureError {}
 
+#[cfg(unix)]
 fn is_executable_file(path: &str) -> bool {
     let c = match std::ffi::CString::new(path) {
         Ok(c) => c,
         Err(_) => return false,
     };
     unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 }
+}
+
+/// Windows first pass (docs/m6-windows-port.md): treat an existing file
+/// with an executable-ish extension as runnable; the login-shell probe
+/// falls through to PowerShell via the caller's candidate list anyway.
+#[cfg(not(unix))]
+fn is_executable_file(path: &str) -> bool {
+    std::path::Path::new(path).is_file()
 }
 
 /// `$SHELL` → /bin/zsh → /bin/bash → /bin/sh, first executable.
@@ -342,8 +351,13 @@ impl LoginShellExecutor for RealLoginShellExecutor {
         }
         // POSIX: own process group so profile-spawned descendants that
         // inherit stdout/stderr die with the group at the deadline
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
+        // (Windows: direct-child kill only — Job Objects are the recorded
+        // second-pass shim)
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         // sanctioned site: same probe spawn, see the comment on Command::new
         #[allow(clippy::disallowed_methods)]
         let mut child = command.spawn().map_err(|e| CaptureError::Io(e.to_string()))?;
@@ -361,8 +375,13 @@ impl LoginShellExecutor for RealLoginShellExecutor {
             }
             if std::time::Instant::now() >= deadline {
                 // kill the whole group, then the direct child fallback
-                let pid = child.id();
-                let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+                // (unix: group SIGKILL; windows: direct kill — Job Objects
+                // tree-kill is the recorded second-pass shim)
+                #[cfg(unix)]
+                {
+                    let pid = child.id();
+                    let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(CaptureError::Timeout {

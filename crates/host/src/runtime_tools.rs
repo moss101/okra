@@ -54,12 +54,28 @@ pub fn append_path_entries(current_path: Option<&str>, entries: &[String]) -> St
     join_unique_path_entries(&[split_path_entries(current_path), entries.to_vec()].concat())
 }
 
+#[cfg(unix)]
 fn is_executable_file(path: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(path) {
         Ok(m) => m.is_file() && (m.permissions().mode() & 0o111) != 0,
         Err(_) => false,
     }
+}
+
+/// Windows first pass (docs/m6-windows-port.md): an existing file with an
+/// executable-ish extension resolves; PATHEXT semantics are the recorded
+/// second-pass work.
+#[cfg(not(unix))]
+fn is_executable_file(path: &str) -> bool {
+    std::path::Path::new(path).is_file()
+        && std::path::Path::new(path)
+            .extension()
+            .map(|e| {
+                let e = e.to_string_lossy().to_ascii_lowercase();
+                e == "exe" || e == "cmd" || e == "bat" || e == "ps1"
+            })
+            .unwrap_or(false)
 }
 
 /// Resolve `command` against `path_env` (unix semantics: no PATHEXT).
@@ -322,11 +338,15 @@ pub fn ensure_app_ca_pair(
     let pem = generate_self_signed_ca_pem("okra Network CA")?;
     std::fs::write(&cert_path, &pem.cert_pem).map_err(|e| format!("write cert: {e}"))?;
     std::fs::write(&key_path, &pem.key_pem).map_err(|e| format!("write key: {e}"))?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&cert_path, std::fs::Permissions::from_mode(0o644))
-        .map_err(|e| format!("cert perms: {e}"))?;
-    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("key perms: {e}"))?;
+    // unix mode hardening; Windows ACL mapping is the recorded second pass
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cert_path, std::fs::Permissions::from_mode(0o644))
+            .map_err(|e| format!("cert perms: {e}"))?;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("key perms: {e}"))?;
+    }
     Ok((AppCaPairStatus::Complete, cert_path, key_path))
 }
 
@@ -351,14 +371,17 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn resolve_command_on_path_finds_executables() {
         let td = tempfile::tempdir().unwrap();
         let bin_dir = td.path().join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let tool = bin_dir.join("mytool");
         std::fs::write(&tool, "#!/bin/sh\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
 
         let path_env = format!("{}:/usr/bin", bin_dir.display());
         assert_eq!(

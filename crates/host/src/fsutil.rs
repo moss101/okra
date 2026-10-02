@@ -13,8 +13,24 @@ pub fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 /// Home directory resolution. One implementation, one cached call.
+/// Windows reads `$USERPROFILE` first (`$HOME` is not set by default
+/// there); unix reads `$HOME`.
 pub fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
+    #[cfg(windows)]
+    {
+        std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .filter(|p| !p.as_os_str().is_empty())
+            })
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME").map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
+    }
 }
 
 /// Normalize a path lexically (remove `.` and `..` without touching the
@@ -44,5 +60,30 @@ mod tests {
         let p = Path::new("/tmp/ws/./src/../src/main.rs");
         assert_eq!(normalize_lexical(p), PathBuf::from("/tmp/ws/src/main.rs"));
         assert!(home_dir().is_some() || home_dir().is_none()); // never panics
+    }
+}
+
+#[cfg(test)]
+mod home_tests {
+    use super::*;
+
+    /// Windows bring-up gate: the daemon reads home via USERPROFILE there.
+    #[cfg(windows)]
+    #[test]
+    fn windows_home_resolves_userprofile() {
+        let profile = std::env::var_os("USERPROFILE");
+        if profile.is_none() {
+            // a runner without USERPROFILE would break every user-scope path
+            panic!("USERPROFILE unset on a windows runner — home_dir() cannot resolve");
+        }
+        assert!(home_dir().is_some());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_home_resolves() {
+        if std::env::var_os("HOME").is_some() {
+            assert!(home_dir().is_some());
+        }
     }
 }

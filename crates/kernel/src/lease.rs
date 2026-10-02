@@ -1,17 +1,19 @@
 //! Single-writer lease — port of deepseek
 //! `packages/session/session-persistence-jsonl/src/lease.ts`.
 //!
-//! Cross-process single-writer via POSIX non-blocking `flock(2)` on
-//! `session.lock` beside the log. Contention (EAGAIN/EWOULDBLOCK) is
-//! `AlreadyOwned`. **No expiry** — a crashed holder's kernel releases the
-//! lock automatically; a wedged live holder keeps it. The lock file is never
-//! removed (stable inode). Readers never touch the lock.
+//! Cross-process single-writer via a non-blocking exclusive lock on
+//! `session.lock` beside the log — the std file-lock API
+//! (`File::try_lock`, stable ≥1.89), which is `flock(2)` on unix and
+//! `LockFileEx` on Windows: same advisory semantics on both, no libc.
+//! Contention is `AlreadyOwned`. **No expiry** — a crashed holder's
+//! kernel releases the lock automatically; a wedged live holder keeps it.
+//! The lock file is never removed (stable identity). Readers never touch
+//! the lock.
 //!
 //! In-process single-writer is enforced by the `writers` map on
 //! `LogStore` (storage.rs), mirroring the donor's `JsonlBackendTracker`.
 
 use std::fs::{File, OpenOptions};
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 pub const LEASE_FILENAME: &str = "session.lock";
@@ -20,25 +22,53 @@ pub const LEASE_FILENAME: &str = "session.lock";
 pub enum LeaseError {
     #[error("session already owned by another writer")]
     AlreadyOwned,
-    #[error("lease inode changed under the lock (stale path)")]
+    #[error("lease identity changed under the lock (stale path)")]
     InodeChanged,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
 
-/// Held for the whole life of a write handle. Drop releases the flock.
+/// Held for the whole life of a write handle. Drop releases the lock.
 #[derive(Debug)]
 pub struct SessionWriteLease {
     _file: File,
     path: PathBuf,
-    locked_ino: (u64, u64),
+    locked_identity: LockIdentity,
 }
 
-fn inode_of(file: &File) -> std::io::Result<(u64, u64)> {
-    // (st_dev, st_ino) via fstat — no NUL issues, no path races.
-    use std::os::unix::fs::MetadataExt;
-    let meta = file.metadata()?;
-    Ok((meta.dev(), meta.ino()))
+/// The locked file's identity, for revalidation against the path (the
+/// donor's inode check). Unix: (st_dev, st_ino). Windows: (creation
+/// time, size) — the lock file is never written after creation, so a
+/// recreated file (the stale-path hazard) changes both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// the Windows variant is constructed only under cfg(windows); the enum is
+// compiled everywhere so the revalidation types match on both platforms
+#[allow(dead_code)]
+enum LockIdentity {
+    Unix(u64, u64),
+    Windows(u64, u64),
+    Unavailable,
+}
+
+fn identity_of(file: &File) -> std::io::Result<LockIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        // (st_dev, st_ino) via fstat — no NUL issues, no path races.
+        Ok(LockIdentity::Unix(meta.dev(), meta.ino()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        let meta = file.metadata()?;
+        Ok(LockIdentity::Windows(meta.creation_time(), meta.len()))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Ok(LockIdentity::Unavailable)
+    }
 }
 
 impl SessionWriteLease {
@@ -52,23 +82,18 @@ impl SessionWriteLease {
             .write(true)
             .read(true)
             .open(&path)?;
-        let fd = file.as_raw_fd();
-        let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
-            // contention is EAGAIN (EWOULDBLOCK is its alias on unix); some
-            // platforms report EACCES for non-blocking lock contention
-            let code = err.raw_os_error().unwrap_or(0);
-            return if code == libc::EAGAIN || code == libc::EACCES {
-                Err(LeaseError::AlreadyOwned)
-            } else {
-                Err(LeaseError::Io(err))
-            };
+        match file.try_lock() {
+            Ok(()) => {}
+            // contention: another live writer holds the lease
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(LeaseError::AlreadyOwned);
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(LeaseError::Io(e)),
         }
-        let locked_ino = inode_of(&file)?;
-        let lease = Self { _file: file, path, locked_ino };
-        // inode revalidation (`lease.ts:90-115`): verify the locked inode is
-        // still the one at the lock path; retry once on mismatch.
+        let locked_identity = identity_of(&file)?;
+        let lease = Self { _file: file, path, locked_identity };
+        // identity revalidation (`lease.ts:90-115`): verify the locked file
+        // is still the one at the lock path; a mismatch is a stale path.
         if lease.revalidate()? {
             Ok(lease)
         } else {
@@ -77,11 +102,8 @@ impl SessionWriteLease {
     }
 
     fn revalidate(&self) -> Result<bool, LeaseError> {
-        match std::fs::metadata(&self.path) {
-            Ok(meta) => {
-                use std::os::unix::fs::MetadataExt;
-                Ok((meta.dev(), meta.ino()) == self.locked_ino)
-            }
+        match File::open(&self.path).and_then(|f| identity_of(&f)) {
+            Ok(identity) => Ok(identity == self.locked_identity || identity == LockIdentity::Unavailable),
             // lock file removed under us: treat as stale path
             Err(_) => Ok(false),
         }

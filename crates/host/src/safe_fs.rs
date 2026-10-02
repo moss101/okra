@@ -8,6 +8,7 @@
 
 use std::fs::File;
 use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -31,16 +32,25 @@ pub enum SafeReadError {
 /// FIFO hang), regular-file + size + permission checks via fstat (racing
 /// the open, not the path), then read.
 pub fn safe_read(path: &Path) -> Result<Vec<u8>, SafeReadError> {
-    use std::os::unix::fs::OpenOptionsExt;
     // fast-path typed rejection; O_NOFOLLOW below closes the TOCTOU window
     if let Ok(md) = std::fs::symlink_metadata(path)
         && md.file_type().is_symlink() {
             return Err(SafeReadError::Symlink);
         }
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?
+    };
+    // Windows first pass (docs/m6-windows-port.md): no O_NOFOLLOW — the
+    // symlink_metadata check above plus the fstat regular-file verification
+    // carry the contract; mode/ACL checks report `enforcement: partial`
+    // (the world-writable check below is unix-mode-based and skipped).
+    #[cfg(not(unix))]
+    let file = std::fs::OpenOptions::new().read(true).open(path)?;
 
     // verify with FSTAT (the opened inode, not the path)
     let meta = file.metadata()?;
@@ -54,9 +64,14 @@ pub fn safe_read(path: &Path) -> Result<Vec<u8>, SafeReadError> {
     if meta.len() > MAX_SAFE_READ_BYTES {
         return Err(SafeReadError::TooLarge { size: meta.len(), cap: MAX_SAFE_READ_BYTES });
     }
-    let mode = meta.permissions().mode();
-    if mode & 0o002 != 0 {
-        return Err(SafeReadError::WorldWritable { mode });
+    // unix-only mode ladder; on Windows the fstat file-type checks above
+    // carry the contract (ACL mapping is the recorded second-pass work)
+    #[cfg(unix)]
+    {
+        let mode = meta.permissions().mode();
+        if mode & 0o002 != 0 {
+            return Err(SafeReadError::WorldWritable { mode });
+        }
     }
 
     let mut buf = Vec::with_capacity(meta.len() as usize);
@@ -66,11 +81,16 @@ pub fn safe_read(path: &Path) -> Result<Vec<u8>, SafeReadError> {
 
 /// Same contract but returns a File for callers that stream.
 pub fn safe_open(path: &Path) -> Result<File, SafeReadError> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::OpenOptions::new().read(true).open(path)?;
     let meta = file.metadata()?;
     if !meta.file_type().is_file() {
         return Err(SafeReadError::NotRegularFile);
@@ -102,6 +122,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn fifo_never_blocks() {
         let td = tempfile::tempdir().unwrap();
         let fifo = td.path().join("pipe");
@@ -115,6 +136,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn world_writable_refused() {
         let td = tempfile::tempdir().unwrap();
         let p = td.path().join("open.txt");
