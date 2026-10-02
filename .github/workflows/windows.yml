@@ -11,6 +11,12 @@ on:
   push:
     branches: [main]
 
+# a doc-only push supersedes the run before it (windows-latest minutes are
+# the scarcest resource this port has)
+concurrency:
+  group: windows-main
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-latest
