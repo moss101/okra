@@ -3,8 +3,9 @@
 MASTER-PLAN §4 M6 makes Windows an explicit porting project. This is the
 starting inventory: every surface that touches OS specifics, where it
 lives, and the expected shape of the port. The CI runner is armed in
-`.github/workflows/windows.yml` (inactive until the repo has a remote —
-providing the runner/machine is a user decision).
+`.github/workflows/windows.yml` — LIVE since the repo landed on GitHub
+(github.com/moss101/okra, 2026-10-02): the workflow runs on every push
+to main and is the canonical bring-up gate.
 
 ## Already portable (expected to just work)
 
@@ -74,8 +75,8 @@ not of okra's code; rustls 0.23 has no pure-Rust provider on the default
 feature path.
 
 Consequences:
-- The armed `.github/workflows/windows.yml` runner remains the real
-  compile gate (providing it is the recorded user decision).
+- The `.github/workflows/windows.yml` runner IS the compile gate (live
+  since 2026-10-02; triage its runs in the order of work below).
 - The platform shims above are unchanged in scope; nothing in this
   session's work (n0028–n0038) added new unix-only paths to the
   pure-logic crates (protocol/kernel/policy/compaction/memory/session/

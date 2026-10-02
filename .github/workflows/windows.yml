@@ -1,6 +1,6 @@
-# M6 Windows bring-up CI (MASTER-PLAN §4 M6). Inactive until the repo has a
-# GitHub remote (none today — okra is a local workspace); the file is ready
-# so the port starts the moment a runner exists. Scope: compile + unit tests
+# M6 Windows bring-up CI (MASTER-PLAN §4 M6). Live: the repo is on
+# GitHub (2026-10-02) and this workflow runs on every push to main.
+# Scope: compile + unit tests
 # first (crashes/concurrency/path semantics), integration tests gated behind
 # them passing; the nono sandbox and PTY domains are expected to need
 # per-platform shims (see docs/m6-windows-port.md).

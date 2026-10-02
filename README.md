@@ -168,10 +168,13 @@ M5  differentiators ✔ in-turn `subagent` tool (n0034: REAL git worktree,
 M6  scale                      ◐ i18n slice: daemon-side en-US/zh-CN catalog
                                   domain (locale negotiation, fallback chain,
                                   interpolation; the UI catalog stays in the
-                                  reused TS UI); Windows bring-up armed —
-                                  `.github/workflows/windows.yml` +
-                                  `docs/m6-windows-port.md` inventory (runner
-                                  itself is a user decision); **managed-pin
+                                  reused TS UI); Windows bring-up LIVE —
+                                  the repo is on GitHub
+                                  (github.com/moss101/okra, pushed 2026-10-02)
+                                  and the armed `.github/workflows/
+                                  windows.yml` now runs on every push
+                                  (triage per `docs/m6-windows-port.md`);
+                                  **managed-pin
                                   loop closed end to end** — admin signs with
                                   `okra pin-sign` (Ed25519 envelope over
                                   sha256(payload), key provisioning via
