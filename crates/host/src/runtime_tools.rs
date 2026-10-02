@@ -395,7 +395,10 @@ mod tests {
         assert_eq!(resolve_command_on_path("mytool", None), None);
     }
 
+    // unix semantics: exec bits + PATH-style resolution (the windows
+    // PATHEXT equivalent is the recorded second-pass work)
     #[test]
+    #[cfg(unix)]
     fn runtime_tool_resolution_prefers_env_then_bundled_then_path() {
         let td = tempfile::tempdir().unwrap();
         let bundled = td.path().join("bundled-tools").join("aarch64-apple-darwin");
@@ -432,6 +435,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn env_patch_includes_tool_vars_and_appends_path() {
         let td = tempfile::tempdir().unwrap();
         let dir = td.path().join("tools");
@@ -467,11 +471,14 @@ mod tests {
         assert!(cert_pem.starts_with("-----BEGIN CERTIFICATE-----"), "{cert_pem}");
         assert!(key_pem.contains("PRIVATE KEY"), "{key_pem}");
 
-        use std::os::unix::fs::PermissionsExt;
-        let key_mode = std::fs::metadata(&key).unwrap().permissions().mode();
-        assert_eq!(key_mode & 0o777, 0o600, "key must be 0600");
-        let cert_mode = std::fs::metadata(&cert).unwrap().permissions().mode();
-        assert_eq!(cert_mode & 0o777, 0o644);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let key_mode = std::fs::metadata(&key).unwrap().permissions().mode();
+            assert_eq!(key_mode & 0o777, 0o600, "key must be 0600");
+            let cert_mode = std::fs::metadata(&cert).unwrap().permissions().mode();
+            assert_eq!(cert_mode & 0o777, 0o644);
+        }
 
         // idempotent: second call reuses the exact same bytes (stable
         // fingerprint — an already-trusted child must never see drift)
