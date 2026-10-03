@@ -257,7 +257,7 @@ fn kill_at_phase_crash_leaves_recoverable_log() {
     // locate the okra binary next to the test executable (target/debug/)
     let exe = std::env::current_exe().unwrap();
     let target_dir = exe.ancestors().nth(2).unwrap().to_path_buf();
-    let bin = target_dir.join("okra");
+    let bin = target_dir.join(format!("okra{}", std::env::consts::EXE_SUFFIX));
     if !bin.exists() {
         panic!("okra binary not built at {}", bin.display());
     }
