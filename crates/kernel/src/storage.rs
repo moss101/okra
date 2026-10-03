@@ -61,9 +61,21 @@ pub enum AppendOutcome {
     CommittedNotDurable,
 }
 
+/// Durability of the directory entry itself (the rename that makes a
+/// temp-write durable): unix syncs the dir fd. Windows cannot open a
+/// directory via std (`File::open` on a dir is os error 5 — the first
+/// Windows bring-up failure, run 37079773172): NTFS metadata journaling
+/// covers rename durability in practice, and the honest degradation is
+/// recorded in docs/m6-windows-port.md.
+#[cfg(unix)]
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
     let f = File::open(dir)?;
     f.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Scan a JSONL file: returns complete events, the committed byte offset

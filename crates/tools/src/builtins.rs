@@ -349,6 +349,9 @@ pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), ToolErro
     match std::fs::rename(&tmp, path) {
         Ok(()) => {
             // fsync the directory so the rename itself is durable
+            // (unix only — windows cannot open a dir via std; NTFS
+            // metadata journaling covers rename durability there)
+            #[cfg(unix)]
             if let Ok(d) = std::fs::File::open(dir) {
                 let _ = d.sync_all();
             }
