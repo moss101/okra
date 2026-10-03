@@ -1391,18 +1391,6 @@ fn g4_mcp_probe_connects_and_caches_status() {
     let td = tempfile::tempdir().unwrap();
     // a one-shot MCP responder: echoes the request id, answers initialize
     // and tools/list
-    let server_script = r#"#!/bin/sh
-read req
-id=$(printf '%s' "$req" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
-case "$req" in
-  *initialize*)
-    printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"fake-tools","version":"1.0"}}}\n' "$id" ;;
-  *tools/list*)
-    printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"probe-tool","description":"canned","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
-  *)
-    printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
-esac
-"#;
     // cross-platform fixture: the fake-mcp test binary (the sh-script
     // stand-in was the one unix-only piece of the windows bring-up)
     let fixture = std::path::PathBuf::from(env!("CARGO_BIN_EXE_fake-mcp"));
