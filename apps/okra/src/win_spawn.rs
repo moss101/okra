@@ -59,53 +59,6 @@ pub fn build_command_line(argv: &[String]) -> String {
     argv.iter().map(|a| quote_arg(a)).collect::<Vec<_>>().join(" ")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn env_block_is_sorted_utf16_double_nul() {
-        let block = build_env_block(&[
-            ("ZLAST".into(), "1".into()),
-            ("AFIRST".into(), "one".into()),
-        ]);
-        let as_string: String = String::from_utf16(&block).unwrap();
-        // sorted: AFIRST first
-        assert!(as_string.starts_with("AFIRST=one\u{0}ZLAST=1\u{0}\u{0}"));
-    }
-
-    #[test]
-    fn empty_pairs_produce_the_terminator_only() {
-        // an empty list is a single NUL (the list terminator); a non-empty
-        // list ends with its own entry NUL + the terminator
-        assert_eq!(build_env_block(&[]), vec![0]);
-        let one = build_env_block(&[("K".into(), "v".into())]);
-        assert_eq!(one, vec!['K' as u16, '=' as u16, 'v' as u16, 0, 0]);
-    }
-
-    #[test]
-    fn quoting_wraps_spaces_and_escapes_quotes() {
-        assert_eq!(quote_arg("plain"), "plain");
-        assert_eq!(quote_arg("has space"), "\"has space\"");
-        assert_eq!(quote_arg("say \"hi\""), "\"say \\\"hi\\\"\"");
-        assert_eq!(quote_arg(""), "\"\"");
-    }
-
-    #[test]
-    fn command_line_joins_quoted_elements() {
-        let line = build_command_line(&[
-            "C:\\bin\\okra.exe".into(),
-            "run-subagent".into(),
-            "--task".into(),
-            "two words".into(),
-        ]);
-        assert_eq!(
-            line,
-            "C:\\bin\\okra.exe run-subagent --task \"two words\""
-        );
-    }
-}
-
 /// Spawn the confined child under a restricted token (every privilege
 /// dropped via DISABLE_MAX_PRIVILEGE) and capture its output — the
 /// windows counterpart of `std::process::Command::output()` for the g5
@@ -126,7 +79,6 @@ pub fn spawn_restricted_output(
         CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, SECURITY_ATTRIBUTES, TOKEN_DUPLICATE,
         TOKEN_QUERY,
     };
-    use windows_sys::Win32::Storage::FileSystem::{FILE_APPEND_DATA, FILE_WRITE_DATA};
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::Threading::{
         CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
@@ -267,4 +219,51 @@ pub fn spawn_restricted_output(
         stdout,
         stderr,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_block_is_sorted_utf16_double_nul() {
+        let block = build_env_block(&[
+            ("ZLAST".into(), "1".into()),
+            ("AFIRST".into(), "one".into()),
+        ]);
+        let as_string: String = String::from_utf16(&block).unwrap();
+        // sorted: AFIRST first
+        assert!(as_string.starts_with("AFIRST=one\u{0}ZLAST=1\u{0}\u{0}"));
+    }
+
+    #[test]
+    fn empty_pairs_produce_the_terminator_only() {
+        // an empty list is a single NUL (the list terminator); a non-empty
+        // list ends with its own entry NUL + the terminator
+        assert_eq!(build_env_block(&[]), vec![0]);
+        let one = build_env_block(&[("K".into(), "v".into())]);
+        assert_eq!(one, vec!['K' as u16, '=' as u16, 'v' as u16, 0, 0]);
+    }
+
+    #[test]
+    fn quoting_wraps_spaces_and_escapes_quotes() {
+        assert_eq!(quote_arg("plain"), "plain");
+        assert_eq!(quote_arg("has space"), "\"has space\"");
+        assert_eq!(quote_arg("say \"hi\""), "\"say \\\"hi\\\"\"");
+        assert_eq!(quote_arg(""), "\"\"");
+    }
+
+    #[test]
+    fn command_line_joins_quoted_elements() {
+        let line = build_command_line(&[
+            "C:\\bin\\okra.exe".into(),
+            "run-subagent".into(),
+            "--task".into(),
+            "two words".into(),
+        ]);
+        assert_eq!(
+            line,
+            "C:\\bin\\okra.exe run-subagent --task \"two words\""
+        );
+    }
 }
