@@ -1,17 +1,15 @@
 //! Windows restricted-token child spawn (the g5 unlock, scoped in
-//! docs/m6-windows-port.md). Phase 1 — the cross-platform pieces:
+//! docs/m6-windows-port.md).
 //!
 //! - [`build_env_block`]: the `CreateProcessAsUserW` environment block
 //!   (wide, `key=value`, sorted, double-NUL terminated) — pure logic,
 //!   unit-tested on every OS;
-//! - [`quote_cmdline`]: argv re-quoted into the single mutable wide
-//!   command line `CreateProcessAsUserW` parses (std::process::Command
-//!   cannot drive it — the token API needs the raw call).
-//!
-//! Phase 2 (unsafe, windows-only, next): `OpenProcessToken` →
-//! `CreateRestrictedToken(DISABLE_MAX_PRIVILEGE)` → `CreateProcessAsUserW`
-//! with pipe inheritance via STARTUPINFOW. Verified signatures are in
-//! docs/m6-windows-port.md. Nothing here executes on unix.
+//! - [`quote_arg`]/[`build_command_line`]: argv re-quoted into the single
+//!   mutable wide command line `CreateProcessAsUserW` parses;
+//! - [`spawn_restricted_output`] (windows): the confined launch under a
+//!   restricted token (every privilege dropped via DISABLE_MAX_PRIVILEGE)
+//!   with output capture — the fail-closed refusal that gated the g5
+//!   tests becomes a working restricted launch.
 
 /// Build a `CreateProcessAsUserW` environment block from sorted pairs:
 /// each `key=value` as UTF-16 with a NUL, the whole block ending in a
@@ -116,18 +114,13 @@ mod tests {
 /// Fail-closed: any API error before creation aborts the launch; the
 /// child either starts as the restricted token or the call errors.
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::HANDLE;
-
-#[cfg(windows)]
 pub fn spawn_restricted_output(
     app: &str,
     argv: &[String],
     extra_env: &[(String, String)],
 ) -> Result<std::process::Output, String> {
-    use std::collections::BTreeMap;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation,
-        WAIT_OBJECT_0,
+        CloseHandle, GetLastError, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::Security::{
         CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, SECURITY_ATTRIBUTES, TOKEN_DUPLICATE,
@@ -139,7 +132,6 @@ pub fn spawn_restricted_output(
         CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
         WaitForSingleObject, STARTF_USESTDHANDLES, STARTUPINFOW, PROCESS_INFORMATION,
     };
-    use windows_sys::Win32::Foundation::GENERIC_WRITE;
 
     let err = |step: &str| -> String {
         format!("restricted spawn failed at {step}: {}", unsafe { GetLastError() })
@@ -148,14 +140,14 @@ pub fn spawn_restricted_output(
     // 1. the daemon's own token, duplicated into a restricted form: every
     //    privilege dropped, nothing else changed (the child keeps its
     //    group memberships and user identity — it is US, minus power)
-    let mut tok: HANDLE = std::ptr::null_mut();
+    let mut tok: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
     let rc = unsafe {
         OpenProcessToken(GetCurrentProcess(), (TOKEN_DUPLICATE | TOKEN_QUERY) as u32, &mut tok)
     };
     if rc == 0 {
         return Err(err("OpenProcessToken"));
     }
-    let mut restricted: HANDLE = std::ptr::null_mut();
+    let mut restricted: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
     let rc = unsafe {
         CreateRestrictedToken(
             tok,
@@ -180,10 +172,10 @@ pub fn spawn_restricted_output(
         lpSecurityDescriptor: std::ptr::null_mut(),
         bInheritHandle: 1,
     };
-    let mut out_read: HANDLE = std::ptr::null_mut();
-    let mut out_write: HANDLE = std::ptr::null_mut();
-    let mut err_read: HANDLE = std::ptr::null_mut();
-    let mut err_write: HANDLE = std::ptr::null_mut();
+    let mut out_read: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+    let mut out_write: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+    let mut err_read: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+    let mut err_write: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
     if unsafe { CreatePipe(&mut out_read, &mut out_write, &sa, 0) } == 0 {
         unsafe { CloseHandle(restricted) };
         return Err(err("CreatePipe(stdout)"));
@@ -246,8 +238,8 @@ pub fn spawn_restricted_output(
     //    the classic dual-pipe deadlock cannot fill 4 KiB of stderr while
     //    stdout is drained. (A concurrent drain needs a Send handle
     //    wrapper — tracked with the terminal-emulator work.)
-    unsafe { WaitForSingleObject(pi.hProcess, WAIT_OBJECT_0 as u32) };
-    let mut read_all = |h: HANDLE| -> Vec<u8> {
+    unsafe { WaitForSingleObject(pi.hProcess, WAIT_OBJECT_0) };
+    let read_all = |h: windows_sys::Win32::Foundation::HANDLE| -> Vec<u8> {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 4096];
         loop {
@@ -271,7 +263,7 @@ pub fn spawn_restricted_output(
     unsafe { CloseHandle(pi.hProcess); CloseHandle(pi.hThread) };
 
     Ok(std::process::Output {
-        status: std::os::windows::process::ExitStatusExt::from_raw(code as i32 as u32),
+        status: std::os::windows::process::ExitStatusExt::from_raw(code),
         stdout,
         stderr,
     })
