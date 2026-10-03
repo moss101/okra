@@ -23,6 +23,7 @@ mod workflow_cli;
 mod workflow_gate;
 mod tui_surface;
 mod workflow_serve;
+mod win_spawn;
 
 use std::io::Write;
 use std::path::PathBuf;
