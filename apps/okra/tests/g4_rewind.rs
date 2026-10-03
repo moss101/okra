@@ -450,10 +450,17 @@ fn windows_rewind_removal_diagnostic() {
             "payload": { "approvalId": approval_id, "decision": "allow" }
         }));
         assert_eq!(s2, 200, "{r2}");
-        // wait for the turn to finish + the file to exist
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while !td.path().join("scratch.md").exists() {
-            assert!(Instant::now() < deadline, "scratch.md never landed");
+        // wait for the turn to COMPLETE (rewind refuses 409 while a turn
+        // is in flight) AND the file to exist
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let done = frames.lock().unwrap().iter().any(|f| {
+                f["params"]["control"]["phase"] == "completedSuccess"
+            });
+            if done && td.path().join("scratch.md").exists() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "turn never completed");
             std::thread::sleep(Duration::from_millis(100));
         }
         // rewind to before the write
