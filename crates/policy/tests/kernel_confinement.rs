@@ -1,3 +1,7 @@
+// The tests in this file apply REAL kernel confinement (Landlock on
+// Linux, Seatbelt on macOS): unix-only by definition. On windows the nono
+// stub reports Unavailable and these fail closed (by design).
+#![cfg(unix)]
 //! REAL kernel-enforcement evidence (macOS Seatbelt / Linux Landlock):
 //! a child process applies nono self-confinement and then physically
 //! attempts reads/writes. The parent asserts the kernel verdicts.
