@@ -9,6 +9,9 @@ use okra_host::mcp_sync::{
 };
 use serde_json::json;
 
+// symlink+home-rebase fixture semantics (unix); the windows variant of
+// the rebase path is triaged with its sibling filesystem_path_rewrite.
+#[cfg(unix)]
 #[test]
 fn local_exports_remote_imports_with_rewrites() {
     let local_home = tempfile::tempdir().unwrap();
