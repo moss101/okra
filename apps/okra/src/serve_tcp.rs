@@ -1108,6 +1108,7 @@ fn http_handle(state: &Arc<TcpServeState>, stream: TcpStream) -> std::io::Result
                         "restoredFiles": report.restored,
                         "recreatedFiles": report.recreated,
                         "removedFiles": report.removed,
+                        "beforeSeen": report.before_seen.iter().map(|(p, e)| serde_json::json!({"path": p, "exists": e})).collect::<Vec<_>>(),
                         "gitResetTo": report.git_reset_to,
                     }))
                     .unwrap_or_default()

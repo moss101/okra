@@ -147,6 +147,10 @@ pub struct RestoreReport {
     pub external_modifications: Vec<String>,
     /// HEAD hash the git domain was reset to (when captured).
     pub git_reset_to: Option<String>,
+    /// DIAGNOSTIC (windows removal triage): every composed-before path
+    /// with its recorded exists flag — shows whether the before record
+    /// was even captured for the removed-file candidates.
+    pub before_seen: Vec<(String, bool)>,
 }
 
 fn now_ms() -> u64 {
@@ -386,6 +390,10 @@ impl CheckpointManager {
         }
 
         let mut report = RestoreReport::default();
+        report.before_seen = composed_before
+            .iter()
+            .map(|(p, snap)| (p.clone(), snap.exists))
+            .collect();
         for (rel_path, snapshot) in &composed_before {
             let disk_path = self.workspace.join(rel_path);
             let on_disk = std::fs::metadata(&disk_path).is_ok();
