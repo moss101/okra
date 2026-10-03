@@ -49,6 +49,18 @@ to main and is the canonical bring-up gate.
 5. Only then: sandbox enforcement work (restricted token) — until then
    Windows ships `enforcement: partial` (honest, by contract).
 
+## SECOND PASS PROGRESS (2026-10-03)
+
+- The integration step COMPILES and RUNS on windows (436 tests passing in
+  run `37097302681`; it died at rustc before this round's fixes).
+- g1 kill-matrix GREEN on windows: the kill contract is now platform-
+  aware (signal on unix; STATUS_CONTROL_C_EXIT hard-termination family
+  on windows — a clean exit still fails).
+- Remaining integration triage (expected red, continue-on-error):
+  g4 computer-control tests (AX is macOS by design — gate to
+  `target_os = macos`), g4 PTY (ConPTY shim = the real work), g4 MCP
+  probe/tools (unix spawn fixtures in the tests).
+
 ## BRING-UP STATUS: GREEN (2026-10-03, n0050)
 
 Run `37082086546` passed the compile gate AND the full `--lib`
