@@ -60,6 +60,10 @@ to main and is the canonical bring-up gate.
   cross-platform `fake-mcp` test binary; computer-control tests gate to
   macOS (AX by design); the PTY test gates to unix pending the ConPTY
   terminal-emulator layer.
+- Rewind-removal triage: `POST /api/rewind` returns 200 but an
+  absent-before file survives on windows (run 37099210769,
+  g4_rewind.rs:228) — candidates: composed-before recording on the
+  windows write path, or a remove_file sharing violation. Next fix.
 - ConPTY findings: conhost opens every session with a DSR probe
   (ESC[6n); the pump answers it, but rendering still stalls — the real
   work is a terminal-emulator layer (win32-input-mode / sequence
