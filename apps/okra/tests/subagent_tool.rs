@@ -8,6 +8,7 @@
 #![allow(clippy::disallowed_methods)]
 use std::process::Command;
 
+#[cfg(unix)]
 fn git(cwd: &std::path::Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .args(["-C", &cwd.to_string_lossy()])

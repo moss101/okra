@@ -586,6 +586,7 @@ fn normalize_proxy_value(value: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+#[cfg(unix)]
     use std::sync::Mutex;
 
     #[test]

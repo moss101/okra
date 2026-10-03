@@ -295,6 +295,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(unix), allow(unused_variables))]
     fn local_containment_rejects_symlink_escape() {
         let td = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();

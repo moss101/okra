@@ -12,10 +12,11 @@
 #![allow(clippy::disallowed_methods)]
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::process::Command;
+#[cfg(unix)] use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(unix)]
 const TASK_JSON: &str = r##"{
   "task": "G5 real-sampler: create deliverable.md via the write_file tool",
   "files": []

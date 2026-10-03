@@ -12,12 +12,14 @@
 #![allow(clippy::disallowed_methods)]
 use std::process::Command;
 
+#[cfg(unix)]
 fn spec(path: &str) -> String {
     format!(
         r#"{{"task":"probe","files":[{{"path":"{path}","content":"role-scoped deliverable\n"}}]}}"#
     )
 }
 
+#[cfg(unix)]
 fn run_child(grant: &std::path::Path, spec_path: &std::path::Path, writable: Option<&str>) -> (std::process::Output, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_okra"));
     cmd.args(["run-subagent", "--grant", grant.to_str().unwrap(), "--task", spec_path.to_str().unwrap()]);
@@ -31,6 +33,7 @@ fn run_child(grant: &std::path::Path, spec_path: &std::path::Path, writable: Opt
     (out, stdout)
 }
 
+#[cfg(unix)]
 fn verdict(stdout: &str) -> serde_json::Value {
     let line = stdout.lines().find(|l| l.starts_with("SUBAGENT ")).expect("verdict line");
     serde_json::from_str(line.trim_start_matches("SUBAGENT ")).unwrap()

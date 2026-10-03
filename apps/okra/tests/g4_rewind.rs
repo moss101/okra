@@ -286,6 +286,7 @@ fn g4_rewind_refuses_while_a_turn_is_running() {
     }
 }
 
+#[cfg(unix)]
 fn wait_for(frames: &Mutex<Vec<serde_json::Value>>, pred: &dyn Fn(&[serde_json::Value]) -> bool) -> bool {
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {

@@ -4,9 +4,9 @@
 //! rebasing filesystem-server paths onto its own home/workspace, and
 //! persisting secrets behind 0o600 atomic writes.
 
-use okra_host::mcp_sync::{
-    ExportedServer, ImportStatus, McpSyncService, McpSyncSource, PathRewrite,
-};
+#[cfg(unix)]
+use okra_host::mcp_sync::PathRewrite;
+use okra_host::mcp_sync::{ExportedServer, ImportStatus, McpSyncService, McpSyncSource};
 use serde_json::json;
 
 // symlink+home-rebase fixture semantics (unix); the windows variant of
@@ -166,4 +166,5 @@ fn full_round_trip_including_legacy_migration_and_toggle() {
     assert!(outcomes.iter().all(|o| o.status == ImportStatus::Skipped));
 }
 
+#[cfg(unix)]
 use std::path::PathBuf;

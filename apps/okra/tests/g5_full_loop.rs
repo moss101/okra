@@ -12,7 +12,7 @@
 // paths (production spawning goes through okra_policy's confined runner); the
 // acceptance harness must exercise the real binary end-to-end.
 #![allow(clippy::disallowed_methods)]
-use std::process::Command;
+#[cfg(unix)] use std::process::Command;
 
 const TASK_JSON: &str = r##"{
   "task": "G5 loop: write the deliverable inside the grant, attempt an escape",
