@@ -1,3 +1,11 @@
+// load probe (packaged-app diagnosis): proves whether main.js executes
+try {
+  require('node:fs').appendFileSync(
+    require('node:path').join(require('node:os').tmpdir(), 'okra-main-probe.txt'),
+    JSON.stringify({ at: Date.now(), requireMain: String(require.main === module),
+      argv: process.argv.slice(0, 3) }) + '\n');
+} catch (_) { /* probe must never break the app */ }
+
 'use strict';
 /* okra desktop shell — MASTER-PLAN block #50: a thin Electron main.
  *
@@ -12,6 +20,7 @@
 
 const { spawn } = require('node:child_process');
 const http = require('node:http');
+const os = require('node:os');
 const path = require('node:path');
 const fs = require('node:fs');
 
@@ -23,20 +32,53 @@ try {
 } catch (_) { /* plain node */ }
 
 function parseArgs(argv) {
-  const args = { cwd: process.cwd(), okra: process.env.OKRA_BIN || null, smoke: false };
+  const isPackaged = Boolean(electron && electron.app && electron.app.isPackaged);
+  // packaged Electron eats unknown switches (Chromium flags) — smoke mode
+  // is triggerable by env as well as the dev-mode arg
+  const args = {
+    cwd: process.cwd(),
+    okra: process.env.OKRA_BIN || null,
+    smoke: process.env.OKRA_SMOKE === '1',
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--cwd') args.cwd = path.resolve(argv[++i] || '.');
     else if (a === '--okra') args.okra = argv[++i] || null;
     else if (a === '--smoke') args.smoke = true;
   }
+  // double-clicked from Finder: cwd is '/', which is nobody's workspace —
+  // default to a per-user workspace dir and create it
+  if (isPackaged && (args.cwd === '/' || args.cwd === path.resolve('/'))) {
+    args.cwd = path.join(os.homedir(), 'Documents', 'okra workspace');
+    fs.mkdirSync(args.cwd, { recursive: true });
+  }
   return args;
+}
+
+/** The real-model config: ~/.okra/desktop-provider.json (optional).
+ *
+ * { "provider": "openai", "model": "<name>", "apiKey": "<key>",
+ *   "baseUrl": "<openai-compatible endpoint>", "extraHeaders": "K: V; K: V" }
+ *
+ * When present, the daemon launches with --provider/--model and the
+ * key/base-url are injected into its environment — this is what turns the
+ * demo sampler into the real thing in a packaged app (Finder launches
+ * have no shell env).
+ */
+function readProviderConfig() {
+  try {
+    const p = path.join(os.homedir(), '.okra', 'desktop-provider.json');
+    const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
+    return cfg && cfg.provider && cfg.apiKey ? cfg : null;
+  } catch (_) { return null; }
 }
 
 /** Find the okra binary: explicit flag/env, else the repo's build output. */
 function resolveOkraBin(args) {
   const candidates = [
     args.okra,
+    // packaged: electron-packager's extraResource lands it in Contents/Resources
+    process.resourcesPath ? path.join(process.resourcesPath, 'okra') : null,
     path.join(__dirname, '..', '..', 'target', 'release', 'okra'),
     path.join(__dirname, '..', '..', 'target', 'debug', 'okra'),
   ].filter(Boolean);
@@ -52,8 +94,19 @@ function resolveOkraBin(args) {
 /** Spawn the loopback daemon; resolve with its bound port from stderr. */
 function startDaemon(args) {
   const bin = resolveOkraBin(args);
-  const child = spawn(bin, ['serve', '--tcp', '--cwd', args.cwd], {
+  const cfg = readProviderConfig();
+  const serveArgs = ['serve', '--tcp', '--cwd', args.cwd];
+  const env = { ...process.env };
+  if (cfg) {
+    serveArgs.push('--provider', cfg.provider);
+    if (cfg.model) serveArgs.push('--model', cfg.model);
+    env.OKRA_API_KEY = cfg.apiKey;
+    if (cfg.baseUrl) env.OKRA_BASE_URL = cfg.baseUrl;
+    if (cfg.extraHeaders) env.OKRA_EXTRA_HEADERS = cfg.extraHeaders;
+  }
+  const child = spawn(bin, serveArgs, {
     stdio: ['ignore', 'ignore', 'pipe'],
+    env,
   });
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('daemon never bound a port')), 15000);
@@ -111,18 +164,31 @@ async function handshake(args) {
   }
 }
 
-/** CI/smoke mode: verify the handshake, print the facts, no window. */
+/** CI/smoke mode: verify the handshake, report, no window.
+ *
+ * PACKAGED: the .app binary has no usable stdout — the result is written
+ * to `$OKRA_SMOKE_OUT` (or a temp file) instead, and the exit code carries
+ * the verdict.
+ */
 async function smoke(args) {
   let code = 0;
+  let report;
   try {
     const d = await handshake(args);
-    process.stdout.write(JSON.stringify({
-      smoke: 'ok', port: d.port, bin: d.bin, cwd: args.cwd, health: d.health,
-    }) + '\n');
+    report = { smoke: 'ok', port: d.port, bin: d.bin, cwd: args.cwd, health: d.health };
+    process.stdout.write(JSON.stringify(report) + '\n');
   } catch (e) {
-    process.stderr.write(`smoke failed: ${e && e.message}\n`);
+    report = { smoke: 'failed', error: String(e && e.message || e) };
+    process.stderr.write(`smoke failed: ${report.error}\n`);
     code = 1;
   } finally {
+    // packaged GUI processes have no attached stdout — mirror the result
+    // to a file so `--smoke` remains verifiable in the .app
+    try {
+      const out = process.env.OKRA_SMOKE_OUT
+        || require('node:path').join(require('node:os').tmpdir(), 'okra-smoke-result.json');
+      require('node:fs').writeFileSync(out, JSON.stringify(report, null, 2) + '\n');
+    } catch (_) { /* best effort */ }
     // kill the whole process group so the daemon never outlives the check
     process.exit(code);
   }
@@ -156,9 +222,14 @@ function runWindow(args) {
   });
 }
 
-// dispatch only when run as the entry point; importers get pure functions
-if (require.main === module) {
-  const args = parseArgs(process.argv.slice(2));
+// dispatch only when run as the entry point; importers get pure functions.
+// PACKAGED ELECTRON: require.main can be undefined in the main process —
+// dispatch there too (a plain-node require has a defined require.main, so
+// importers still get the pure functions)
+if (require.main === module || require.main === undefined) {
+  // packaged: argv = [binary, ...userArgs]; dev: argv = [electron, appDir, ...userArgs]
+  const isPackaged = Boolean(electron && electron.app && electron.app.isPackaged);
+  const args = parseArgs(process.argv.slice(isPackaged ? 1 : 2));
   if (args.smoke) {
     smoke(args);
   } else if (electron) {
