@@ -880,11 +880,9 @@ fn g4_git_surfaces_report_branch_status_and_diff() {
 /// N0012 — workbench terminals: the PTY surface over SSE + keystroke POST.
 /// A real shell runs in a real PTY; keys typed over HTTP execute and the
 /// output streams back; resize/close work; unknown ids are 404.
-/// WINDOWS: gated pending the ConPTY terminal-emulator layer — conhost's
-/// DSR probe is answered by the pump but rendering still stalls (the
-/// findings are recorded in docs/m6-windows-port.md); open/resize/keys/
-/// close endpoints themselves work there.
-#[cfg(unix)]
+/// WINDOWS DIAGNOSTIC (runs there too; red is continue-on-error): the
+/// failure dump decodes every streamed frame so the conhost keys-path
+/// investigation has real data.
 #[test]
 fn g4_terminals_run_a_real_pty_over_http() {
     let td = tempfile::tempdir().unwrap();
@@ -953,7 +951,20 @@ fn g4_terminals_run_a_real_pty_over_http() {
                     .unwrap_or(false)
             })
         });
-        assert!(got, "PTY output never streamed the marker; frames: {frames:?}");
+        let dump: Vec<String> = frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|f| {
+                f["b64"].as_str().and_then(|b| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(b)
+                        .ok()
+                        .map(|d| String::from_utf8_lossy(&d).to_string())
+                })
+            })
+            .collect();
+        assert!(got, "PTY output never streamed the marker; decoded output: {dump:?}");
         let _ = t.join();
 
         // 6. resize is accepted
