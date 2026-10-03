@@ -10,6 +10,17 @@
 #![allow(clippy::disallowed_methods)]
 use okra_host::git::GitRepository;
 
+fn init_repo_with_identity(path: &std::path::Path) -> GitRepository {
+    let repo = GitRepository::init(path).unwrap();
+    for (k, v) in [("user.email", "okra-test@example.com"), ("user.name", "okra test")] {
+        let _ = Command::new("git")
+            .args(["config", k, v])
+            .current_dir(repo.root())
+            .output();
+    }
+    repo
+}
+
 fn git_available() -> bool {
     std::process::Command::new("git")
         .arg("--version")
@@ -22,7 +33,7 @@ fn git_available() -> bool {
 fn init_status_commit_roundtrip() {
     if !git_available() { return; }
     let td = tempfile::tempdir().unwrap();
-    let repo = GitRepository::init(&td.path().join("repo")).unwrap();
+    let repo = init_repo_with_identity(&td.path().join("repo"));
     std::fs::write(repo.root().join("a.txt"), b"v1").unwrap();
 
     assert!(repo.is_dirty().unwrap(), "untracked file = dirty");
@@ -41,7 +52,7 @@ fn init_status_commit_roundtrip() {
 fn worktrees_are_isolated_but_shared() {
     if !git_available() { return; }
     let td = tempfile::tempdir().unwrap();
-    let repo = GitRepository::init(&td.path().join("repo")).unwrap();
+    let repo = init_repo_with_identity(&td.path().join("repo"));
     std::fs::write(repo.root().join("base.txt"), b"base").unwrap();
     repo.commit_all("base").unwrap();
 
@@ -95,7 +106,7 @@ fn commit_file(repo: &GitRepository, rel: &str, contents: &[u8], message: &str) 
 
 fn init_repo_with_file() -> (tempfile::TempDir, GitRepository) {
     let td = tempfile::tempdir().unwrap();
-    let repo = GitRepository::init(&td.path().join("repo")).unwrap();
+    let repo = init_repo_with_identity(&td.path().join("repo"));
     std::fs::write(
         repo.root().join(".gitconfig"),
         b"",
