@@ -125,6 +125,11 @@ terminal-emulator layer) is NEW capability work, not red tests.
   parent — the g5 kernel-verdict tests (run a probe write outside the
   grant, expect refusal) stay the gate and would move from
   fail-closed-refused to pass-with-token.
+- Subagent launches on windows: **LANDED** — the confined child spawns
+  under a restricted token (every privilege dropped via
+  DISABLE_MAX_PRIVILEGE) through CreateProcessAsUserW with pipe
+  inheritance; the g5 confined-launch tests are un-gated and pass on the
+  runner.
 - Subagent launches FAIL CLOSED on windows (by design): the nono stub
   reports Unavailable and the g5 launcher refuses confined children —
   the G5 contract holding. Unlocks with the restricted-token sandbox.
