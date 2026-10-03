@@ -10,8 +10,11 @@
 // paths (production spawning goes through okra_policy's confined runner); the
 // acceptance harness must exercise the real binary end-to-end.
 #![allow(clippy::disallowed_methods)]
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
 use std::net::TcpListener;
+
 #[cfg(unix)] use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -127,6 +130,7 @@ fn spawn_mock_model(authorization_expected: &str) -> (std::thread::JoinHandle<()
     (handle, addr)
 }
 
+#[cfg(unix)]
 fn model_url(mock_addr: &str) -> String {
     format!("http://{mock_addr}/v1")
 }
