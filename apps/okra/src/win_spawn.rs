@@ -222,7 +222,7 @@ pub fn spawn_restricted_output(
             std::ptr::null(),
             1, // inherit the pipe write handles
             0,
-            env_block.as_ptr(),
+            env_block.as_ptr() as *const core::ffi::c_void,
             std::ptr::null(),
             &mut si,
             &mut pi,
