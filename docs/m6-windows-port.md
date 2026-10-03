@@ -80,6 +80,10 @@ terminal-emulator layer) is NEW capability work, not red tests.
 - Subagent launches FAIL CLOSED on windows (by design): the nono stub
   reports Unavailable and the g5 launcher refuses confined children —
   the G5 contract holding. Unlocks with the restricted-token sandbox.
+- Rewind-removal triage RESOLVED: the original red was the gate-release
+  race (409 "turn in flight" right after completedSuccess, before the
+  turn thread releases running_turns) — the tests retry on 409 and PASS
+  on windows (run 37114039717: g4_rewind 3/3 green).
 - Rewind-removal triage: `POST /api/rewind` returns 200 but an
   absent-before file survives on windows (run 37099210769,
   g4_rewind.rs:228) — candidates: composed-before recording on the
