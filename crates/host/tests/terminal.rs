@@ -1,3 +1,8 @@
+// PTY semantics are the unix second-pass surface: on windows the
+// ConPTY terminal-emulator layer is the tracked remaining work
+// (docs/m6-windows-port.md — the DSR probe reply alone does not unstick
+// conhost rendering).
+#![cfg(unix)]
 //! Terminal/PTY domain tests: real pseudo-terminal sessions — programs see
 //! a TTY, output streams to the host, exit codes propagate.
 
