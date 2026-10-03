@@ -389,11 +389,11 @@ impl CheckpointManager {
             }
         }
 
-        let mut report = RestoreReport::default();
-        report.before_seen = composed_before
+        let before_seen: Vec<(String, bool)> = composed_before
             .iter()
             .map(|(p, snap)| (p.clone(), snap.exists))
             .collect();
+        let mut report = RestoreReport { before_seen, ..Default::default() };
         for (rel_path, snapshot) in &composed_before {
             let disk_path = self.workspace.join(rel_path);
             let on_disk = std::fs::metadata(&disk_path).is_ok();
