@@ -22,6 +22,7 @@ const TASK_JSON: &str = r##"{
   ]
 }"##;
 
+#[cfg(unix)]
 fn git_available() -> bool {
     std::process::Command::new("git")
         .arg("--version")
