@@ -18,6 +18,9 @@ fn git(cwd: &std::path::Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+// Confined subagent launch: on windows the sandbox stub reports
+// Unavailable and the launch is refused (fail-closed by design).
+#[cfg(unix)]
 #[test]
 fn subagent_tool_runs_isolated_and_collects_work_on_a_branch() {
     let td = tempfile::tempdir().unwrap();
