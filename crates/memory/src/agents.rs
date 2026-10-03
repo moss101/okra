@@ -52,25 +52,26 @@ pub fn extract_memories(turn_text: &str, existing: &[String]) -> Vec<MemoryCandi
             continue;
         }
         let lower = s.to_ascii_lowercase();
-        let is_pref;
-        if lower.starts_with("always ")
+        // preference patterns → a standing instruction; "we use X for Y"
+        // shapes → a durable project fact; anything else is chatter
+        let is_pref = lower.starts_with("always ")
             || lower.starts_with("never ")
             || lower.starts_with("prefer ")
             || lower.starts_with("please always")
             || lower.contains(" remember ")
             || lower.starts_with("remember that ")
             || lower.starts_with("don't use ")
-            || lower.starts_with("avoid ")
-        {
-            is_pref = true;
-        } else if ((lower.starts_with("we use ") || lower.contains(" we use "))
-            || lower.contains(" the project ")
-            || lower.contains(" this repo "))
-            && (lower.contains(" for ") || lower.contains(" is ") || lower.contains(" uses "))
-        {
-            is_pref = false;
-        } else {
-            continue;
+            || lower.starts_with("avoid ");
+        if !is_pref {
+            let fact_topic = lower.starts_with("we use ")
+                || lower.contains(" we use ")
+                || lower.contains(" the project ")
+                || lower.contains(" this repo ");
+            let fact_link =
+                lower.contains(" for ") || lower.contains(" is ") || lower.contains(" uses ");
+            if !(fact_topic && fact_link) {
+                continue;
+            }
         }
         let vec = hashed_embedding(s);
         let dup = existing_vecs

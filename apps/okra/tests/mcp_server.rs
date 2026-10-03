@@ -117,7 +117,9 @@ fn handshake_list_and_fail_closed_consent() {
     assert!(unknown.get("error").is_some());
 }
 
+// unix semantics: a #!/bin/sh osascript stand-in with the exec bit
 #[test]
+#[cfg(unix)]
 fn granted_app_observable_through_the_hermetic_backend() {
     // the AX backend shells out to env-overridable binaries: a fixture
     // script stands in for osascript

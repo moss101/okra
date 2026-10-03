@@ -197,6 +197,7 @@ pub fn archive_checksum(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn session_with_logs(sessions_dir: &Path, id: &str) {
         let dir = sessions_dir.join(id);
         std::fs::create_dir_all(&dir).unwrap();

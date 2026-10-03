@@ -154,6 +154,7 @@ impl Default for NonoSandboxBackend {
     }
 }
 
+#[cfg(unix)]
 fn system_read_paths() -> Vec<PathBuf> {
     if cfg!(target_os = "macos") {
         vec![

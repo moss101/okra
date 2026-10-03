@@ -312,9 +312,11 @@ mod tests {
 
     /// env mutation is unsafe in edition 2024; a test-local helper keeps
     /// the unsafe blocks single-purpose (set + removal pairing).
+    #[cfg(unix)]
     unsafe fn env_guard(_var: &str) {}
 
     /// A fixture "osascript": prints a canned tree and counts invocations.
+    #[cfg(unix)]
     fn fixture_dir() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "okra-ax-fixture-{}-{}",

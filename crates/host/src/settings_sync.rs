@@ -1641,6 +1641,7 @@ mod tests {
         assert!(meta.file_type().is_symlink(), "symlink mode links the skill dir");
     }
 
+    #[cfg(unix)]
     fn write_plugin(root: &Path, dir_name: &str, name: &str, version: &str) -> PathBuf {
         let dir = root.join(dir_name);
         std::fs::create_dir_all(dir.join(".claude-plugin")).unwrap();

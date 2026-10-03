@@ -700,7 +700,9 @@ mod tests {
         assert!(extract_captured_env_snapshot(&reversed).is_none());
     }
 
+    #[cfg(unix)]
     struct FakeExecutor(Result<String, CaptureError>);
+    #[cfg(unix)]
     impl LoginShellExecutor for FakeExecutor {
         fn execute(&self, _s: &str, _a: &[String], _e: &BTreeMap<String, String>, _t: Duration, _m: usize) -> Result<String, CaptureError> {
             self.0.clone()
@@ -743,10 +745,12 @@ mod tests {
         assert!(matches!(err, CaptureError::Exit { .. }), "unframed output is a failed capture, not silent success");
     }
 
+    #[cfg(unix)]
     struct InspectExecutor<'a> {
         inner: FakeExecutor,
         seen: &'a Mutex<Option<BTreeMap<String, String>>>,
     }
+    #[cfg(unix)]
     impl LoginShellExecutor for InspectExecutor<'_> {
         fn execute(&self, shell: &str, args: &[String], env: &BTreeMap<String, String>, t: Duration, m: usize) -> Result<String, CaptureError> {
             assert!(shell.ends_with("sh") || shell.ends_with("bash") || shell.ends_with("zsh"));
