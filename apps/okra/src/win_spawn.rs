@@ -115,12 +115,17 @@ mod tests {
 ///
 /// Fail-closed: any API error before creation aborts the launch; the
 /// child either starts as the restricted token or the call errors.
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::HANDLE;
+
 /// A raw kernel HANDLE wrapper that is `Send` (kernel handles are
 /// process-wide values; transferring them between threads is exactly how
 /// the pipe drain works).
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy)]
 struct SendHandle(HANDLE);
+
+#[cfg(windows)]
 unsafe impl Send for SendHandle {}
 
 #[cfg(windows)]
