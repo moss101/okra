@@ -157,11 +157,6 @@ fn mutex_vec() -> std::sync::Mutex<Vec<serde_json::Value>> {
 
 use std::sync::Mutex;
 
-// WINDOWS TRIAGE: POST /api/rewind answers 200 but scratch.md survives
-// (run 37099210769) — the restore-removal path needs a real windows repro
-// (candidates: composed-before recording on the windows write path, or a
-// remove_file sharing violation). Tracked in docs/m6-windows-port.md.
-#[cfg(unix)]
 #[test]
 fn g4_rewind_restores_a_scratched_refactor() {
     let td = tempfile::tempdir().unwrap();
@@ -226,10 +221,19 @@ fn g4_rewind_restores_a_scratched_refactor() {
         std::fs::write(td.path().join("scratch.md"), "SCRATCHED OVER").unwrap();
 
         // rewind to the start of prompt 0: before the write existed at all
-        let (status, body) = http_post(&addr, "/api/rewind", &serde_json::json!({
-            "sessionId": "rewind-1",
-            "promptIndex": 0
-        }));
+        // a 409 right after completedSuccess is the gate-release race
+        // (the turn thread tears down after the projection flips) — retry
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let (status, body) = loop {
+            let (s, b) = http_post(&addr, "/api/rewind", &serde_json::json!({
+                "sessionId": "rewind-1",
+                "promptIndex": 0
+            }));
+            if s != 409 || Instant::now() > deadline {
+                break (s, b);
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        };
         assert_eq!(status, 200, "{body}");
         assert!(
             !td.path().join("scratch.md").exists(),
@@ -298,10 +302,6 @@ fn wait_for(frames: &Mutex<Vec<serde_json::Value>>, pred: &dyn Fn(&[serde_json::
     false
 }
 
-// Same windows rewind-removal triage as its sibling test: the removal
-// path (git reset untracked + absent-before removal) needs a windows
-// repro. Tracked in docs/m6-windows-port.md.
-#[cfg(unix)]
 #[test]
 fn g4_rewind_resets_git_to_the_captured_head() {
     let td = tempfile::tempdir().unwrap();
