@@ -338,6 +338,7 @@ pub fn orchestrate_subagent(
     parent_session: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     use okra_host::subagent::{SubagentGrant, SubagentLauncher};
+    #[cfg(not(windows))]
     use std::process::Command;
 
     let repo = okra_host::git::GitRepository::open(repo_path)
@@ -379,9 +380,9 @@ pub fn orchestrate_subagent(
     let output = {
         let env_extra: Vec<(String, String)> = parent_session
             .iter()
-            .map(|p| ("OKRA_SUBAGENT_PARENT".to_string(), p.clone()))
+            .map(|p| ("OKRA_SUBAGENT_PARENT".to_string(), p.to_string()))
             .collect();
-        win_spawn::spawn_restricted_output(
+        crate::win_spawn::spawn_restricted_output(
             &bin.to_string_lossy(),
             &cli_args,
             &env_extra,
