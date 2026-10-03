@@ -94,7 +94,7 @@ pub fn spawn_restricted_output(
     //    group memberships and user identity — it is US, minus power)
     let mut tok: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
     let rc = unsafe {
-        OpenProcessToken(GetCurrentProcess(), (TOKEN_DUPLICATE | TOKEN_QUERY), &mut tok)
+        OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &mut tok)
     };
     if rc == 0 {
         return Err(err("OpenProcessToken"));
