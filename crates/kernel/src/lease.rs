@@ -113,3 +113,49 @@ impl SessionWriteLease {
         &self.path
     }
 }
+
+#[cfg(all(test, windows))]
+mod windows_probe {
+    use super::*;
+
+    /// First-bring-up probe: isolates which step of the lease path fails
+    /// on a real Windows runner (open / try_lock / identity / revalidate).
+    /// Remove once the lease is green on CI.
+    #[test]
+    fn lease_probe_windows_step_isolation() {
+        let td = tempfile::tempdir().unwrap();
+        let dir = td.path().join("sess-probe");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(LEASE_FILENAME);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .expect("STEP open");
+        file.try_lock()
+            .map_err(|e| match e {
+                std::fs::TryLockError::WouldBlock => "STEP try_lock: WouldBlock".to_string(),
+                std::fs::TryLockError::Error(io) => format!("STEP try_lock: {io}"),
+            })
+            .unwrap();
+        let id = identity_of(&file).expect("STEP identity");
+        let file2 = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .expect("STEP reopen while held");
+        match file2.try_lock() {
+            Ok(()) => panic!("STEP second lock unexpectedly succeeded"),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(io)) => panic!("STEP second lock: {io}"),
+        }
+        drop(file2);
+        drop(id);
+        let lease = SessionWriteLease::acquire(&dir).expect("STEP acquire end-to-end");
+        assert_eq!(lease.path(), path);
+    }
+}
