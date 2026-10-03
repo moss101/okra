@@ -123,7 +123,8 @@ pub fn spawn_restricted_output(
 ) -> Result<std::process::Output, String> {
     use std::collections::BTreeMap;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0,
+        CloseHandle, GetLastError, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation,
+        WAIT_OBJECT_0,
     };
     use windows_sys::Win32::Security::{
         CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, SECURITY_ATTRIBUTES, TOKEN_DUPLICATE,
