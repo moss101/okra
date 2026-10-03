@@ -109,10 +109,22 @@ terminal-emulator layer) is NEW capability work, not red tests.
   `RemoveAllPrivileges`, add `S-1-1-0` deny for write bits) →
   `CreateProcessAsUserW` with the restricted token; features
   `Win32_Security` + `Win32_System_Threading` are already enabled in the
-  windows-sys dependency. Honest limit: the daemon cannot PROVE the
-  kernel enforcement from the parent — the g5 kernel-verdict tests (run
-  a probe write outside the grant, expect refusal) stay the gate and
-  would move from fail-closed-refused to pass-with-token.
+  windows-sys dependency.
+  VERIFIED SIGNATURES (windows-sys 0.59 source, local registry):
+  - simplest strong form: `CreateRestrictedToken(tok,
+    DISABLE_MAX_PRIVILEGE, 0, null, 0, null, 0, null, &new)` — dropping
+    ALL privileges needs no SID/LUID list plumbing;
+  - `CreateProcessAsUserW(token, app, cmdline(PWSTR — MUTABLE wide
+    buffer; args must be re-quoted), sec_attrs, sec_attrs,
+    inherit_handles, creation_flags, env(wide, double-NUL), dir,
+    startupinfo, &procinfo)` — the env block + stdout/stderr pipe
+    inheritance via STARTUPINFOW are the remaining plumbing;
+  - `OpenProcessToken(GetCurrentProcess,
+    TOKEN_DUPLICATE|TOKEN_QUERY, &tok)` first.
+  Honest limit: the daemon cannot PROVE the kernel enforcement from the
+  parent — the g5 kernel-verdict tests (run a probe write outside the
+  grant, expect refusal) stay the gate and would move from
+  fail-closed-refused to pass-with-token.
 - Subagent launches FAIL CLOSED on windows (by design): the nono stub
   reports Unavailable and the g5 launcher refuses confined children —
   the G5 contract holding. Unlocks with the restricted-token sandbox.
