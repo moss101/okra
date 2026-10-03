@@ -36,6 +36,10 @@ fn verdict(stdout: &str) -> serde_json::Value {
     serde_json::from_str(line.trim_start_matches("SUBAGENT ")).unwrap()
 }
 
+// Role-scoped writes run through the confined child turn: on windows the
+// sandbox stub reports Unavailable and confined launches are refused
+// (fail-closed by design). Unlocks with the restricted-token sandbox.
+#[cfg(unix)]
 #[test]
 fn write_inside_declared_role_scope_lands() {
     let td = tempfile::tempdir().unwrap();
@@ -54,6 +58,10 @@ fn write_inside_declared_role_scope_lands() {
     );
 }
 
+// Role-scoped writes run through the confined child turn: on windows the
+// sandbox stub reports Unavailable and confined launches are refused
+// (fail-closed by design). Unlocks with the restricted-token sandbox.
+#[cfg(unix)]
 #[test]
 fn write_outside_declared_role_scope_is_refused_at_the_tool_plane() {
     let td = tempfile::tempdir().unwrap();
