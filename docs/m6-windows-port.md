@@ -49,6 +49,19 @@ to main and is the canonical bring-up gate.
 5. Only then: sandbox enforcement work (restricted token) — until then
    Windows ships `enforcement: partial` (honest, by contract).
 
+## BRING-UP STATUS: GREEN (2026-10-03, n0050)
+
+Run `37082086546` passed the compile gate AND the full `--lib`
+unit/convergence suite on `windows-latest` (418 tests). What it took:
+the lease → std file-lock API, nono as a unix-only dependency behind an
+honest-unavailable backend stub, the sync_dir directory-open root cause
+(os error 5), `home_dir` via USERPROFILE, safe-read first passes, and
+gating the unix-semantics test batch — full story in
+`.agents/notes/0050-windows-bringup-green.md`. Remaining (non-gating,
+continue-on-error): windows integration triage, windows clippy, PATHEXT
+resolution, ACL mapping, Job Objects tree-kill, restricted-token
+sandbox.
+
 ## Cross-check status (2026-10-02 re-verification)
 
 The dev machine cannot even TYPE-CHECK for Windows today, one step before

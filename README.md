@@ -168,12 +168,18 @@ M5  differentiators ✔ in-turn `subagent` tool (n0034: REAL git worktree,
 M6  scale                      ◐ i18n slice: daemon-side en-US/zh-CN catalog
                                   domain (locale negotiation, fallback chain,
                                   interpolation; the UI catalog stays in the
-                                  reused TS UI); Windows bring-up LIVE —
+                                  reused TS UI); Windows bring-up GREEN —
                                   the repo is on GitHub
-                                  (github.com/moss101/okra, pushed 2026-10-02)
-                                  and the armed `.github/workflows/
-                                  windows.yml` now runs on every push
-                                  (triage per `docs/m6-windows-port.md`);
+                                  (github.com/moss101/okra) and
+                                  `windows.yml` passes the compile +
+                                  full `--lib` gate on `windows-latest`
+                                  (418 tests, run 37082086546; lease →
+                                  std file-lock API, nono unix-only
+                                  behind an honest stub, sync_dir root
+                                  cause fixed — n0050); the second-pass
+                                  queue (integration triage, windows
+                                  clippy, PATHEXT/ACL/Job Objects) runs
+                                  continue-on-error;
                                   **managed-pin
                                   loop closed end to end** — admin signs with
                                   `okra pin-sign` (Ed25519 envelope over
