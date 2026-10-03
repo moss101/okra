@@ -128,6 +128,9 @@ fn model_url(mock_addr: &str) -> String {
     format!("http://{mock_addr}/v1")
 }
 
+// Same fail-closed contract as the g5 launcher: on windows the sandbox
+// stub reports Unavailable and confined child launches are refused.
+#[cfg(unix)]
 #[test]
 fn g5_real_sampler_drives_confined_child() {
     if !git_available() {
