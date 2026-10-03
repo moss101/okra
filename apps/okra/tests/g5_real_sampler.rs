@@ -16,7 +16,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 
 #[cfg(unix)] use std::process::Command;
+#[cfg(unix)]
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use std::time::Duration;
 
 #[cfg(unix)]
