@@ -49,6 +49,15 @@ to main and is the canonical bring-up gate.
 5. Only then: sandbox enforcement work (restricted token) — until then
    Windows ships `enforcement: partial` (honest, by contract).
 
+## SECOND PASS: CLEAN (2026-10-03, run 37103997439)
+
+The windows pipeline is fully green with NO annotations: build ✓,
+`--lib` ✓ (all suites), integration ✓ (all non-gated suites), clippy ✓
+(zero warnings — the windows-only dead-code batch from the test gates
+was swept). Everything remaining (PATHEXT resolution, ACL mapping,
+Job Objects tree-kill, restricted-token sandbox, the ConPTY
+terminal-emulator layer) is NEW capability work, not red tests.
+
 ## SECOND PASS PROGRESS (2026-10-03)
 
 - The integration step COMPILES and RUNS on windows (436 tests passing in
