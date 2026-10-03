@@ -60,6 +60,9 @@ to main and is the canonical bring-up gate.
   cross-platform `fake-mcp` test binary; computer-control tests gate to
   macOS (AX by design); the PTY test gates to unix pending the ConPTY
   terminal-emulator layer.
+- Subagent launches FAIL CLOSED on windows (by design): the nono stub
+  reports Unavailable and the g5 launcher refuses confined children —
+  the G5 contract holding. Unlocks with the restricted-token sandbox.
 - Rewind-removal triage: `POST /api/rewind` returns 200 but an
   absent-before file survives on windows (run 37099210769,
   g4_rewind.rs:228) — candidates: composed-before recording on the

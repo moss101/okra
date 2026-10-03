@@ -30,6 +30,11 @@ fn git_available() -> bool {
         .unwrap_or(false)
 }
 
+// The subagent launcher FAILS CLOSED where no kernel sandbox exists:
+// on windows the nono stub reports Unavailable and confined child
+// launches are refused (the G5 contract — isolation enforced by the
+// kernel, not policy). The happy-path test needs Landlock/Seatbelt.
+#[cfg(unix)]
 #[test]
 fn g5_launcher_confined_child_and_collect_work() {
     if !git_available() {
