@@ -94,7 +94,7 @@ pub fn spawn_restricted_output(
     //    group memberships and user identity — it is US, minus power)
     let mut tok: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
     let rc = unsafe {
-        OpenProcessToken(GetCurrentProcess(), (TOKEN_DUPLICATE | TOKEN_QUERY) as u32, &mut tok)
+        OpenProcessToken(GetCurrentProcess(), (TOKEN_DUPLICATE | TOKEN_QUERY), &mut tok)
     };
     if rc == 0 {
         return Err(err("OpenProcessToken"));
@@ -157,6 +157,10 @@ pub fn spawn_restricted_output(
     si.hStdOutput = out_write;
     si.hStdError = err_write;
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    // raw pointers: the FFI takes *mut — and the unnecessary_mut_passed
+    // lint otherwise fires on this windows-sys declaration
+    let si_ptr: *mut STARTUPINFOW = &mut si;
+    let pi_ptr: *mut PROCESS_INFORMATION = &mut pi;
 
     // 4. create AS the restricted token; NULL cwd inherits the daemon's
     let app_wide: Vec<u16> = app.encode_utf16().chain(std::iter::once(0)).collect();
@@ -171,8 +175,8 @@ pub fn spawn_restricted_output(
             0,
             env_block.as_ptr() as *const core::ffi::c_void,
             std::ptr::null(),
-            &mut si,
-            &mut pi,
+            si_ptr,
+            pi_ptr,
         )
     };
     // the parent's copies of the write ends die here — the child holds
