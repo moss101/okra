@@ -14,6 +14,7 @@
 #![allow(clippy::disallowed_methods)]
 #[cfg(unix)] use std::process::Command;
 
+#[cfg(unix)]
 const TASK_JSON: &str = r##"{
   "task": "G5 loop: write the deliverable inside the grant, attempt an escape",
   "files": [
