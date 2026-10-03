@@ -463,11 +463,20 @@ fn windows_rewind_removal_diagnostic() {
             assert!(Instant::now() < deadline, "turn never completed");
             std::thread::sleep(Duration::from_millis(100));
         }
-        // rewind to before the write
-        let (status, body) = http_post(&addr, "/api/rewind", &serde_json::json!({
-            "sessionId": "rewind-diag",
-            "promptIndex": 0
-        }));
+        // rewind to before the write. A 409 "turn in flight" right after
+        // completedSuccess is the gate-release race (the turn thread tears
+        // down after the projection flips) — retry within a deadline.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let (status, body) = loop {
+            let (s, b) = http_post(&addr, "/api/rewind", &serde_json::json!({
+                "sessionId": "rewind-diag",
+                "promptIndex": 0
+            }));
+            if s != 409 || Instant::now() > deadline {
+                break (s, b);
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        };
         let survives = td.path().join("scratch.md").exists();
         panic!(
             "DIAGNOSTIC: rewind status={status} body={body} scratch.md survives={survives}"
