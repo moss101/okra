@@ -22,6 +22,25 @@
 #![allow(clippy::disallowed_methods)]
 use std::path::{Path, PathBuf};
 use std::process::Command;
+/// "aborted abruptly by the kill" across platforms: unix = killed by a
+/// signal (`code()` is None); windows = STATUS_CONTROL_C_EXIT
+/// (0xC000013A) — the abort-after-kill exit code a windows process
+/// reports for a hard termination. Both are the kill-matrix contract;
+/// neither is a clean exit.
+fn abruptly_aborted(status: &std::process::ExitStatus) -> bool {
+    #[cfg(unix)]
+    {
+        status.code().is_none()
+    }
+    #[cfg(windows)]
+    {
+        matches!(status.code(), Some(-1073740791) | Some(-1073741510))
+        // 0xC000013A STATUS_CONTROL_C_EXIT | 0xC000013A's console sibling
+        // STATUS_CONTROL_C_EXIT vs 0xC0000409 — accept the hard-termination
+        // family; a clean code (0) must never pass
+    }
+}
+
 
 use okra_kernel as kernel;
 
@@ -150,8 +169,8 @@ fn g1_kill_matrix_every_durable_boundary_recovers() {
         let spec_abs = ws.join("task.json").to_str().unwrap().to_string();
         let aborted = run_cli(&ws, &["--task", &spec_abs, "--kill-at-boundary", &kill_spec]);
         assert!(
-            aborted.status.code().is_none(),
-            "child must abort by signal at {boundary}, got {:?} stderr={}",
+            abruptly_aborted(&aborted.status),
+            "child must abort abruptly at {boundary}, got {:?} stderr={}",
             aborted.status.code(),
             String::from_utf8_lossy(&aborted.stderr)
         );
@@ -205,7 +224,11 @@ fn g1_repair_marks_interrupted_call_outcome_unknown() {
     let (_td, ws) = workspace("g1-interrupted");
     let spec_abs = ws.join("task.json").to_str().unwrap().to_string();
     let aborted = run_cli(&ws, &["--task", &spec_abs, "--kill-at-boundary", "tool_call_logged:2"]);
-    assert!(aborted.status.code().is_none());
+    assert!(
+        abruptly_aborted(&aborted.status),
+        "got {:?}",
+        aborted.status.code()
+    );
 
     // before any recovery the raw log has an unmatched call
     let sessions = ws.join(".okra-sessions");
