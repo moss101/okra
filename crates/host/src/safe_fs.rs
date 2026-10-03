@@ -191,12 +191,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn enforcement_level_is_honest_per_platform() {
-        let level = enforcement_level();
-        #[cfg(unix)]
-        assert_eq!(level, "full");
-        #[cfg(windows)]
-        assert_eq!(level, "partial", "the ACL mapping is the recorded second pass");
+    fn enforcement_level_is_full_everywhere() {
+        // the windows ACL second pass landed: Everyone-write refusal via
+        // the DACL — both platforms are `full`
+        assert_eq!(enforcement_level(), "full");
     }
 
     #[test]
