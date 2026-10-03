@@ -331,7 +331,10 @@ mod tests {
     /// ONE serial test for the env-overridable backend: the env is
     /// process-global and tests run in parallel — each fixture phase runs
     /// sequentially inside a single test.
+    // the fixture pipeline drives a #!/bin/sh script standing in for
+    // osascript — unix/mac semantics end to end
     #[test]
+    #[cfg(unix)]
     fn backend_fixture_phases() {
         unsafe { env_guard("OKRA_OSASCRIPT") };
         let dir = fixture_dir();
