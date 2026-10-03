@@ -21,7 +21,7 @@ to main and is the canonical bring-up gate.
 | Surface | Location | Windows shape |
 |---|---|---|
 | Sandbox (nono: Seatbelt/Landlock) | `okra_policy`, N0006 | No direct equivalent. Options: restricted-token + AppContainer (large), or ship Windows with `enforcement: partial` and honest denial dialects (deepseek honesty types already model this) |
-| Process groups (login-shell capture, terminal) | `runtime_env::RealLoginShellExecutor` (process_group(0), kill(-pid)), `terminal.rs` (portable-pty) | Job Objects for tree kill; portable-pty has a ConPTY backend; the `detached`/group code paths are unix-gated today |
+| Process groups (login-shell capture, terminal) | `runtime_env::RealLoginShellExecutor` (process_group(0), kill(-pid)), `terminal.rs` (portable-pty) | **LANDED**: the capture deadline kill uses `taskkill /PID /T /F` (tree kill via the OS, CREATE_NO_WINDOW); Job Objects remain the fuller shim for auto-kill-on-close semantics; portable-pty has a ConPTY backend (the rendering stall is tracked separately) |
 | Safe-read (O_NOFOLLOW\|O_NONBLOCK) | `safe_fs.rs` | FILE_FLAG_OPEN_REPARSE_POINT + GetFileInformation checks; the ownership/mode ladder re-maps to ACLs (first pass: report `enforcement: partial`) |
 | fsutil canonicalize (verbatim `\\?\` paths) | `fsutil.rs` | The M6 note in the file is the design slot; path-equality keys must normalize verbatim prefixes |
 | home dir / env | `fsutil::home_dir` | SHGetKnownFolderPath or `USERPROFILE`; the clippy ban on `std::env::home_dir` already forces one call site |
