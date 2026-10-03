@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! G5 gate (MASTER-PLAN §4): "a subagent run in an isolated worktree
 //! cannot touch paths outside its grant — enforced by sandbox, not policy."
 //!
