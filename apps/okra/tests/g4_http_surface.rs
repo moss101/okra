@@ -1403,19 +1403,16 @@ case "$req" in
     printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
 esac
 "#;
-    let fixture = td.path().join("fake-mcp.sh");
-    std::fs::write(&fixture, server_script).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    // cross-platform fixture: the fake-mcp test binary (the sh-script
+    // stand-in was the one unix-only piece of the windows bring-up)
+    let fixture = std::path::PathBuf::from(env!("CARGO_BIN_EXE_fake-mcp"));
     std::fs::create_dir_all(td.path().join(".okra")).unwrap();
     std::fs::write(
         td.path().join(".okra").join("config.json"),
         serde_json::json!({
             "mcp": { "servers": {
-                "fake": { "command": fixture.to_string_lossy() },
+                "fake": { "command": fixture.to_string_lossy(), "args": [
+                    "--count-file", td.path().join("probe-count").to_string_lossy() ] },
                 "broken": { "command": "/nope/no-such-mcp-server" }
             } }
         })
@@ -1462,40 +1459,16 @@ esac
 #[test]
 fn g4_mcp_tools_run_inside_turns() {
     let td = tempfile::tempdir().unwrap();
-    // a PERSISTENT responder: loops until EOF (stdin close), counting
-    // initialize lines to a file — the persistent-session proof
-    let server_script = r#"#!/bin/sh
-count_file=/tmp/okra-mcp-init-count
-echo 0 > "$count_file" 2>/dev/null
-while IFS= read -r req; do
-  id=$(printf '%s' "$req" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
-  case "$req" in
-    *initialize*)
-      n=$(cat "$count_file" 2>/dev/null || echo 0)
-      echo $((n + 1)) > "$count_file" 2>/dev/null
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"fake-tools","version":"1.0"}}}\n' "$id" ;;
-    *tools/list*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"probe-tool","description":"canned","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
-    *tools/call*)
-      text=$(printf '%s' "$req" | sed -n 's/.*"text":"\([^"]*\)".*/\1/p')
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"echo: %s"}]}}\n' "$id" "$text" ;;
-    *)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
-  esac
-done
-"#;
-    let fixture = td.path().join("fake-mcp.sh");
-    std::fs::write(&fixture, server_script).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    // cross-platform persistent responder: the fake-mcp test binary
+    // counts `initialize` lines to a temp file (the
+    // initialize-exactly-once proof for persistent sessions)
+    let fixture = std::path::PathBuf::from(env!("CARGO_BIN_EXE_fake-mcp"));
     std::fs::create_dir_all(td.path().join(".okra")).unwrap();
     std::fs::write(
         td.path().join(".okra").join("config.json"),
         serde_json::json!({
-            "mcp": { "servers": { "fake": { "command": fixture.to_string_lossy() } } }
+            "mcp": { "servers": { "fake": { "command": fixture.to_string_lossy(), "args": [
+                "--count-file", td.path().join("turn-count").to_string_lossy() ] } } }
         })
         .to_string(),
     )
@@ -1561,13 +1534,13 @@ done
 
         // PERSISTENT-SESSION PROOF: initialize ran exactly ONCE even though
         // the session did initialize + tools/list + tools/call
-        let count_file = "/tmp/okra-mcp-init-count";
-        let count = std::fs::read_to_string(count_file)
+        let count_file = td.path().join("turn-count").to_string_lossy().to_string();
+        let count = std::fs::read_to_string(&count_file)
             .unwrap_or_default()
             .trim()
             .to_string();
         assert_eq!(count, "1", "initialize must run once per session, got {count}");
-        let _ = std::fs::remove_file(count_file);
+        let _ = std::fs::remove_file(&count_file);
     }));
     let _ = daemon.kill();
     let _ = daemon.wait();
@@ -1670,6 +1643,7 @@ fn g4_ask_user_question_flow() {
 /// every call is approval-gated, and the screenshot returns a PNG data
 /// URL the UI renders.
 #[test]
+#[cfg(target_os = "macos")]
 fn g4_computer_control_end_to_end() {
     let td = tempfile::tempdir().unwrap();
     let bin = td.path().join("bin");
@@ -1892,6 +1866,7 @@ fn g4_skills_management_lifecycle() {
 /// set with ONE card (app tools then run without cards); display-scope
 /// tools need request_full_control (ONE card) and release re-arms it.
 #[test]
+#[cfg(target_os = "macos")]
 fn g4_computer_consent_lifecycle() {
     let td = tempfile::tempdir().unwrap();
     let bin = td.path().join("bin");
@@ -2056,6 +2031,7 @@ echo "cliclick $*" >> "$OKRA_AX_LOG"
 /// checkboxes), the session driving-lock (one session drives at a time,
 /// released at turn end), and the batch families.
 #[test]
+#[cfg(target_os = "macos")]
 fn g4_consent_completion_lock_clipboard_batches() {
     let td = tempfile::tempdir().unwrap();
     let bin = td.path().join("bin");

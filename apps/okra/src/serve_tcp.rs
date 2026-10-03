@@ -1776,7 +1776,16 @@ fn term_open(state: &Arc<TcpServeState>, program: Option<String>) -> Result<Stri
     let mut ids = state.terminals.lock().unwrap();
     let id = format!("t{}", ids.len() + 1);
     let shell = program.unwrap_or_else(|| {
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+        // unix: $SHELL → /bin/sh; windows: $COMSPEC → cmd.exe (portable-pty
+        // drives ConPTY there automatically)
+        #[cfg(windows)]
+        {
+            std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
+        }
+        #[cfg(not(windows))]
+        {
+            std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+        }
     });
     let (session, mut reader) =
         TerminalSession::spawn_split(&shell, &[], &state.cwd, Default::default())?;
