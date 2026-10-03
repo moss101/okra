@@ -76,6 +76,15 @@ terminal-emulator layer) is NEW capability work, not red tests.
   absent-before file survives on windows (run 37099210769,
   g4_rewind.rs:228) — candidates: composed-before recording on the
   windows write path, or a remove_file sharing violation. Next fix.
+- ConPTY next diagnostic step: with the DSR reply in place, the typed
+  marker still never echoes within 30s (the PTY streams only the probe
+  frame) — the next cycle should instrument the keys path (does the
+  ConPTY input pipe accept the write? does cmd.exe echo?) with the test
+  re-enabled on windows and FULL frame dumps.
+- Gate-release race (timing note for test authors): the projection flips
+  to `completedSuccess` BEFORE the turn thread releases `running_turns`
+  — an immediate follow-up call can get the honest 409 "turn in flight".
+  Tests retry on 409 (see g4_rewind).
 - ConPTY findings: conhost opens every session with a DSR probe
   (ESC[6n); the pump answers it, but rendering still stalls — the real
   work is a terminal-emulator layer (win32-input-mode / sequence
