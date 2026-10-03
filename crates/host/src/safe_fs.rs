@@ -51,9 +51,10 @@ pub fn everyone_has_write_access(path: &Path) -> std::io::Result<bool> {
         BuildTrusteeWithSidW, GetEffectiveRightsFromAclW, GetNamedSecurityInfoW,
         SE_FILE_OBJECT,
     };
+    use windows_sys::Win32::Security::Authorization::{ACL, TRUSTEE_W};
     use windows_sys::Win32::Security::{
         AllocateAndInitializeSid, DACL_SECURITY_INFORMATION, FreeSid,
-        SECURITY_WORLD_SID_AUTHORITY, TRUSTEE_W,
+        SECURITY_WORLD_SID_AUTHORITY,
     };
     use windows_sys::Win32::Storage::FileSystem::{FILE_APPEND_DATA, FILE_WRITE_DATA};
 
