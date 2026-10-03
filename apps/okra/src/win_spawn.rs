@@ -115,6 +115,14 @@ mod tests {
 ///
 /// Fail-closed: any API error before creation aborts the launch; the
 /// child either starts as the restricted token or the call errors.
+/// A raw kernel HANDLE wrapper that is `Send` (kernel handles are
+/// process-wide values; transferring them between threads is exactly how
+/// the pipe drain works).
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+struct SendHandle(HANDLE);
+unsafe impl Send for SendHandle {}
+
 #[cfg(windows)]
 pub fn spawn_restricted_output(
     app: &str,
@@ -240,13 +248,13 @@ pub fn spawn_restricted_output(
 
     // 5. drain stderr on a helper thread (a full stderr pipe would
     //    deadlock a stdout-only drain), wait, then read stdout to EOF
-    let err_handle = err_read;
+    let err_handle = SendHandle(err_read);
     let err_drain = std::thread::spawn(move || {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 4096];
         loop {
             let mut n: u32 = 0;
-            if unsafe { windows_sys::Win32::Storage::FileSystem::ReadFile(err_handle, chunk.as_mut_ptr(), chunk.len() as u32, &mut n, std::ptr::null_mut()) } == 0 && n == 0 {
+            if unsafe { windows_sys::Win32::Storage::FileSystem::ReadFile(err_handle.0, chunk.as_mut_ptr(), chunk.len() as u32, &mut n, std::ptr::null_mut()) } == 0 && n == 0 {
                 break;
             }
             buf.extend_from_slice(&chunk[..n as usize]);
