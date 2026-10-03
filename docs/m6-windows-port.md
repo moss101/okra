@@ -49,6 +49,14 @@ to main and is the canonical bring-up gate.
 5. Only then: sandbox enforcement work (restricted token) — until then
    Windows ships `enforcement: partial` (honest, by contract).
 
+## HARDENED GATE GREEN (2026-10-03, run 37112803251)
+
+The continue-on-error tolerances are REMOVED: integration tests and
+clippy (`-D warnings`) now FAIL the run on regression. First hardened
+run: fully green (build + unit + 1,040 integration tests + clippy, zero
+warnings). The last whack-a-mole items were windows-only dead imports in
+`g5_real_sampler`/`g5_full_loop` behind the unix test gates.
+
 ## SECOND PASS: CLEAN (2026-10-03, run 37103997439)
 
 The windows pipeline is fully green with NO annotations: build ✓,
