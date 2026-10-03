@@ -23,6 +23,10 @@ mod workflow_cli;
 mod workflow_gate;
 mod tui_surface;
 mod workflow_serve;
+// phase 1 (the tested primitives); phase 2 (the unsafe token +
+// CreateProcessAsUserW call) consumes them — hence the dead_code allowance
+// until wired
+#[allow(dead_code)]
 mod win_spawn;
 
 use std::io::Write;
