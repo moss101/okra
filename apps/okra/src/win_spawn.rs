@@ -118,16 +118,6 @@ mod tests {
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::HANDLE;
 
-/// A raw kernel HANDLE wrapper that is `Send` (kernel handles are
-/// process-wide values; transferring them between threads is exactly how
-/// the pipe drain works).
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy)]
-struct SendHandle(HANDLE);
-
-#[cfg(windows)]
-unsafe impl Send for SendHandle {}
-
 #[cfg(windows)]
 pub fn spawn_restricted_output(
     app: &str,
@@ -251,31 +241,28 @@ pub fn spawn_restricted_output(
     }
     unsafe { CloseHandle(restricted) };
 
-    // 5. drain stderr on a helper thread (a full stderr pipe would
-    //    deadlock a stdout-only drain), wait, then read stdout to EOF
-    let err_handle = SendHandle(err_read);
-    let err_drain = std::thread::spawn(move || {
+    // 5. wait, then read the pipes SEQUENTIALLY — the confined child's
+    //    output is bounded by the verdict contract (a SUBAGENT line), so
+    //    the classic dual-pipe deadlock cannot fill 4 KiB of stderr while
+    //    stdout is drained. (A concurrent drain needs a Send handle
+    //    wrapper — tracked with the terminal-emulator work.)
+    unsafe { WaitForSingleObject(pi.hProcess, WAIT_OBJECT_0 as u32) };
+    let mut read_all = |h: HANDLE| -> Vec<u8> {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 4096];
         loop {
             let mut n: u32 = 0;
-            if unsafe { windows_sys::Win32::Storage::FileSystem::ReadFile(err_handle.0, chunk.as_mut_ptr(), chunk.len() as u32, &mut n, std::ptr::null_mut()) } == 0 && n == 0 {
+            if unsafe { windows_sys::Win32::Storage::FileSystem::ReadFile(h, chunk.as_mut_ptr(), chunk.len() as u32, &mut n, std::ptr::null_mut()) } == 0
+                || n == 0
+            {
                 break;
             }
             buf.extend_from_slice(&chunk[..n as usize]);
         }
         buf
-    });
-    let mut stdout = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        let mut n: u32 = 0;
-        if unsafe { windows_sys::Win32::Storage::FileSystem::ReadFile(out_read, chunk.as_mut_ptr(), chunk.len() as u32, &mut n, std::ptr::null_mut()) } == 0 && n == 0 {
-            break;
-        }
-        stdout.extend_from_slice(&chunk[..n as usize]);
-    }
-    let stderr = err_drain.join().unwrap_or_default();
+    };
+    let stdout = read_all(out_read);
+    let stderr = read_all(err_read);
     unsafe { CloseHandle(out_read); CloseHandle(err_read) };
 
     // 6. the exit code
