@@ -56,10 +56,15 @@ to main and is the canonical bring-up gate.
 - g1 kill-matrix GREEN on windows: the kill contract is now platform-
   aware (signal on unix; STATUS_CONTROL_C_EXIT hard-termination family
   on windows — a clean exit still fails).
-- Remaining integration triage (expected red, continue-on-error):
-  g4 computer-control tests (AX is macOS by design — gate to
-  `target_os = macos`), g4 PTY (ConPTY shim = the real work), g4 MCP
-  probe/tools (unix spawn fixtures in the tests).
+- Integration triage DONE (second pass): MCP fixtures moved to a
+  cross-platform `fake-mcp` test binary; computer-control tests gate to
+  macOS (AX by design); the PTY test gates to unix pending the ConPTY
+  terminal-emulator layer.
+- ConPTY findings: conhost opens every session with a DSR probe
+  (ESC[6n); the pump answers it, but rendering still stalls — the real
+  work is a terminal-emulator layer (win32-input-mode / sequence
+  handling), not just the probe reply. Terminal open/resize/keys/close
+  endpoints themselves work (the PTY test's earlier gates passed).
 
 ## BRING-UP STATUS: GREEN (2026-10-03, n0050)
 
