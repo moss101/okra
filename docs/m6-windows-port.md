@@ -76,11 +76,6 @@ terminal-emulator layer) is NEW capability work, not red tests.
   absent-before file survives on windows (run 37099210769,
   g4_rewind.rs:228) — candidates: composed-before recording on the
   windows write path, or a remove_file sharing violation. Next fix.
-- ConPTY diagnostic RESULT (runs 37106132295/37107367246): the DSR
-  reply (with bounded retries) does not unstick rendering — the session
-  streams only the probe. One run passed the full flow (timing luck).
-  Conclusion: the terminal-emulator layer (win32-input-mode, sequence
-  handling) is REQUIRED for windows PTY, not a probe reply.
 - ConPTY next diagnostic step: with the DSR reply in place, the typed
   marker still never echoes within 30s (the PTY streams only the probe
   frame) — the next cycle should instrument the keys path (does the
