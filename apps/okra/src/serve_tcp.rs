@@ -1800,12 +1800,27 @@ fn term_open(state: &Arc<TcpServeState>, program: Option<String>) -> Result<Stri
     // output pump: owns the split reader, feeds the scrollback
     let scroll = Arc::clone(&entry.scroll);
     let closed = Arc::clone(&entry.closed);
+    let session_for_dsr = Arc::clone(&entry.session);
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break, // EOF: child exited
-                Ok(n) => scroll.lock().unwrap().push(&buf[..n]),
+                Ok(n) => {
+                    // ConPTY interop (windows): conhost opens every session
+                    // with a Device Status Report probe (ESC[6n) and waits
+                    // for the terminal's cursor-position reply before it
+                    // renders. A real terminal answers; the scrollback
+                    // renderer does not — so the PUMP answers on its behalf
+                    // (cursor home). No reply = a stalled windows session.
+                    if buf[..n].windows(6).any(|w| w == b"\x1b[6n") {
+                        let _ = session_for_dsr
+                            .lock()
+                            .unwrap()
+                            .write(b"\x1b[1;1R");
+                    }
+                    scroll.lock().unwrap().push(&buf[..n]);
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
