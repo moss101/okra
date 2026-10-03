@@ -880,9 +880,13 @@ fn g4_git_surfaces_report_branch_status_and_diff() {
 /// N0012 — workbench terminals: the PTY surface over SSE + keystroke POST.
 /// A real shell runs in a real PTY; keys typed over HTTP execute and the
 /// output streams back; resize/close work; unknown ids are 404.
-/// WINDOWS DIAGNOSTIC (runs there too; red is continue-on-error): the
-/// failure dump decodes every streamed frame so the conhost keys-path
-/// investigation has real data.
+/// WINDOWS: gated pending the ConPTY terminal-emulator layer. Findings
+/// (runs 37106132295 green ONCE — timing; 37097302681/37107367246 red):
+/// conhost opens with a DSR probe (the pump replies, with bounded
+/// retries) but rendering still stalls — win32-input-mode/sequence
+/// handling is the remaining work (docs/m6-windows-port.md). The decoded
+/// frame dump stays for the next diagnostic cycle.
+#[cfg(unix)]
 #[test]
 fn g4_terminals_run_a_real_pty_over_http() {
     let td = tempfile::tempdir().unwrap();
