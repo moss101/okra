@@ -129,6 +129,9 @@ fn converts_multi_agent_home_into_okra() {
     );
 }
 
+// symlink semantics (unix); windows link modes are the recorded
+// second-pass ACL/link work.
+#[cfg(unix)]
 #[test]
 fn symlink_mode_keeps_okra_pointing_at_the_source() {
     let td = tempfile::tempdir().unwrap();
