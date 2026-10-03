@@ -1814,10 +1814,21 @@ fn term_open(state: &Arc<TcpServeState>, program: Option<String>) -> Result<Stri
                     // renderer does not — so the PUMP answers on its behalf
                     // (cursor home). No reply = a stalled windows session.
                     if buf[..n].windows(6).any(|w| w == b"\x1b[6n") {
-                        let _ = session_for_dsr
-                            .lock()
-                            .unwrap()
-                            .write(b"\x1b[1;1R");
+                        // bounded retries: conhost's input reader may not be
+                        // ready when the first reply lands (a dropped reply
+                        // stalls the session — seen flaky on CI)
+                        let dsr_session = Arc::clone(&session_for_dsr);
+                        std::thread::spawn(move || {
+                            for delay in [0u64, 200, 500] {
+                                if delay > 0 {
+                                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                                }
+                                let _ = dsr_session
+                                    .lock()
+                                    .unwrap()
+                                    .write(b"\x1b[1;1R");
+                            }
+                        });
                     }
                     scroll.lock().unwrap().push(&buf[..n]);
                 }
