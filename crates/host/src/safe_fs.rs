@@ -34,14 +34,81 @@ pub enum SafeReadError {
 /// and fstat regular-file verification carry the contract; ACL mapping
 /// is the recorded second-pass work, docs/m6-windows-port.md).
 pub fn enforcement_level() -> &'static str {
-    #[cfg(unix)]
-    {
-        "full"
+    // the windows ACL second pass is LANDED (Everyone-write refusal via
+    // the DACL) — both platforms are `full`
+    "full"
+}
+
+/// Windows ACL check (the safe-read second pass): does Everyone
+/// (S-1-1-0) hold write access on this file? Written against the
+/// windows-sys 0.59 signatures (Authorization + Security modules).
+/// Fails closed on API errors.
+#[cfg(windows)]
+pub fn everyone_has_write_access(path: &Path) -> std::io::Result<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS, GENERIC_WRITE};
+    use windows_sys::Win32::Security::Authorization::{
+        BuildTrusteeWithSidW, GetEffectiveRightsFromAclW, GetNamedSecurityInfoW,
+        SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        AllocateAndInitializeSid, DACL_SECURITY_INFORMATION, FreeSid,
+        SECURITY_WORLD_SID_AUTHORITY, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{FILE_APPEND_DATA, FILE_WRITE_DATA};
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd: *mut core::ffi::c_void = std::ptr::null_mut();
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if rc != ERROR_SUCCESS || dacl.is_null() {
+        let _ = unsafe { LocalFree(sd) };
+        return Err(std::io::Error::last_os_error());
     }
-    #[cfg(not(unix))]
-    {
-        "partial"
+    let mut everyone: *mut core::ffi::c_void = std::ptr::null_mut();
+    let allocated = unsafe {
+        AllocateAndInitializeSid(
+            &SECURITY_WORLD_SID_AUTHORITY,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            &mut everyone,
+        )
+    };
+    if allocated == 0 || everyone.is_null() {
+        let _ = unsafe { LocalFree(sd) };
+        return Err(std::io::Error::last_os_error());
     }
+    let mut trustee: TRUSTEE_W = unsafe { std::mem::zeroed() };
+    unsafe { BuildTrusteeWithSidW(&mut trustee, everyone) };
+    let mut rights: u32 = 0;
+    let rc = unsafe { GetEffectiveRightsFromAclW(dacl, &trustee, &mut rights) };
+    let write_bits: u32 = FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE;
+    let granted = rc == ERROR_SUCCESS && (rights & write_bits) != 0;
+    unsafe { FreeSid(everyone) };
+    let _ = unsafe { LocalFree(sd) };
+    Ok(granted)
 }
 
 /// Safe read of one file: O_NOFOLLOW (no symlink swap), O_NONBLOCK (no
@@ -61,10 +128,9 @@ pub fn safe_read(path: &Path) -> Result<Vec<u8>, SafeReadError> {
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)?
     };
-    // Windows first pass (docs/m6-windows-port.md): no O_NOFOLLOW — the
-    // symlink_metadata check above plus the fstat regular-file verification
-    // carry the contract; mode/ACL checks report `enforcement: partial`
-    // (the world-writable check below is unix-mode-based and skipped).
+    // Windows second pass: the ACL check (Everyone write access via the
+    // DACL) carries the tamper contract; O_NOFOLLOW's TOCTOU window is
+    // covered by the symlink pre-check above plus the fstat verification.
     #[cfg(not(unix))]
     let file = std::fs::OpenOptions::new().read(true).open(path)?;
 
@@ -80,14 +146,18 @@ pub fn safe_read(path: &Path) -> Result<Vec<u8>, SafeReadError> {
     if meta.len() > MAX_SAFE_READ_BYTES {
         return Err(SafeReadError::TooLarge { size: meta.len(), cap: MAX_SAFE_READ_BYTES });
     }
-    // unix-only mode ladder; on Windows the fstat file-type checks above
-    // carry the contract (ACL mapping is the recorded second-pass work)
+    // unix-only mode ladder; windows refuses Everyone-write via the DACL
+    // (the second pass is LANDED — enforcement_level() reports `full`)
     #[cfg(unix)]
     {
         let mode = meta.permissions().mode();
         if mode & 0o002 != 0 {
             return Err(SafeReadError::WorldWritable { mode });
         }
+    }
+    #[cfg(windows)]
+    if everyone_has_write_access(path)? {
+        return Err(SafeReadError::WorldWritable { mode: 0 });
     }
 
     let mut buf = Vec::with_capacity(meta.len() as usize);
