@@ -102,6 +102,17 @@ terminal-emulator layer) is NEW capability work, not red tests.
   cross-platform `fake-mcp` test binary; computer-control tests gate to
   macOS (AX by design); the PTY test gates to unix pending the ConPTY
   terminal-emulator layer.
+- Restricted-token sandbox SCOPE (the g5 unlock): the confined-child
+  spawn sites are `apps/okra/src/subagent.rs` (2 `Command::new` sites).
+  Windows shape: `OpenProcessToken(GetCurrentProcess)` →
+  `CreateRestrictedToken` (drop every privilege via
+  `RemoveAllPrivileges`, add `S-1-1-0` deny for write bits) →
+  `CreateProcessAsUserW` with the restricted token; features
+  `Win32_Security` + `Win32_System_Threading` are already enabled in the
+  windows-sys dependency. Honest limit: the daemon cannot PROVE the
+  kernel enforcement from the parent — the g5 kernel-verdict tests (run
+  a probe write outside the grant, expect refusal) stay the gate and
+  would move from fail-closed-refused to pass-with-token.
 - Subagent launches FAIL CLOSED on windows (by design): the nono stub
   reports Unavailable and the g5 launcher refuses confined children —
   the G5 contract holding. Unlocks with the restricted-token sandbox.
