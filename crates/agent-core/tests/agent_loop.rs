@@ -267,10 +267,13 @@ fn kill_at_phase_crash_leaves_recoverable_log() {
         .env("OKRA_KILL_AT_PHASE", kill_spec)
         .output()
         .expect("spawn okra child");
+    // unix: killed by a signal (no exit code) or SIGABRT (134); windows:
+    // the STATUS_CONTROL_C_EXIT hard-termination family — a clean exit
+    // (0) never passes
+    let code = status.status.code();
     assert!(
-        status.status.code().is_none() || status.status.code() == Some(134),
-        "child should have aborted (signal), got {:?} stderr={}",
-        status.status.code(),
+        code.is_none() || code == Some(134) || code == Some(-1073740791) || code == Some(-1073741510),
+        "child should have aborted abruptly, got {code:?} stderr={}",
         String::from_utf8_lossy(&status.stderr)
     );
 
