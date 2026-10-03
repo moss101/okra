@@ -67,6 +67,11 @@ fn no_pin_changes_nothing_and_prints_nothing() {
     assert!(!stderr.contains("[pin]"), "NotConfigured must be silent: {stderr}");
 }
 
+// The test asserts kernel confinement actually APPLIED ([sandbox] line):
+// on windows the sandbox stub reports Unavailable (fail-closed — no
+// silent passthrough), so the confinement proof is unix-only. The pin's
+// PROVIDER DENIAL half is platform-neutral (covered by the sibling tests).
+#[cfg(unix)]
 #[test]
 #[allow(clippy::disallowed_methods)] // test harness: runs the compiled binary
 fn fail_closed_pin_denies_all_providers_and_applies_read_only() {
