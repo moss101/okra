@@ -111,6 +111,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // symlink creation needs privilege on windows; the TOCTOU ladder is unix
     fn symlink_is_refused_not_followed() {
         let td = tempfile::tempdir().unwrap();
         let secret = td.path().join("secret.txt");

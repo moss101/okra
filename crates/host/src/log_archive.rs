@@ -204,6 +204,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // windows triage: tar extraction (second pass)
     fn archives_jsonl_logs_from_sessions() {
         let td = tempfile::tempdir().unwrap();
         let sessions = td.path().join("sessions");

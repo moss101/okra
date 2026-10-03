@@ -911,6 +911,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // windows triage: symlink + home-rebase fixtures
     fn filesystem_path_rewrite_rebases_onto_remote() {
         let (svc, td) = service();
         let local_home = td.path().join("local");

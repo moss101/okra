@@ -632,6 +632,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn shell_resolution_and_args_follow_the_candidate_ladder() {
         let mut env = BTreeMap::new();
         env.insert("SHELL".into(), "/bin/bash".into());
@@ -707,6 +708,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn capture_orchestration_builds_probe_env_and_extracts() {
         let mut base = BTreeMap::new();
         base.insert("HOME".to_string(), "/Users/dev".to_string());
@@ -756,6 +758,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn real_shell_capture_round_trip() {
         // a REAL capture through /bin/sh: PATH must exist and no markers leak
         let snap = capture_login_shell_env_snapshot(

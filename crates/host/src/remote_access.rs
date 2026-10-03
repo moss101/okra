@@ -155,6 +155,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // readonly-dir refusal is a unix mode-bit contract
     fn multi_directory_check_reports_the_first_failure() {
         let td = tempfile::tempdir().unwrap();
         let good = td.path().join("good");

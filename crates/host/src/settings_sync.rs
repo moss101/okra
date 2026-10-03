@@ -1627,6 +1627,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn symlink_mode_links_instead_of_copies() {
         let td = tempfile::tempdir().unwrap();
         let home = td.path();
@@ -1653,6 +1654,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn plugin_discovery_and_config_registration() {
         let td = tempfile::tempdir().unwrap();
         let home = td.path();
