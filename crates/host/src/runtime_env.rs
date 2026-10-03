@@ -400,12 +400,25 @@ impl LoginShellExecutor for RealLoginShellExecutor {
             }
             if std::time::Instant::now() >= deadline {
                 // kill the whole group, then the direct child fallback
-                // (unix: group SIGKILL; windows: direct kill — Job Objects
-                // tree-kill is the recorded second-pass shim)
+                // (unix: group SIGKILL; windows: `taskkill /T /F` ends the
+                // pid and its descendants — Job Objects are the recorded
+                // fuller shim)
                 #[cfg(unix)]
                 {
                     let pid = child.id();
                     let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+                }
+                #[cfg(windows)]
+                {
+                    // sanctioned site (same capture spawn above)
+                    #[allow(clippy::disallowed_methods)]
+                    let _ = {
+                        use std::os::windows::process::CommandExt;
+                        let mut tk = std::process::Command::new("taskkill");
+                        tk.args(["/PID", &child.id().to_string(), "/T", "/F"])
+                            .creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+                        tk.output()
+                    };
                 }
                 let _ = child.kill();
                 let _ = child.wait();
