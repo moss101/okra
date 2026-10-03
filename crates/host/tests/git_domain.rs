@@ -13,7 +13,7 @@ use okra_host::git::GitRepository;
 fn init_repo_with_identity(path: &std::path::Path) -> GitRepository {
     let repo = GitRepository::init(path).unwrap();
     for (k, v) in [("user.email", "okra-test@example.com"), ("user.name", "okra test")] {
-        let _ = Command::new("git")
+        let _ = std::process::Command::new("git")
             .args(["config", k, v])
             .current_dir(repo.root())
             .output();
