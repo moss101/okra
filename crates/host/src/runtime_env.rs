@@ -265,9 +265,34 @@ fn is_executable_file(path: &str) -> bool {
 /// Windows first pass (docs/m6-windows-port.md): treat an existing file
 /// with an executable-ish extension as runnable; the login-shell probe
 /// falls through to PowerShell via the caller's candidate list anyway.
+/// Windows command executability (PATHEXT semantics, the recorded
+/// second-pass work in docs/m6-windows-port.md): an existing file whose
+/// extension is in the PATHEXT list (default `.COM;.EXE;.BAT;.CMD`,
+/// case-insensitive, empty entries skipped). The pure decision is
+/// cross-platform so it stays unit-tested on every OS; the windows
+/// wrapper feeds `$PATHEXT`.
+#[cfg_attr(unix, allow(dead_code))]
+fn windows_file_is_executable(path: &str, pathext: &str) -> bool {
+    let p = std::path::Path::new(path);
+    if !p.is_file() {
+        return false;
+    }
+    p.extension()
+        .map(|e| {
+            let dotted = format!(".{}", e.to_string_lossy().to_ascii_lowercase());
+            pathext
+                .split(';')
+                .map(str::trim)
+                .filter(|x| !x.is_empty())
+                .any(|x| x.to_ascii_lowercase() == dotted)
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(not(unix))]
 fn is_executable_file(path: &str) -> bool {
-    std::path::Path::new(path).is_file()
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    windows_file_is_executable(path, &pathext)
 }
 
 /// `$SHELL` → /bin/zsh → /bin/bash → /bin/sh, first executable.
@@ -798,5 +823,39 @@ mod tests {
         let origin = build_agent_endpoint_origin_env(Some(" https://api.example.com "));
         assert_eq!(origin.get("OKRA_BASE_URL").map(String::as_str), Some("https://api.example.com"));
         assert!(build_agent_endpoint_origin_env(Some("  ")).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pathext_tests {
+    use super::*;
+
+    /// PATHEXT semantics (windows command resolution), unit-tested on
+    /// every OS via the pure helper.
+    #[test]
+    fn windows_file_is_executable_follows_pathext() {
+        let td = tempfile::tempdir().unwrap();
+        let tool = td.path().join("tool.exe");
+        std::fs::write(&tool, b"MZ").unwrap();
+        let tool_s = tool.to_string_lossy().to_string();
+
+        let default = ".COM;.EXE;.BAT;.CMD";
+        assert!(windows_file_is_executable(&tool_s, default), "exe resolves");
+        assert!(
+            windows_file_is_executable(&tool_s, ".cmd;.exe"),
+            "case-insensitive + reordered PATHEXT"
+        );
+        // a different extension list excludes it
+        assert!(!windows_file_is_executable(&tool_s, ".PS1"), "outside PATHEXT → no");
+        // empty entries are skipped, not matched
+        assert!(!windows_file_is_executable(&tool_s, ";;"), "empty PATHEXT matches nothing");
+        // a non-existent path is never executable, whatever PATHEXT says
+        assert!(
+            !windows_file_is_executable(
+                td.path().join("missing.exe").to_string_lossy().as_ref(),
+                default
+            ),
+            "existence is required"
+        );
     }
 }
