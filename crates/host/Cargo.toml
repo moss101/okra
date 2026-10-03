@@ -25,5 +25,18 @@ rusqlite = { workspace = true }
 aes-gcm = { workspace = true }
 rcgen = "0.14.10"
 
+# windows platform shims (the port-doc second pass: ACL mapping for
+# safe-read, Job Objects tree-kill). Pinned exact per the nono decision
+# pattern; unix builds never see it.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.59.0", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 tempfile = { workspace = true }
