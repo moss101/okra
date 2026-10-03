@@ -364,26 +364,48 @@ pub fn orchestrate_subagent(
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("okra")))
         .unwrap_or_else(|| std::path::PathBuf::from("okra"));
+    let cli_args: Vec<String> = vec![
+        "run-subagent".into(),
+        "--grant".into(),
+        worktree_path.to_string_lossy().into_owned(),
+        "--task".into(),
+        spec_copy.to_string_lossy().into_owned(),
+    ];
+    // WINDOWS: the confined child launches under a RESTRICTED TOKEN
+    // (every privilege dropped) — the fail-closed refusal that gated the
+    // g5 tests becomes a working restricted launch (docs/m6-windows-port.md,
+    // restricted-token scope)
+    #[cfg(windows)]
+    let output = {
+        let env_extra: Vec<(String, String)> = parent_session
+            .iter()
+            .map(|p| ("OKRA_SUBAGENT_PARENT".to_string(), p.clone()))
+            .collect();
+        win_spawn::spawn_restricted_output(
+            &bin.to_string_lossy(),
+            &cli_args,
+            &env_extra,
+        )
+        .map_err(|e| format!("restricted child spawn: {e}"))?
+    };
     // sanctioned site: the orchestrator spawns the confined child runner
     // itself (the child then re-confines to the worktree); arguments are
     // host-built paths, never model text
+    #[cfg(not(windows))]
     #[allow(clippy::disallowed_methods)]
     let mut command = Command::new(&bin);
-    command.args([
-        "run-subagent",
-        "--grant",
-        &worktree_path.to_string_lossy(),
-        "--task",
-        &spec_copy.to_string_lossy(),
-    ]);
+    #[cfg(not(windows))]
+    command.args(cli_args.iter().map(String::as_str));
     // fork linkage: the child's kernel session header links to the
     // parent so rewind/fork bookkeeping can traverse the family tree
+    #[cfg(not(windows))]
     if let Some(parent) = parent_session {
         command.env("OKRA_SUBAGENT_PARENT", parent);
     }
     // sanctioned site: spawning the confined child runner; the child
     // re-applies nono self-confinement to the worktree before any work
     #[allow(clippy::disallowed_methods)]
+    #[cfg(not(windows))]
     let output = command
         .output()
         .map_err(|e| format!("spawn child: {e}"))?;
