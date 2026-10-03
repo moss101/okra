@@ -57,6 +57,31 @@ run: fully green (build + unit + 1,040 integration tests + clippy, zero
 warnings). The last whack-a-mole items were windows-only dead imports in
 `g5_real_sampler`/`g5_full_loop` behind the unix test gates.
 
+## ACL SECOND PASS — implementation sketch (next session's first item)
+
+`windows-sys =0.59.0` is already a cfg(windows) dependency of `okra-host`
+(commit history: "capability pass 2"), features enabled: Foundation,
+Security, Security_Authorization, Storage_FileSystem, System_JobObjects,
+System_Threading + add System_Memory (LocalFree).
+
+Design: `safe_fs::everyone_has_write_access(path) -> io::Result<bool>` —
+1. wide-path → `GetNamedSecurityInfoW(path, SE_FILE_OBJECT=1,
+   DACL_SECURITY_INFORMATION, …, &mut dacl, …, &mut sd)`
+2. Everyone SID: `AllocateAndInitializeSid(SECURITY_WORLD_SID_AUTHORITY,
+   1, 0,…, &sid)` → `BuildTrusteeWithSidW(&mut trustee, sid)`
+3. `GetEffectiveRightsFromAclW(dacl, &mut trustee, &mut rights)`
+4. refuse when `rights & (FILE_WRITE_DATA | FILE_APPEND_DATA |
+   GENERIC_WRITE) != 0`; free via `FreeSid` + `LocalFree`
+5. wire into `safe_read`'s cfg(not(unix)) branch → new
+   `SafeReadError::WorldWritableAcl` variant; `enforcement_level()`
+   flips to `full` when the check is wired.
+
+CAUTION (this session's lesson): the draft in git history ("capability
+pass 1" revert, c-series) guessed several API details and could not
+compile-verify locally — write it against the windows-sys 0.59 docs and
+let CI converge over 1–2 cycles; the hardened gate will red until it
+compiles.
+
 ## SECOND PASS: CLEAN (2026-10-03, run 37103997439)
 
 The windows pipeline is fully green with NO annotations: build ✓,
