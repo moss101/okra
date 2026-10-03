@@ -10,6 +10,7 @@
 // paths (production spawning goes through okra_policy's confined runner); the
 // acceptance harness must exercise the real binary end-to-end.
 #![allow(clippy::disallowed_methods)]
+#[cfg(unix)]
 use std::process::Command;
 
 #[cfg(unix)]

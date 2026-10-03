@@ -22,6 +22,7 @@ const TASK_JSON: &str = r##"{
   "files": []
 }"##;
 
+#[cfg(unix)]
 fn git_available() -> bool {
     std::process::Command::new("git")
         .arg("--version")
@@ -33,6 +34,7 @@ fn git_available() -> bool {
 /// Minimal OpenAI-compatible endpoint: POST /v1/chat/completions.
 /// Step 1 → tool_call write_file; step 2 → content + stop. Rejects
 /// requests without the Authorization header (proves auth flows).
+#[cfg(unix)]
 fn spawn_mock_model(authorization_expected: &str) -> (std::thread::JoinHandle<()>, String) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
