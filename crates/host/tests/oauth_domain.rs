@@ -171,6 +171,7 @@ fn token_cache_roundtrip_and_expiry() {
     client.client_credentials(None).unwrap();
 
     // cache file exists, mode 600, readable, and the cached token returns
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let meta = std::fs::metadata(&cache).unwrap();
     #[cfg(unix)]
     {
