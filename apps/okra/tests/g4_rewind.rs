@@ -403,3 +403,72 @@ fn g4_rewind_resets_git_to_the_captured_head() {
         std::panic::resume_unwind(panic);
     }
 }
+
+// WINDOWS DIAGNOSTIC (n0050 queue): the same flow as the gated unix test,
+// but the panic carries the FULL /api/rewind response (removedFiles /
+// restoredFiles / recreatedFiles / externalModifications) — the data the
+// windows removal repro needs. Remove once the removal path is fixed.
+#[cfg(windows)]
+#[test]
+fn windows_rewind_removal_diagnostic() {
+    let td = tempfile::tempdir().unwrap();
+    std::fs::write(td.path().join("notes.md"), "# notes\n").unwrap();
+    let (mut daemon, addr) = spawn_daemon(td.path());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // prompt 0 creates scratch.md through the real pipeline
+        let frames = std::sync::Arc::new(mutex_vec());
+        let writer = std::sync::Arc::clone(&frames);
+        let a = addr.to_string();
+        let t = std::thread::spawn(move || {
+            sse_collect(&a, "rewind-diag", &writer, &|f| {
+                f.iter().any(|f| f["params"]["control"]["phase"] == "completedSuccess")
+            })
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let (status, reply) = http_post_command(&addr, &serde_json::json!({
+            "commandId": "diag-1",
+            "type": "sendText",
+            "sessionId": "rewind-diag",
+            "payload": { "text": "create scratch.md" }
+        }));
+        assert_eq!(status, 200, "{reply}");
+        // resolve the write approval (Allow once)
+        let approval_id = loop {
+            let pending = frames.lock().unwrap().iter().rev().find_map(|f| {
+                f["params"]["control"]["awaitingApproval"]
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|p| p["approvalId"].as_str().map(str::to_string))
+            });
+            if let Some(id) = pending { break id; }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let (s2, r2) = http_post_command(&addr, &serde_json::json!({
+            "commandId": "diag-2",
+            "type": "resolveApproval",
+            "sessionId": "rewind-diag",
+            "payload": { "approvalId": approval_id, "decision": "allow" }
+        }));
+        assert_eq!(s2, 200, "{r2}");
+        // wait for the turn to finish + the file to exist
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !td.path().join("scratch.md").exists() {
+            assert!(Instant::now() < deadline, "scratch.md never landed");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // rewind to before the write
+        let (status, body) = http_post(&addr, "/api/rewind", &serde_json::json!({
+            "sessionId": "rewind-diag",
+            "promptIndex": 0
+        }));
+        let survives = td.path().join("scratch.md").exists();
+        panic!(
+            "DIAGNOSTIC: rewind status={status} body={body} scratch.md survives={survives}"
+        );
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
