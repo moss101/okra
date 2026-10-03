@@ -951,6 +951,7 @@ fn g4_terminals_run_a_real_pty_over_http() {
                     .unwrap_or(false)
             })
         });
+        use base64::Engine as _;
         let dump: Vec<String> = frames
             .lock()
             .unwrap()

@@ -3261,6 +3261,8 @@ pub fn file_preview(cwd: &Path, rel_raw: &str) -> Result<serde_json::Value, (u16
         "truncated": truncated,
         "binary": shown.contains(&0u8),
         "content": String::from_utf8_lossy(shown),
+        // the safe-read honesty contract, visible to surfaces
+        "enforcement": okra_host::safe_fs::enforcement_level(),
     }))
 }
 

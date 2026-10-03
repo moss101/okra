@@ -28,6 +28,22 @@ pub enum SafeReadError {
     Io(#[from] std::io::Error),
 }
 
+/// The safe-read enforcement level, per platform — the honesty contract
+/// (deepseek `enforcement: full | partial`): unix gets the full
+/// O_NOFOLLOW + mode ladder; windows is `partial` (the symlink pre-check
+/// and fstat regular-file verification carry the contract; ACL mapping
+/// is the recorded second-pass work, docs/m6-windows-port.md).
+pub fn enforcement_level() -> &'static str {
+    #[cfg(unix)]
+    {
+        "full"
+    }
+    #[cfg(not(unix))]
+    {
+        "partial"
+    }
+}
+
 /// Safe read of one file: O_NOFOLLOW (no symlink swap), O_NONBLOCK (no
 /// FIFO hang), regular-file + size + permission checks via fstat (racing
 /// the open, not the path), then read.
@@ -101,6 +117,15 @@ pub fn safe_open(path: &Path) -> Result<File, SafeReadError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enforcement_level_is_honest_per_platform() {
+        let level = enforcement_level();
+        #[cfg(unix)]
+        assert_eq!(level, "full");
+        #[cfg(windows)]
+        assert_eq!(level, "partial", "the ACL mapping is the recorded second pass");
+    }
 
     #[test]
     fn regular_file_reads() {
