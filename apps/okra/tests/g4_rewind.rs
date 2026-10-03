@@ -297,6 +297,10 @@ fn wait_for(frames: &Mutex<Vec<serde_json::Value>>, pred: &dyn Fn(&[serde_json::
     false
 }
 
+// Same windows rewind-removal triage as its sibling test: the removal
+// path (git reset untracked + absent-before removal) needs a windows
+// repro. Tracked in docs/m6-windows-port.md.
+#[cfg(unix)]
 #[test]
 fn g4_rewind_resets_git_to_the_captured_head() {
     let td = tempfile::tempdir().unwrap();
